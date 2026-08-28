@@ -2,17 +2,16 @@
   "version": "4.3.0",
   "base_version": "4.2.9",
   "patch_files": [
-    "release-src/4.3.0/02-main-integration.patch",
-    "release-src/4.3.0/04-update-notes.patch"
+    "release-src/4.3.0/01-x-planner-integration.patch",
+    "release-src/4.3.0/02-x-planner-compat.patch"
   ],
   "overlay_chunks": [
     "release-src/4.3.0/overlay/overlay.b64.00",
     "release-src/4.3.0/overlay/overlay.b64.01",
     "release-src/4.3.0/overlay/overlay.b64.02",
-    "release-src/4.3.0/overlay/overlay.b64.03",
-    "release-src/4.3.0/overlay/overlay.b64.04"
+    "release-src/4.3.0/overlay/overlay.b64.03"
   ],
-  "overlay_sha256": "aa1c365711fc4102ee8aabc2a04e0db8e4104e2a152818e6f297d8d0fe42c8dc",
-  "notes": "Добавлен встроенный Twitter / X Planner: аккаунты через отдельные профили Chrome/Edge, очередь видео, подписи и общий суффикс, конкретный/случайный/по кругу/наименее загруженный аккаунт, автоматическое распределение по настраиваемым временным окнам, календарь и быстрый переход к следующей публикации. Без X API, X Pro и автоматического управления сайтом x.com.",
+  "overlay_sha256": "85777622b6fb397e557c24ddb47faf3ce0a9ceee497191454f5a03d93ea93fb3",
+  "notes": "Добавлен встроенный Twitter / X Planner: отдельные браузерные профили для X-аккаунтов, очередь видео, ручные подписи и общий суффикс, конкретный/случайный/по кругу/наименее загруженный аккаунт, автоматическое распределение по настраиваемым временным окнам, календарь занятых дат и времени и быстрый переход к следующей публикации. Без X API, X Pro и автоматического управления сайтом x.com.",
   "retry": 1
 }

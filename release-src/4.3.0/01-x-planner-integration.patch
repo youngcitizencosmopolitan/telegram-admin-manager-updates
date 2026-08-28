@@ -1,0 +1,113 @@
+diff --git a/telegram_admin_manager_v4.3.0/UPDATE_4_3_0.txt b/telegram_admin_manager_v4.3.0/UPDATE_4_3_0.txt
+new file mode 100644
+index 0000000..8355bfa
+--- /dev/null
++++ b/telegram_admin_manager_v4.3.0/UPDATE_4_3_0.txt
+@@ -0,0 +1,11 @@
++Telegram Admin Manager 4.3.0
++
++- В главном дашборде появилась кнопка Twitter / X.
++- Twitter / X работает как отдельный лёгкий процесс того же приложения и не блокирует Telegram-часть.
++- Добавлен локальный календарь X без X API и без автоматических кликов по сайту.
++- Для каждого X-аккаунта создаётся отдельный профиль Edge/Chrome: один раз войди в X, дальше приложение открывает нужный профиль само.
++- Видео можно назначить конкретному аккаунту, случайному аккаунту, по кругу или аккаунту с наименьшей загрузкой.
++- Временные окна редактируются в интерфейсе; внутри окна выбирается случайная свободная минута.
++- Настраиваются лимит публикаций на аккаунт/день, минимальный интервал и общий хвост подписи.
++- Календарь хранит дату, время, аккаунт, видео, подпись и состояние; больше не нужно помнить, где и когда уже была публикация.
++- Кнопка «Открыть следующее в X» открывает нужный браузерный профиль, копирует подпись и выделяет видео в Проводнике. Финальный Schedule выполняется штатно на x.com.
+diff --git a/telegram_admin_manager_v4.2.9/build_exe.bat b/telegram_admin_manager_v4.3.0/build_exe.bat
+index 1b43ad7..979332c 100644
+--- a/telegram_admin_manager_v4.2.9/build_exe.bat
++++ b/telegram_admin_manager_v4.3.0/build_exe.bat
+@@ -10,7 +10,7 @@ if not exist ".venv\Scripts\python.exe" (
+ ".venv\Scripts\python.exe" -m pip install --upgrade pyinstaller
+ if errorlevel 1 goto :error
+ 
+-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --noconsole --collect-all imageio_ffmpeg --collect-submodules tam_core --collect-submodules tam_ui --name TelegramAdminManager telegram_admin_manager.py
++".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --noconsole --collect-all imageio_ffmpeg --collect-submodules tam_core --collect-submodules tam_ui --collect-submodules tam_x --name TelegramAdminManager telegram_admin_manager.py
+ if errorlevel 1 goto :error
+ 
+ echo.
+diff --git a/telegram_admin_manager_v4.2.9/telegram_admin_manager.py b/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
+index 6dde522..e97ec2a 100644
+--- a/telegram_admin_manager_v4.2.9/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
+@@ -7,6 +7,7 @@ import json
+ import os
+ import queue
+ import re
++import subprocess
+ import sys
+ import threading
+ import time
+@@ -30,6 +31,7 @@ from tam_core.telegram_limits import (
+     wait_seconds as telegram_wait_seconds,
+ )
+ from tam_ui.qr_dialog import QRLoginDialog
++from tam_x.launcher import build_x_planner_command
+ 
+ try:
+     import qrcode
+@@ -57,7 +59,7 @@ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.2.9"
++APP_VERSION = "4.3.0"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -210,6 +212,21 @@ class TelegramAdminManager(tk.Tk):
+             self.after(4500, self._maybe_check_for_updates)
+ 
+     # ---------- UI ----------
++
++    def _open_x_planner(self) -> None:
++        """Open the local X planner as an isolated process of this same app."""
++        try:
++            cmd = build_x_planner_command(
++                executable=sys.executable,
++                entrypoint=str(Path(__file__).resolve()),
++                frozen=bool(getattr(sys, "frozen", False)),
++            )
++            env = os.environ.copy()
++            env["TAM_DATA_DIR"] = str(DATA_DIR)
++            subprocess.Popen(cmd, cwd=str(BASE_DIR), env=env)
++        except Exception as exc:
++            messagebox.showerror(APP_NAME, f"Не удалось открыть Twitter / X:\n{exc}")
++
+     @staticmethod
+     def _sanitize_sash_positions(raw: Any, *, expected: int) -> list[int]:
+         if not isinstance(raw, (list, tuple)) or expected <= 0:
+@@ -349,14 +366,18 @@ class TelegramAdminManager(tk.Tk):
+             font=("Segoe UI", 9, "bold"),
+         )
+         self.busy_label.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
++        ttk.Button(
++            header, text="Twitter / X", style="Dashboard.TButton",
++            command=self._open_x_planner,
++        ).grid(row=0, column=2, rowspan=2, padx=(8, 0))
+         ttk.Button(
+             header, text="↻ Обновления", style="Quiet.TButton",
+             command=self._show_update_center,
+-        ).grid(row=0, column=2, rowspan=2, padx=(8, 0))
++        ).grid(row=0, column=3, rowspan=2, padx=(8, 0))
+         ttk.Button(
+             header, text="⚙ Расширенное управление", style="Quiet.TButton",
+             command=lambda: self._open_advanced("uploads"),
+-        ).grid(row=0, column=3, rowspan=2, padx=(8, 0))
++        ).grid(row=0, column=4, rowspan=2, padx=(8, 0))
+ 
+         workspace = tk.PanedWindow(root, orient="horizontal", sashwidth=6, bg="#d8dee8", bd=0, relief="flat")
+         workspace.grid(row=1, column=0, sticky="nsew")
+@@ -4853,6 +4874,10 @@ class TelegramAdminManager(tk.Tk):
+ 
+ 
+ def main() -> None:
++    if "--x-planner" in sys.argv:
++        from tam_x.ui import run_x_planner
++        run_x_planner(DATA_DIR)
++        return
+     try:
+         app = TelegramAdminManager()
+         app.mainloop()

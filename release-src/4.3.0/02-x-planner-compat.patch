@@ -1,0 +1,32 @@
+--- /dev/null	2026-08-28 14:48:57.025262234 +0000
++++ b/telegram_admin_manager_v4.3.0/tam_x/app.py
+@@ -0,0 +1,4 @@
++"""Compatibility exports for the X planner UI."""
++from .ui import XPlannerApp, run_x_planner
++
++__all__ = ["XPlannerApp", "run_x_planner"]
+--- /dev/null	2026-08-28 14:48:57.025262234 +0000
++++ b/telegram_admin_manager_v4.3.0/tam_x/store.py
+@@ -0,0 +1,4 @@
++"""Compatibility exports for X planner persistence models."""
++from .planner import Account, DraftJob, PlannedJob, PlannerStore, TimeWindow
++
++__all__ = ["Account", "DraftJob", "PlannedJob", "PlannerStore", "TimeWindow"]
+--- /dev/null	2026-08-28 14:48:57.025262234 +0000
++++ b/telegram_admin_manager_v4.3.0/tests/test_x_planner_core.py
+@@ -0,0 +1,15 @@
++import unittest
++
++from tam_x.app import XPlannerApp, run_x_planner
++from tam_x.store import PlannerStore
++
++
++class XPlannerCompatibilityTests(unittest.TestCase):
++    def test_compatibility_exports_resolve(self):
++        self.assertIsNotNone(XPlannerApp)
++        self.assertTrue(callable(run_x_planner))
++        self.assertIsNotNone(PlannerStore)
++
++
++if __name__ == "__main__":
++    unittest.main()
