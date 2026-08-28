@@ -1,0 +1,13 @@
+{
+  "version": "4.2.9",
+  "base_version": "4.2.8",
+  "patch_files": [
+    "release-src/4.2.9/01-telegram-admin-manager.patch",
+    "release-src/4.2.9/02-batch-uploader.patch",
+    "release-src/4.2.9/03-repositories.patch",
+    "release-src/4.2.9/04-state-db.patch",
+    "release-src/4.2.9/05-tests.patch",
+    "release-src/4.2.9/06-update-notes.patch"
+  ],
+  "notes": "Дашборд с изменяемыми и сохраняемыми размерами панелей; мониторинг папок продолжает сканирование независимо от активной выгрузки; при обнаружении сразу показывает количество новых файлов."
+}
