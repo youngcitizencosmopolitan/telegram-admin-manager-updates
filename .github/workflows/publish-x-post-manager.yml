@@ -1,0 +1,187 @@
+name: Publish X Post Manager release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'x-post-manager/**'
+      - '.github/workflows/publish-x-post-manager.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'x-post-manager/release.json'
+      - '.github/workflows/publish-x-post-manager.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct verified source package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $r = Get-Content 'x-post-manager/release.json' -Raw | ConvertFrom-Json
+          if (-not $r.version -or -not $r.notes -or -not $r.source_sha256) { throw 'release.json requires version, notes, source_sha256' }
+          if (-not $r.source_chunks -or @($r.source_chunks).Count -eq 0) { throw 'release.json requires source_chunks' }
+          $b64 = ''
+          foreach ($chunk in @($r.source_chunks)) {
+            if (-not (Test-Path $chunk)) { throw "Missing source chunk: $chunk" }
+            $b64 += (Get-Content $chunk -Raw).Trim()
+          }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'x-post-manager-source.zip'), [Convert]::FromBase64String($b64))
+          $actual = (Get-FileHash 'x-post-manager-source.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne ([string]$r.source_sha256).ToLowerInvariant()) { throw "Source SHA mismatch: expected $($r.source_sha256), got $actual" }
+          New-Item -ItemType Directory -Force -Path 'build-src\x-post-manager' | Out-Null
+          Expand-Archive 'x-post-manager-source.zip' -DestinationPath 'build-src\x-post-manager' -Force
+          "VERSION=$($r.version)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SOURCE_DIR=$((Resolve-Path 'build-src\x-post-manager').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'build-src/x-post-manager/requirements.txt'
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "$env:SOURCE_DIR\requirements.txt"
+          pip install pyinstaller==6.15.0
+
+      - name: Run source verification and tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:SOURCE_DIR
+          try {
+            python -m compileall -q .
+            if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
+            python -m unittest discover -s tests -v
+            if ($LASTEXITCODE -ne 0) { throw 'unit tests failed' }
+            $text = Get-Content 'xpostmanager\paths.py' -Raw
+            $m = [regex]::Match($text, 'APP_VERSION\s*=\s*["'']([^"'']+)["'']')
+            if (-not $m.Success -or $m.Groups[1].Value -ne $env:VERSION) { throw "APP_VERSION mismatch: expected $env:VERSION" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Install FFmpeg and Inno Setup
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey FFmpeg install failed' }
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey Inno Setup install failed' }
+
+      - name: Build application and updater
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:SOURCE_DIR
+          try {
+            pyinstaller --noconfirm --clean XPostManager.spec
+            if ($LASTEXITCODE -ne 0) { throw 'XPostManager PyInstaller build failed' }
+            pyinstaller --noconfirm --clean XPostManagerUpdater.spec
+            if ($LASTEXITCODE -ne 0) { throw 'Updater PyInstaller build failed' }
+            Copy-Item 'dist\XPostManagerUpdater.exe' 'dist\XPostManager\XPostManagerUpdater.exe' -Force
+            $ffmpeg = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Filter ffmpeg.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            $ffprobe = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Filter ffprobe.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $ffmpeg -or -not $ffprobe) { throw 'FFmpeg binaries not found after Chocolatey install' }
+            Copy-Item $ffmpeg.FullName 'dist\XPostManager\ffmpeg.exe' -Force
+            Copy-Item $ffprobe.FullName 'dist\XPostManager\ffprobe.exe' -Force
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build update ZIP and installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:SOURCE_DIR
+          try {
+            New-Item -ItemType Directory -Force -Path package | Out-Null
+            $pkg = "package\XPostManager-$env:VERSION"
+            if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+            Copy-Item 'dist\XPostManager\*' $pkg -Recurse -Force
+            $zip = "XPostManager_v$env:VERSION`_update.zip"
+            if (Test-Path $zip) { Remove-Item $zip -Force }
+            Compress-Archive -Path $pkg -DestinationPath $zip -CompressionLevel Optimal
+            $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+            if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found at $iscc" }
+            & $iscc "/DMyAppVersion=$env:VERSION" "/DSourceDir=$((Resolve-Path 'dist\XPostManager').Path)" "/DOutputDir=$((Resolve-Path '.').Path)" 'installer.iss'
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed' }
+            $setup = "XPostManager_Setup_v$env:VERSION.exe"
+            if (-not (Test-Path $setup)) { throw "Installer missing: $setup" }
+            $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "SETUP_NAME=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "ZIP_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } finally {
+            Pop-Location
+          }
+
+      - name: Create or update GitHub Release
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notes = (Get-Content 'x-post-manager/release.json' -Raw | ConvertFrom-Json).notes
+          $tag = "x-v$env:VERSION"
+          $zip = Join-Path $env:SOURCE_DIR $env:ZIP_NAME
+          $setup = Join-Path $env:SOURCE_DIR $env:SETUP_NAME
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip $setup --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag $zip $setup --repo $env:GITHUB_REPOSITORY --title "X Post Manager v$env:VERSION" --notes $notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed' }
+
+      - name: Publish update manifest last
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $r = Get-Content 'x-post-manager/release.json' -Raw | ConvertFrom-Json
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            package_url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/x-v$env:VERSION/XPostManager_v$env:VERSION`_update.zip"
+            sha256 = $env:ZIP_SHA
+            notes = [string]$r.notes
+          }
+          ($manifest | ConvertTo-Json) + "`n" | Set-Content 'x-post-manager/update.json' -Encoding utf8
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add x-post-manager/update.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Publish X Post Manager $env:VERSION"
+            git push
+          }
+
+      - name: Verify published release and manifest
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "x-v$env:VERSION"
+          $json = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets | ConvertFrom-Json
+          $names = @($json.assets | ForEach-Object { $_.name })
+          if ($names -notcontains $env:ZIP_NAME) { throw "Missing release asset $env:ZIP_NAME" }
+          if ($names -notcontains $env:SETUP_NAME) { throw "Missing release asset $env:SETUP_NAME" }
+          $m = Get-Content 'x-post-manager/update.json' -Raw | ConvertFrom-Json
+          if ($m.version -ne $env:VERSION -or $m.sha256 -ne $env:ZIP_SHA) { throw 'Published manifest verification failed' }

@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "source_chunks": [
+    "x-post-manager/release-src/1.0.0/source.zip.b64.00",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.01",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.02",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.03",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.04",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.05",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.06",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.07",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.08",
+    "x-post-manager/release-src/1.0.0/source.zip.b64.09"
+  ],
+  "source_sha256": "2b2dc40ad378846a366d6ff4835f1db7d929d8753f96329ee9e34448f5d92e75",
+  "notes": "Первая версия X Post Manager: несколько X-аккаунтов, очередь разных видео, ручные подписи и общий суффикс, расписание и авто-распределение, автоматическая подготовка/нарезка видео через FFmpeg, публикация частей длинного ролика связанной серией, безопасное хранение токенов через Windows DPAPI и автообновления."
+}
