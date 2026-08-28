@@ -1,0 +1,253 @@
+diff --git a/telegram_admin_manager_v4.2.8/telegram_admin_manager.py b/telegram_admin_manager_v4.2.9/telegram_admin_manager.py
+index 133f5e2..6dde522 100644
+--- a/telegram_admin_manager_v4.2.8/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.2.9/telegram_admin_manager.py
+@@ -57,7 +57,7 @@ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.2.8"
++APP_VERSION = "4.2.9"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -210,6 +210,101 @@ class TelegramAdminManager(tk.Tk):
+             self.after(4500, self._maybe_check_for_updates)
+ 
+     # ---------- UI ----------
++    @staticmethod
++    def _sanitize_sash_positions(raw: Any, *, expected: int) -> list[int]:
++        if not isinstance(raw, (list, tuple)) or expected <= 0:
++            return []
++        values: list[int] = []
++        for item in raw:
++            try:
++                value = int(item)
++            except Exception:
++                continue
++            if value < 0:
++                continue
++            values.append(value)
++            if len(values) >= expected:
++                break
++        return values
++
++    @staticmethod
++    def _collect_pane_sashes(pane: Any, orientation: str) -> list[int]:
++        values: list[int] = []
++        try:
++            count = max(0, len(pane.panes()) - 1)
++        except Exception:
++            return values
++        axis = 0 if str(orientation).casefold().startswith("h") else 1
++        for index in range(count):
++            try:
++                coord = pane.sash_coord(index)
++                values.append(int(coord[axis]))
++            except Exception:
++                continue
++        return values
++
++    def _save_dashboard_sashes(self, _event: Any | None = None) -> None:
++        panes = getattr(self, "_dashboard_panes", {})
++        if not panes:
++            return
++        payload: dict[str, list[int]] = {}
++        for key, (pane, orientation) in panes.items():
++            values = self._collect_pane_sashes(pane, orientation)
++            if values:
++                payload[str(key)] = values
++        if not payload:
++            return
++        try:
++            if self.store.data.get("dashboard_sashes") == payload:
++                return
++            self.store.data["dashboard_sashes"] = payload
++            self.store.save()
++        except Exception:
++            pass
++
++    def _restore_dashboard_sashes(self) -> None:
++        raw = self.store.data.get("dashboard_sashes", {})
++        if not isinstance(raw, dict):
++            return
++        for key, (pane, orientation) in getattr(self, "_dashboard_panes", {}).items():
++            try:
++                expected = max(0, len(pane.panes()) - 1)
++            except Exception:
++                continue
++            positions = self._sanitize_sash_positions(raw.get(key), expected=expected)
++            # Place from the last sash backwards. Moving an early sash can push
++            # later panes because of minsize constraints; reverse order preserves
++            # the saved geometry much more faithfully.
++            for index, value in reversed(list(enumerate(positions))):
++                try:
++                    if str(orientation).casefold().startswith("h"):
++                        pane.sash_place(index, int(value), 0)
++                    else:
++                        pane.sash_place(index, 0, int(value))
++                except Exception:
++                    pass
++            try:
++                self.update_idletasks()
++            except Exception:
++                pass
++
++    @staticmethod
++    def _latest_monitor_detection(rules: list[dict[str, Any]]) -> tuple[str, int, float]:
++        best_name = ""
++        best_count = 0
++        best_stamp = 0.0
++        for rule in rules:
++            try:
++                stamp = float(rule.get("monitor_last_detection", 0) or 0)
++                count = int(rule.get("monitor_last_new_count", 0) or 0)
++            except Exception:
++                continue
++            if count > 0 and stamp > best_stamp:
++                best_stamp = stamp
++                best_count = count
++                best_name = str(rule.get("name", "Правило") or "Правило")
++        return best_name, best_count, best_stamp
++
+     def _build_ui(self) -> None:
+         """Build the v4 single-page dashboard.
+ 
+@@ -269,8 +364,7 @@ class TelegramAdminManager(tk.Tk):
+         # Left: actual one-page dashboard -----------------------------------
+         dashboard = tk.Frame(workspace, bg="#eef2f7")
+         dashboard.columnconfigure(0, weight=1)
+-        dashboard.rowconfigure(3, weight=2)
+-        dashboard.rowconfigure(4, weight=2)
++        dashboard.rowconfigure(1, weight=1)
+         workspace.add(dashboard, stretch="always", minsize=760)
+ 
+         # Metric cards
+@@ -301,14 +395,22 @@ class TelegramAdminManager(tk.Tk):
+             value.pack(anchor="w", pady=(3, 0))
+             self.dashboard_metric_cards[key] = {"frame": card, "value": value, "bg": bg, "accent": accent}
+ 
+-        # Monitoring + quick actions
+-        control_row = tk.Frame(dashboard, bg="#eef2f7")
+-        control_row.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+-        control_row.columnconfigure(0, weight=3)
+-        control_row.columnconfigure(1, weight=2)
++        # Monitoring + queue/groups/activity live in draggable dashboard panes.
++        # The user can resize them with the sash handles; positions are persisted.
++        body_panes = tk.PanedWindow(
++            dashboard, orient="vertical", sashwidth=7, sashrelief="flat",
++            bg="#d8dee8", bd=0, relief="flat",
++        )
++        body_panes.grid(row=1, column=0, sticky="nsew")
++
++        control_row = tk.PanedWindow(
++            body_panes, orient="horizontal", sashwidth=7, sashrelief="flat",
++            bg="#d8dee8", bd=0, relief="flat",
++        )
++        body_panes.add(control_row, stretch="never", minsize=145, pady=4)
+ 
+         monitor_card = tk.Frame(control_row, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=14, pady=12)
+-        monitor_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
++        control_row.add(monitor_card, stretch="always", minsize=390, padx=3)
+         monitor_card.columnconfigure(0, weight=1)
+         tk.Label(monitor_card, text="Фоновый мониторинг", bg="#ffffff", fg="#172033", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
+         self.dashboard_monitor_status = tk.StringVar(value="Остановлен")
+@@ -322,6 +424,12 @@ class TelegramAdminManager(tk.Tk):
+             monitor_card, textvariable=self.dashboard_monitor_details, bg="#ffffff", fg="#64748b",
+             font=("Segoe UI", 9), wraplength=620, justify="left",
+         ).grid(row=2, column=0, sticky="w", pady=(2, 0))
++        self.dashboard_monitor_new_files = tk.StringVar(value="Новых файлов пока не обнаружено")
++        self.dashboard_monitor_new_label = tk.Label(
++            monitor_card, textvariable=self.dashboard_monitor_new_files, bg="#ffffff", fg="#2563eb",
++            font=("Segoe UI", 9, "bold"), wraplength=620, justify="left",
++        )
++        self.dashboard_monitor_new_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(5, 0))
+         self.dashboard_monitor_btn = ttk.Button(
+             monitor_card, text="▶ Включить мониторинг", style="Dashboard.TButton",
+             command=self._dashboard_toggle_monitor,
+@@ -335,10 +443,10 @@ class TelegramAdminManager(tk.Tk):
+             monitor_card,
+             text="Мониторинг только наблюдает за папками и добавляет изменения в очередь. Сам интерфейс остаётся свободным.",
+             bg="#ffffff", fg="#7a8596", font=("Segoe UI", 8), wraplength=700, justify="left",
+-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(9, 0))
++        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(7, 0))
+ 
+         quick = tk.Frame(control_row, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=12, pady=10)
+-        quick.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
++        control_row.add(quick, stretch="always", minsize=280, padx=3)
+         for c in range(2):
+             quick.columnconfigure(c, weight=1)
+         tk.Label(quick, text="Быстрые действия", bg="#ffffff", fg="#172033", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 7))
+@@ -354,8 +462,8 @@ class TelegramAdminManager(tk.Tk):
+             )
+ 
+         # Queue --------------------------------------------------------------
+-        queue_card = tk.Frame(dashboard, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
+-        queue_card.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
++        queue_card = tk.Frame(body_panes, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
++        body_panes.add(queue_card, stretch="always", minsize=115, pady=4)
+         queue_card.columnconfigure(0, weight=1)
+         queue_card.rowconfigure(1, weight=1)
+         qhead = tk.Frame(queue_card, bg="#ffffff")
+@@ -377,8 +485,8 @@ class TelegramAdminManager(tk.Tk):
+         self.dashboard_queue_tree.configure(yscrollcommand=qsb.set)
+ 
+         # Groups / channels catalog -----------------------------------------
+-        groups_card = tk.Frame(dashboard, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
+-        groups_card.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
++        groups_card = tk.Frame(body_panes, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
++        body_panes.add(groups_card, stretch="always", minsize=115, pady=4)
+         groups_card.columnconfigure(0, weight=1)
+         groups_card.rowconfigure(1, weight=1)
+         ghead = tk.Frame(groups_card, bg="#ffffff")
+@@ -403,8 +511,8 @@ class TelegramAdminManager(tk.Tk):
+         self.dashboard_groups_tree.bind("<Double-1>", lambda _e: self._dashboard_open_selected_group_admins())
+ 
+         # Active / recent files ---------------------------------------------
+-        activity_card = tk.Frame(dashboard, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
+-        activity_card.grid(row=4, column=0, sticky="nsew")
++        activity_card = tk.Frame(body_panes, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
++        body_panes.add(activity_card, stretch="always", minsize=150, pady=4)
+         activity_card.columnconfigure(0, weight=1)
+         activity_card.rowconfigure(1, weight=1)
+         ahead = tk.Frame(activity_card, bg="#ffffff")
+@@ -450,6 +558,15 @@ class TelegramAdminManager(tk.Tk):
+         log_sb.grid(row=1, column=1, sticky="ns")
+         self.log_text.configure(yscrollcommand=log_sb.set)
+ 
++        self._dashboard_panes = {
++            "workspace": (workspace, "horizontal"),
++            "body": (body_panes, "vertical"),
++            "controls": (control_row, "horizontal"),
++        }
++        for pane, _orientation in self._dashboard_panes.values():
++            pane.bind("<ButtonRelease-1>", self._save_dashboard_sashes, add="+")
++        self.after(350, self._restore_dashboard_sashes)
++
+         # Hidden advanced workspace -----------------------------------------
+         self.advanced_window = tk.Toplevel(self)
+         self.advanced_window.withdraw()
+@@ -890,8 +1007,22 @@ class TelegramAdminManager(tk.Tk):
+             queued_text = bu.queue_status_var.get() if hasattr(bu, "queue_status_var") else ""
+             self.dashboard_monitor_details.set(
+                 f"Активных правил: {len(enabled_rules)} · {queued_text}. "
+-                + ("Изменения автоматически попадают в очередь." if monitor_on else "Нажми Start — правила продолжат работать независимо от открытых окон.")
++                + (
++                    "Сканирование папок идёт независимо от выгрузки; найденные изменения ждут своей очереди."
++                    if monitor_on else
++                    "Мониторинг остановлен; очередь загрузок может продолжать работать отдельно."
++                )
+             )
++            det_name, det_count, det_stamp = self._latest_monitor_detection(enabled_rules)
++            if det_stamp > 0 and det_count > 0:
++                det_clock = time.strftime("%H:%M:%S", time.localtime(det_stamp))
++                self.dashboard_monitor_new_files.set(
++                    f"Последнее обнаружение: +{det_count} новых файлов · {det_name} · {det_clock}"
++                )
++                self.dashboard_monitor_new_label.configure(fg="#2563eb")
++            else:
++                self.dashboard_monitor_new_files.set("Новых файлов пока не обнаружено")
++                self.dashboard_monitor_new_label.configure(fg="#64748b")
+ 
+             self._mirror_tree(bu.queue_tree, self.dashboard_queue_tree, limit=30)
+             self._mirror_tree(bu.activity, self.dashboard_activity_tree, limit=80)
