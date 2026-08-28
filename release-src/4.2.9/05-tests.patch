@@ -1,0 +1,206 @@
+diff --git a/telegram_admin_manager_v4.2.9/tests/test_dashboard_monitoring_v429.py b/telegram_admin_manager_v4.2.9/tests/test_dashboard_monitoring_v429.py
+new file mode 100644
+index 0000000..a96cd5f
+--- /dev/null
++++ b/telegram_admin_manager_v4.2.9/tests/test_dashboard_monitoring_v429.py
+@@ -0,0 +1,200 @@
++from __future__ import annotations
++
++import asyncio
++import tempfile
++import threading
++import time
++import unittest
++from pathlib import Path
++
++from batch_uploader import BatchUploaderPane
++from tam_core.repositories import MonitorRuleStore
++from tam_core.state_db import StateDatabase
++from telegram_admin_manager import TelegramAdminManager
++
++
++class _DummyMonitorStore:
++    def __init__(self, rule: dict, seen_files: set[str] | None = None):
++        self.rule = dict(rule)
++        self.saved: list[dict] = []
++        self._seen = {str(x).replace("\\", "/").casefold() for x in (seen_files or set())}
++
++    def put(self, rule: dict) -> None:
++        self.rule = dict(rule)
++        self.saved.append(dict(rule))
++
++    def seen_files(self, rule_id: str) -> set[str]:
++        return set(self._seen)
++
++    def replace_seen_files(self, rule_id: str, paths: set[str]) -> None:
++        self._seen = {str(x).replace("\\", "/").casefold() for x in paths}
++
++
++class _DummyApp:
++    def __init__(self, rule: dict, seen_files: set[str] | None = None):
++        self._busy = True
++        self.monitor_rules = _DummyMonitorStore(rule, seen_files)
++        self.logs: list[str] = []
++
++    def ui_call(self, fn):
++        fn()
++
++    def log(self, text: str) -> None:
++        self.logs.append(str(text))
++
++
++class MonitorDetectionTests(unittest.TestCase):
++    def test_monitor_counts_new_files_even_while_upload_is_busy(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            (root / "old.mp4").write_bytes(b"old")
++            (root / "new.mp4").write_bytes(b"new")
++            rule = {
++                "id": "r1",
++                "name": "VIP 1",
++                "folder": str(root),
++                "target": "@vip",
++                "recursive": True,
++                "send_videos": True,
++                "send_photos": False,
++                "monitor_folder": True,
++                "monitor_interval": 15,
++                "monitor_seen_initialized": True,
++            }
++
++            pane = BatchUploaderPane.__new__(BatchUploaderPane)
++            pane.app = _DummyApp(rule, {"old.mp4"})
++            pane.running = True  # active upload
++            pane.monitor_stop_event = threading.Event()
++            pane.monitor_runtime = {}
++            pane.monitor_last_signatures = {"r1": "older-signature"}
++            pane.monitor_pending_signatures = {}
++            pane.monitor_prepared_targets = set()
++            pane.monitor_rules = lambda: [dict(pane.app.monitor_rules.rule)]
++            pane.refresh_monitor_tab = lambda *args, **kwargs: None
++            pane._enqueue_batch = lambda *args, **kwargs: None
++
++            stopper = threading.Timer(0.15, pane.monitor_stop_event.set)
++            stopper.start()
++            try:
++                asyncio.run(pane._monitor_loop())
++            finally:
++                stopper.cancel()
++
++            runtime = pane.monitor_runtime["r1"]
++            self.assertEqual(runtime.get("new_files"), 1)
++            self.assertGreater(float(runtime.get("last_detected", 0)), 0)
++            self.assertTrue(any("1" in line and "нов" in line.casefold() for line in pane.app.logs))
++            self.assertTrue(pane.app._busy, "test must exercise monitoring while another operation owns busy state")
++
++    def test_first_seen_snapshot_becomes_baseline_without_false_alert(self) -> None:
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {"id": "r1", "name": "VIP", "monitor_seen_initialized": False}
++        updated, new_count, initialized = pane._update_monitor_seen_state(
++            rule,
++            previous_files=set(),
++            current_files={"a.mp4", "folder/b.mp4"},
++            now=123.0,
++        )
++        self.assertTrue(initialized)
++        self.assertEqual(new_count, 0)
++        self.assertTrue(updated["monitor_seen_initialized"])
++        self.assertNotIn("monitor_last_new_count", updated)
++
++    def test_seen_snapshot_reports_only_new_paths(self) -> None:
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {
++            "id": "r1",
++            "name": "VIP",
++            "monitor_seen_initialized": True,
++        }
++        updated, new_count, initialized = pane._update_monitor_seen_state(
++            rule,
++            previous_files={"a.mp4", "folder/b.mp4"},
++            current_files={"a.mp4", "folder/b.mp4", "folder/c.mp4", "d.jpg"},
++            now=456.0,
++        )
++        self.assertFalse(initialized)
++        self.assertEqual(new_count, 2)
++        self.assertEqual(updated["monitor_last_new_count"], 2)
++        self.assertEqual(updated["monitor_last_detection"], 456.0)
++
++
++class MonitorRulePersistenceTests(unittest.TestCase):
++    def test_sync_from_task_preserves_detection_baseline_when_identity_is_same(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            db = StateDatabase(Path(td) / "state.db")
++            store = MonitorRuleStore(db)
++            existing = {
++                "id": "t1",
++                "name": "VIP",
++                "folder": "C:/VIP",
++                "target": "@vip",
++                "recursive": True,
++                "send_videos": True,
++                "send_photos": False,
++                "forum_topics_from_subfolders": False,
++                "monitor_folder": True,
++                "monitor_signature": "sig",
++                "monitor_seen_initialized": True,
++                "monitor_last_new_count": 2,
++                "monitor_last_detection": 100.0,
++            }
++            store.put(existing)
++            store.replace_seen_files("t1", {"a.mp4", "b.mp4"})
++            edited = dict(existing)
++            edited.pop("monitor_signature")
++            edited.pop("monitor_seen_initialized")
++            edited.pop("monitor_last_new_count")
++            edited.pop("monitor_last_detection")
++            edited["name"] = "VIP renamed"
++            store.sync_from_task(edited)
++            result = store.get("t1")
++            self.assertTrue(result.get("monitor_seen_initialized"))
++            self.assertEqual(store.seen_files("t1"), {"a.mp4", "b.mp4"})
++            self.assertEqual(result.get("monitor_last_new_count"), 2)
++            self.assertEqual(result.get("monitor_last_detection"), 100.0)
++
++    def test_seen_file_index_roundtrips_without_bloating_rule_payload(self) -> None:
++        with tempfile.TemporaryDirectory() as td:
++            db = StateDatabase(Path(td) / "state.db")
++            store = MonitorRuleStore(db)
++            store.put({"id": "r1", "name": "VIP", "folder": "C:/VIP", "target": "@vip"})
++            store.replace_seen_files("r1", {"A.mp4", "folder/B.mp4"})
++            self.assertEqual(store.seen_files("r1"), {"a.mp4", "folder/b.mp4"})
++            self.assertNotIn("monitor_seen_files", store.get("r1"))
++            store.delete("r1")
++            self.assertEqual(store.seen_files("r1"), set())
++
++
++class DashboardLayoutTests(unittest.TestCase):
++    def test_saved_sash_positions_ignore_invalid_values(self) -> None:
++        self.assertEqual(
++            TelegramAdminManager._sanitize_sash_positions([120, "240", -5, "oops", 360], expected=3),
++            [120, 240, 360],
++        )
++        self.assertEqual(TelegramAdminManager._sanitize_sash_positions(None, expected=2), [])
++
++
++    def test_collect_pane_sashes_reads_requested_axis(self) -> None:
++        class FakePane:
++            def panes(self):
++                return ("a", "b", "c")
++            def sash_coord(self, index):
++                return ((100, 5), (220, 9))[index]
++
++        pane = FakePane()
++        self.assertEqual(TelegramAdminManager._collect_pane_sashes(pane, "horizontal"), [100, 220])
++        self.assertEqual(TelegramAdminManager._collect_pane_sashes(pane, "vertical"), [5, 9])
++
++    def test_latest_monitor_detection_uses_most_recent_rule(self) -> None:
++        rules = [
++            {"name": "A", "monitor_last_detection": 100.0, "monitor_last_new_count": 2},
++            {"name": "B", "monitor_last_detection": 200.0, "monitor_last_new_count": 7},
++        ]
++        name, count, stamp = TelegramAdminManager._latest_monitor_detection(rules)
++        self.assertEqual((name, count, stamp), ("B", 7, 200.0))
++
++
++if __name__ == "__main__":
++    unittest.main()
