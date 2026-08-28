@@ -1,10 +1,17 @@
 name: Publish Telegram Admin Manager release
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'release.json'
+      - 'release-src/**'
+      - '.github/workflows/publish-release.yml'
   push:
     branches: [main]
     paths:
       - 'release.json'
+      - '.github/workflows/publish-release.yml'
 
 permissions:
   contents: write
@@ -41,9 +48,13 @@ jobs:
               f.write(f"BASE_VERSION={str(d['base_version']).strip()}\n")
           patches = d.get('patch_files') or ([d.get('patch_file')] if d.get('patch_file') else [])
           patches = [str(x).strip() for x in patches if str(x).strip()]
-          if not patches:
-              raise SystemExit('release.json requires patch_files or patch_file')
-          Path('.release-patches.txt').write_text('\n'.join(patches) + '\n', encoding='utf-8')
+          overlays = [str(x).strip() for x in (d.get('overlay_chunks') or []) if str(x).strip()]
+          if not patches and not overlays:
+              raise SystemExit('release.json requires patch_files/patch_file or overlay_chunks')
+          Path('.release-patches.txt').write_text('\n'.join(patches) + ('\n' if patches else ''), encoding='utf-8')
+          Path('.release-overlay-chunks.txt').write_text('\n'.join(overlays) + ('\n' if overlays else ''), encoding='utf-8')
+          if overlays and not str(d.get('overlay_sha256', '')).strip():
+              raise SystemExit('release.json requires overlay_sha256 when overlay_chunks are used')
           PY
 
       - name: Rebuild package from previous verified release
@@ -53,7 +64,7 @@ jobs:
           BASE_ZIP="TelegramAdminManager_v${BASE_VERSION}_update.zip"
           NEW_ZIP="TelegramAdminManager_v${VERSION}_update.zip"
           BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${BASE_VERSION}/${BASE_ZIP}"
-          rm -rf extracted package "$BASE_ZIP" "$NEW_ZIP"
+          rm -rf extracted package "$BASE_ZIP" "$NEW_ZIP" .release-overlay.zip
           mkdir -p extracted package
           curl -fL --retry 3 --retry-delay 2 "$BASE_URL" -o "$BASE_ZIP"
           unzip -q "$BASE_ZIP" -d extracted
@@ -62,11 +73,32 @@ jobs:
           DEST="package/TelegramAdminManager-${VERSION}"
           mkdir -p "$DEST"
           cp -a "$SRC_DIR"/. "$DEST/"
-          while IFS= read -r PATCH_FILE; do
-            test -f "$PATCH_FILE"
-            echo "Applying $PATCH_FILE"
-            (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
-          done < .release-patches.txt
+
+          if [[ -s .release-patches.txt ]]; then
+            while IFS= read -r PATCH_FILE; do
+              test -f "$PATCH_FILE"
+              echo "Applying $PATCH_FILE"
+              (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
+            done < .release-patches.txt
+          fi
+
+          if [[ -s .release-overlay-chunks.txt ]]; then
+            python3 - <<'PY'
+          import base64, hashlib, json
+          from pathlib import Path
+          release = json.loads(Path('release.json').read_text(encoding='utf-8'))
+          chunks = [Path(x) for x in release.get('overlay_chunks') or []]
+          encoded = ''.join(p.read_text(encoding='utf-8').strip() for p in chunks)
+          payload = base64.b64decode(encoded, validate=True)
+          actual = hashlib.sha256(payload).hexdigest()
+          expected = str(release.get('overlay_sha256', '')).strip().lower()
+          if actual != expected:
+              raise SystemExit(f'Overlay SHA mismatch: expected {expected}, got {actual}')
+          Path('.release-overlay.zip').write_bytes(payload)
+          print('Overlay verified:', actual)
+          PY
+            unzip -oq .release-overlay.zip -d "$DEST"
+          fi
 
           python3 - <<'PY'
           import json, os, shutil
@@ -90,11 +122,17 @@ jobs:
           import os, re
           from pathlib import Path
           version = os.environ['VERSION']
-          p = Path('package') / ('TelegramAdminManager-' + version) / 'telegram_admin_manager.py'
+          root = Path('package') / ('TelegramAdminManager-' + version)
+          p = root / 'telegram_admin_manager.py'
           text = p.read_text(encoding='utf-8')
           m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
           if not m or m.group(1) != version:
               raise SystemExit(f'APP_VERSION mismatch: expected {version}, got {m.group(1) if m else None}')
+          if version == '4.3.0':
+              required = [root/'tam_x'/'app.py', root/'tam_x'/'planner.py', root/'tam_x'/'store.py', root/'tests'/'test_x_planner_core.py']
+              missing = [str(x) for x in required if not x.is_file()]
+              if missing:
+                  raise SystemExit('X planner files missing from candidate: ' + ', '.join(missing))
           PY
           python3 -m compileall -q "$DEST"
           (cd "$DEST" && python3 -m unittest discover -s tests -v)
@@ -114,7 +152,17 @@ jobs:
           echo "Package: $NEW_ZIP"
           echo "SHA256: $SHA256"
 
+      - name: Upload pull request candidate
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-admin-manager-${{ env.VERSION }}-candidate
+          path: ${{ env.NEW_ZIP }}
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Create or update GitHub Release
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -131,6 +179,7 @@ jobs:
           fi
 
       - name: Publish update manifest last
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
@@ -156,6 +205,7 @@ jobs:
           fi
 
       - name: Verify published release and manifest
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
