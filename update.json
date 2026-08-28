@@ -1,6 +1,6 @@
 {
-  "version": "4.2.2",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.2.2/TelegramAdminManager_v4.2.2_update.zip",
-  "sha256": "fc027d77f3509d1504e66f253c22285de2155956b97ec7691d1909478183c8b8",
-  "notes": "Первый релиз через постоянный GitHub-канал обновлений."
+  "version": "4.2.7",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.2.7/TelegramAdminManager_v4.2.7_update.zip",
+  "sha256": "cdb5bcaddd4c6cfec35ce2bb5e92f42eab4bb8f03dcde28147e4f807e8170d2b",
+  "notes": "Тест автообновления: переход с v4.2.6 на v4.2.7. Функциональных изменений нет."
 }
