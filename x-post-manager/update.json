@@ -1,6 +1,7 @@
 {
-  "version": "0.0.0",
-  "package_url": "",
-  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "notes": "X Post Manager has not been published yet."
+  "version": "1.0.0",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/x-v1.0.0/XPostManager_v1.0.0_update.zip",
+  "sha256": "a85c723bc6ec4db9fd6f9838dc0747c7b374b42602fbc8333d4e04e010dba9a9",
+  "notes": "Первая версия X Post Manager: несколько X-аккаунтов, очередь разных видео, ручные подписи и общий суффикс, расписание и авто-распределение, автоматическая подготовка/нарезка видео через FFmpeg, публикация частей длинного ролика связанной серией, безопасное хранение токенов через Windows DPAPI и автообновления."
 }
+
