@@ -1,6 +1,6 @@
 {
-  "version": "4.2.8",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.2.8/TelegramAdminManager_v4.2.8_update.zip",
-  "sha256": "431cf86abf8f634a8c53b37831b461b8e7d42e11955f218ab879d57b99e50aa5",
-  "notes": "Второй тест автообновления: переход с v4.2.7 на v4.2.8. Функциональных изменений нет."
+  "version": "4.2.9",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.2.9/TelegramAdminManager_v4.2.9_update.zip",
+  "sha256": "af13a5328b8487d0eaf5ef80345e50c453bc4372179dd2199a122cb8b135346e",
+  "notes": "Дашборд с изменяемыми и сохраняемыми размерами панелей; мониторинг папок продолжает сканирование независимо от активной выгрузки; при обнаружении сразу показывает количество новых файлов."
 }
