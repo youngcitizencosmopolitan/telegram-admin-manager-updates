@@ -1,6 +1,6 @@
 {
-  "version": "4.2.9",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.2.9/TelegramAdminManager_v4.2.9_update.zip",
-  "sha256": "af13a5328b8487d0eaf5ef80345e50c453bc4372179dd2199a122cb8b135346e",
-  "notes": "Дашборд с изменяемыми и сохраняемыми размерами панелей; мониторинг папок продолжает сканирование независимо от активной выгрузки; при обнаружении сразу показывает количество новых файлов."
+  "version": "4.3.0",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.3.0/TelegramAdminManager_v4.3.0_update.zip",
+  "sha256": "90017c47462a7a2940e95d9fbfae2e7b117a4be7f9276e928dc1b09b7e44c64e",
+  "notes": "Добавлен встроенный Twitter / X Planner: аккаунты через отдельные профили Chrome/Edge, очередь видео, подписи и общий суффикс, конкретный/случайный/по кругу/наименее загруженный аккаунт, автоматическое распределение по настраиваемым временным окнам, календарь и быстрый переход к следующей публикации. Без X API, X Pro и автоматического управления сайтом x.com."
 }
