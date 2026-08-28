@@ -1,0 +1,50 @@
+diff --git a/telegram_admin_manager_v4.2.8/tam_core/repositories.py b/telegram_admin_manager_v4.2.9/tam_core/repositories.py
+index 7c325a9..1e02872 100644
+--- a/telegram_admin_manager_v4.2.8/tam_core/repositories.py
++++ b/telegram_admin_manager_v4.2.9/tam_core/repositories.py
+@@ -351,6 +351,15 @@ class MonitorRuleStore:
+     def put(self, rule: dict[str, Any]) -> None:
+         self.db.monitor_rule_put(dict(rule))
+ 
++    def seen_files(self, rule_id: str) -> set[str]:
++        return self.db.monitor_seen_files(rule_id)
++
++    def replace_seen_files(self, rule_id: str, paths: set[str] | list[str]) -> None:
++        self.db.monitor_seen_replace(rule_id, paths)
++
++    def reset_seen_files(self, rule_id: str) -> None:
++        self.db.monitor_seen_replace(rule_id, [])
++
+     def delete(self, rule_id: str) -> None:
+         self.db.monitor_rule_delete(rule_id)
+ 
+@@ -372,11 +381,24 @@ class MonitorRuleStore:
+         updated = dict(task)
+         updated["id"] = tid
+         updated["monitor_folder"] = wants_monitor
+-        if existing and self._identity(existing) == self._identity(updated):
+-            if existing.get("monitor_signature"):
+-                updated["monitor_signature"] = existing.get("monitor_signature")
+-            if existing.get("monitor_last_success"):
+-                updated["monitor_last_success"] = existing.get("monitor_last_success")
++        same_identity = bool(existing and self._identity(existing) == self._identity(updated))
++        if same_identity:
++            for key in (
++                "monitor_signature", "monitor_last_success",
++                "monitor_seen_initialized",
++                "monitor_last_new_count", "monitor_last_detection",
++            ):
++                if key in existing:
++                    updated[key] = existing.get(key)
++        elif existing:
++            # A different folder/media selection is a new monitoring baseline.
++            self.reset_seen_files(tid)
++            for key in (
++                "monitor_signature", "monitor_last_success",
++                "monitor_seen_initialized",
++                "monitor_last_new_count", "monitor_last_detection",
++            ):
++                updated.pop(key, None)
+         self.put(updated)
+ 
+     def migrate_from_tasks(self, tasks: list[dict[str, Any]]) -> int:
