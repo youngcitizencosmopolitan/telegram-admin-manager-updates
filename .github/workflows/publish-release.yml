@@ -24,7 +24,7 @@ jobs:
           import json, os
           from pathlib import Path
           d = json.loads(Path('release.json').read_text(encoding='utf-8'))
-          required = ['version', 'base_version', 'notes', 'patch_file']
+          required = ['version', 'base_version', 'notes']
           missing = [k for k in required if not str(d.get(k, '')).strip()]
           if missing:
               raise SystemExit('release.json missing: ' + ', '.join(missing))
@@ -32,7 +32,11 @@ jobs:
           with env.open('a', encoding='utf-8') as f:
               f.write(f"VERSION={str(d['version']).strip()}\n")
               f.write(f"BASE_VERSION={str(d['base_version']).strip()}\n")
-              f.write(f"PATCH_FILE={str(d['patch_file']).strip()}\n")
+          patches = d.get('patch_files') or ([d.get('patch_file')] if d.get('patch_file') else [])
+          patches = [str(x).strip() for x in patches if str(x).strip()]
+          if not patches:
+              raise SystemExit('release.json requires patch_files or patch_file')
+          Path('.release-patches.txt').write_text('\n'.join(patches) + '\n', encoding='utf-8')
           PY
 
       - name: Rebuild package from previous verified release
@@ -51,8 +55,11 @@ jobs:
           DEST="package/TelegramAdminManager-${VERSION}"
           mkdir -p "$DEST"
           cp -a "$SRC_DIR"/. "$DEST/"
-          test -f "$PATCH_FILE"
-          (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
+          while IFS= read -r PATCH_FILE; do
+            test -f "$PATCH_FILE"
+            echo "Applying $PATCH_FILE"
+            (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
+          done < .release-patches.txt
 
           python3 - <<'PY'
           import json, os, shutil
