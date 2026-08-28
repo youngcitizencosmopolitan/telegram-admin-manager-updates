@@ -16,6 +16,13 @@ jobs:
       - name: Checkout update repository
         uses: actions/checkout@v4
 
+      - name: Install UI test dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-tk
+
       - name: Read release metadata
         shell: bash
         run: |
