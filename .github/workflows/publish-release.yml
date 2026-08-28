@@ -1,0 +1,164 @@
+name: Publish Telegram Admin Manager release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'release.json'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout update repository
+        uses: actions/checkout@v4
+
+      - name: Read release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          d = json.loads(Path('release.json').read_text(encoding='utf-8'))
+          required = ['version', 'base_version', 'notes', 'patch_file']
+          missing = [k for k in required if not str(d.get(k, '')).strip()]
+          if missing:
+              raise SystemExit('release.json missing: ' + ', '.join(missing))
+          env = Path(os.environ['GITHUB_ENV'])
+          with env.open('a', encoding='utf-8') as f:
+              f.write(f"VERSION={str(d['version']).strip()}\n")
+              f.write(f"BASE_VERSION={str(d['base_version']).strip()}\n")
+              f.write(f"PATCH_FILE={str(d['patch_file']).strip()}\n")
+          PY
+
+      - name: Rebuild package from previous verified release
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_ZIP="TelegramAdminManager_v${BASE_VERSION}_update.zip"
+          NEW_ZIP="TelegramAdminManager_v${VERSION}_update.zip"
+          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${BASE_VERSION}/${BASE_ZIP}"
+          rm -rf extracted package "$BASE_ZIP" "$NEW_ZIP"
+          mkdir -p extracted package
+          curl -fL --retry 3 --retry-delay 2 "$BASE_URL" -o "$BASE_ZIP"
+          unzip -q "$BASE_ZIP" -d extracted
+          SRC_DIR="$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)"
+          test -n "$SRC_DIR"
+          DEST="package/TelegramAdminManager-${VERSION}"
+          mkdir -p "$DEST"
+          cp -a "$SRC_DIR"/. "$DEST/"
+          test -f "$PATCH_FILE"
+          (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
+
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          d = json.loads(Path('release.json').read_text(encoding='utf-8'))
+          dest = Path('package') / ('TelegramAdminManager-' + os.environ['VERSION'])
+          for rel in d.get('delete_files') or []:
+              p = dest / str(rel)
+              if p.is_dir():
+                  shutil.rmtree(p)
+              elif p.exists():
+                  p.unlink()
+          PY
+
+      - name: Validate source and run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="package/TelegramAdminManager-${VERSION}"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = os.environ['VERSION']
+          p = Path('package') / ('TelegramAdminManager-' + version) / 'telegram_admin_manager.py'
+          text = p.read_text(encoding='utf-8')
+          m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+          if not m or m.group(1) != version:
+              raise SystemExit(f'APP_VERSION mismatch: expected {version}, got {m.group(1) if m else None}')
+          PY
+          python3 -m compileall -q "$DEST"
+          (cd "$DEST" && python3 -m unittest discover -s tests -v)
+
+      - name: Build update ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="package/TelegramAdminManager-${VERSION}"
+          find "$DEST" -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find "$DEST" -type f -name '*.pyc' -delete
+          NEW_ZIP="TelegramAdminManager_v${VERSION}_update.zip"
+          (cd package && zip -qr "../${NEW_ZIP}" "TelegramAdminManager-${VERSION}")
+          SHA256="$(sha256sum "$NEW_ZIP" | awk '{print $1}')"
+          echo "NEW_ZIP=$NEW_ZIP" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "Package: $NEW_ZIP"
+          echo "SHA256: $SHA256"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="$(python3 -c "import json; print(json.load(open('release.json', encoding='utf-8'))['notes'])")"
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" "$NEW_ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "v${VERSION}" "$NEW_ZIP" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Telegram Admin Manager v${VERSION}" \
+              --notes "$NOTES"
+          fi
+
+      - name: Publish update manifest last
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path('release.json').read_text(encoding='utf-8'))
+          version = os.environ['VERSION']
+          data = {
+              'version': version,
+              'package_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/v{version}/TelegramAdminManager_v{version}_update.zip",
+              'sha256': os.environ['SHA256'],
+              'notes': str(release['notes']),
+          }
+          Path('update.json').write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish Telegram Admin Manager ${VERSION}"
+            git push
+          fi
+
+      - name: Verify published release and manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" --json assets >/tmp/release-assets.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          version = os.environ['VERSION']
+          expected = f'TelegramAdminManager_v{version}_update.zip'
+          rel = json.loads(Path('/tmp/release-assets.json').read_text())
+          names = {a.get('name') for a in rel.get('assets', [])}
+          if expected not in names:
+              raise SystemExit('Release asset missing: ' + expected)
+          manifest = json.loads(Path('update.json').read_text(encoding='utf-8'))
+          assert manifest['version'] == version
+          assert manifest['sha256'] == os.environ['SHA256']
+          print('Publication verified:', version, manifest['sha256'])
+          PY
