@@ -1,0 +1,202 @@
+diff --git a/telegram_admin_manager_v4.2.8/batch_uploader.py b/telegram_admin_manager_v4.2.9/batch_uploader.py
+index b6b1580..c0da985 100644
+--- a/telegram_admin_manager_v4.2.8/batch_uploader.py
++++ b/telegram_admin_manager_v4.2.9/batch_uploader.py
+@@ -462,18 +462,18 @@ class BatchUploaderPane:
+         frame.grid(row=2, column=0, sticky="nsew")
+         frame.columnconfigure(0, weight=1)
+         frame.rowconfigure(0, weight=1)
+-        cols = ("on", "source", "folder", "target", "interval", "last", "next", "admins", "topics", "queue", "state")
++        cols = ("on", "source", "folder", "target", "interval", "last", "next", "admins", "topics", "new", "queue", "state")
+         self.monitor_tree = ttk.Treeview(frame, columns=cols, show="tree headings", selectmode="browse")
+         headings = {
+             "#0": "Правило", "on": "Мон.", "source": "Источник", "folder": "Папка", "target": "Группа",
+             "interval": "Интервал", "last": "Последняя проверка", "next": "Следующая",
+-            "admins": "Админы (кэш)", "topics": "Темы (кэш)", "queue": "Очередь", "state": "Состояние",
++            "admins": "Админы (кэш)", "topics": "Темы (кэш)", "new": "Новые", "queue": "Очередь", "state": "Состояние",
+         }
+         widths = {"#0": 145, "on": 50, "source": 95, "folder": 225, "target": 180, "interval": 70, "last": 120,
+-                  "next": 95, "admins": 100, "topics": 85, "queue": 95, "state": 140}
++                  "next": 95, "admins": 100, "topics": 85, "new": 70, "queue": 95, "state": 160}
+         for col, title in headings.items():
+             self.monitor_tree.heading(col, text=title)
+-            self.monitor_tree.column(col, width=widths[col], minwidth=50, anchor="w" if col not in {"on", "source", "interval", "admins", "topics", "queue"} else "center")
++            self.monitor_tree.column(col, width=widths[col], minwidth=50, anchor="w" if col not in {"on", "source", "interval", "admins", "topics", "new", "queue"} else "center")
+         self.monitor_tree.grid(row=0, column=0, sticky="nsew")
+         sb = ttk.Scrollbar(frame, orient="vertical", command=self.monitor_tree.yview)
+         sb.grid(row=0, column=1, sticky="ns")
+@@ -585,6 +585,7 @@ class BatchUploaderPane:
+                     next_text,
+                     f"{known_admins}/{len(accounts)}" if accounts else "0/0",
+                     str(topics_count),
++                    str(int(runtime.get("new_files", rule.get("monitor_last_new_count", 0)) or 0)) if int(runtime.get("new_files", rule.get("monitor_last_new_count", 0)) or 0) > 0 else "—",
+                     queue_text,
+                     state,
+                 ),
+@@ -667,9 +668,22 @@ class BatchUploaderPane:
+             and bool(updated.get("send_photos", False)) == bool(original.get("send_photos", False))
+             and bool(updated.get("forum_topics_from_subfolders", False)) == bool(original.get("forum_topics_from_subfolders", False))
+         )
+-        if same_identity and original.get("monitor_signature"):
+-            updated["monitor_signature"] = original.get("monitor_signature")
+-            updated["monitor_last_success"] = original.get("monitor_last_success", 0)
++        if same_identity:
++            for key in (
++                "monitor_signature", "monitor_last_success",
++                "monitor_seen_initialized",
++                "monitor_last_new_count", "monitor_last_detection",
++            ):
++                if key in original:
++                    updated[key] = original.get(key)
++        else:
++            self.app.monitor_rules.reset_seen_files(tid)
++            for key in (
++                "monitor_signature", "monitor_last_success",
++                "monitor_seen_initialized",
++                "monitor_last_new_count", "monitor_last_detection",
++            ):
++                updated.pop(key, None)
+         self.app.monitor_rules.put(updated)
+         self._set_linked_task_monitor_flag(tid, bool(updated.get("monitor_folder", False)))
+         self.refresh_monitor_tab()
+@@ -703,8 +717,39 @@ class BatchUploaderPane:
+         task = dict(rule)
+         # Monitoring enablement is independent from the package task's Enabled flag.
+         task["enabled"] = True
++        # Detection bookkeeping can contain thousands of relative paths. It belongs
++        # to the monitor rule, not to persistent upload queue snapshots.
++        for key in (
++            "monitor_seen_initialized",
++            "monitor_last_new_count", "monitor_last_detection",
++        ):
++            task.pop(key, None)
+         return task
+ 
++    @staticmethod
++    def _update_monitor_seen_state(
++        rule: dict[str, Any], *, previous_files: set[str], current_files: set[str], now: float
++    ) -> tuple[dict[str, Any], int, bool]:
++        """Update compact detection metadata while the file index lives in SQLite.
++
++        The seen-file index is separate from monitor_signature and from the rule's
++        JSON payload. This keeps dashboard reads lightweight and lets monitoring
++        report arrivals even while an older upload is running.
++        """
++        updated = dict(rule)
++        previous = {str(x).replace("\\", "/").casefold() for x in previous_files if str(x)}
++        current = {str(x).replace("\\", "/").casefold() for x in current_files if str(x)}
++        has_baseline = bool(updated.get("monitor_seen_initialized", False))
++        updated["monitor_seen_initialized"] = True
++        if not has_baseline:
++            return updated, 0, True
++        new_count = len(current - previous)
++        if new_count > 0:
++            updated["monitor_last_new_count"] = int(new_count)
++            updated["monitor_last_detection"] = float(now)
++        return updated, int(new_count), False
++
++
+     def enqueue_selected_monitor_rule(self) -> None:
+         tid = self._monitor_selected_tid()
+         if not tid:
+@@ -1531,11 +1576,15 @@ class BatchUploaderPane:
+                 titles.append(title)
+         return sorted(titles, key=str.casefold)
+ 
+-    def _folder_signature(self, task: dict[str, Any]) -> str:
+-        """Cheap metadata-only signature; never reads the media payload."""
++    def _scan_monitor_snapshot(self, task: dict[str, Any]) -> tuple[str, set[str]]:
++        """Return metadata signature plus normalized relative media paths.
++
++        The scan is metadata-only and runs on the monitoring event loop's worker
++        thread, independent from the upload event loop and its file transfers.
++        """
+         root = Path(str(task.get("folder", "")))
+         if not root.exists() or not root.is_dir():
+-            return "missing"
++            return "missing", set()
+         h = hashlib.blake2b(digest_size=16)
+         try:
+             for d in sorted((x for x in root.iterdir() if x.is_dir()), key=lambda x: x.name.casefold()):
+@@ -1547,18 +1596,25 @@ class BatchUploaderPane:
+         try:
+             files, _total = self._scan_task_files(task)
+         except Exception:
+-            return "error"
++            return "error", set()
++        relative_files: set[str] = set()
+         for path in files:
+             try:
+                 st = path.stat()
+-                rel = str(path.relative_to(root))
++                rel = str(path.relative_to(root)).replace("\\", "/")
++                relative_files.add(rel.casefold())
+                 h.update(rel.encode("utf-8", errors="ignore"))
+                 h.update(str(int(st.st_size)).encode())
+                 h.update(str(int(st.st_mtime_ns)).encode())
+                 h.update(b"\0")
+             except OSError:
+                 continue
+-        return h.hexdigest()
++        return h.hexdigest(), relative_files
++
++    def _folder_signature(self, task: dict[str, Any]) -> str:
++        """Compatibility wrapper for callers that only need the signature."""
++        signature, _files = self._scan_monitor_snapshot(task)
++        return signature
+ 
+     def _effective_global_parallel(self, tasks: list[dict[str, Any]]) -> int:
+         accounts_by_session = {a.session: a for a in self.app.store.accounts()}
+@@ -1738,11 +1794,50 @@ class BatchUploaderPane:
+                 runtime = self.monitor_runtime.setdefault(tid, {})
+                 runtime.update({"last_check": wall_now, "next_check": wall_now + interval, "state": "Сканирование…"})
+                 self.app.ui_call(self.refresh_monitor_tab)
+-                signature = await asyncio.to_thread(self._folder_signature, task)
++                signature, current_files = await asyncio.to_thread(self._scan_monitor_snapshot, task)
++
++                # File arrival detection is independent from uploads. Persist the
++                # observed path set immediately, even if another upload currently
++                # owns Telegram sessions or this task is already queued.
++                new_count = 0
++                initialized = False
++                if signature not in {"missing", "error"}:
++                    try:
++                        previous_files = self.app.monitor_rules.seen_files(tid)
++                    except Exception as exc:
++                        previous_files = set()
++                        self.app.log(f"Мониторинг: не удалось прочитать индекс файлов {task.get('name', tid)} — {exc}")
++                    updated_rule, new_count, initialized = self._update_monitor_seen_state(
++                        task, previous_files=previous_files, current_files=current_files, now=wall_now
++                    )
++                    try:
++                        if initialized or current_files != previous_files:
++                            self.app.monitor_rules.replace_seen_files(tid, current_files)
++                        if updated_rule != task:
++                            self.app.monitor_rules.put(updated_rule)
++                            task = updated_rule
++                    except Exception as exc:
++                        self.app.log(f"Мониторинг: не удалось сохранить снимок файлов {task.get('name', tid)} — {exc}")
++                    if new_count > 0:
++                        runtime["new_files"] = int(new_count)
++                        runtime["last_detected"] = wall_now
++                        self.app.log(
++                            f"Мониторинг: {task.get('name', 'Правило')} — найдено новых файлов: {new_count}."
++                        )
++                    elif initialized:
++                        runtime["new_files"] = 0
++
+                 old = self.monitor_last_signatures.get(tid)
+                 pending = self.monitor_pending_signatures.get(tid)
+                 changed = signature != old and signature != pending
+-                runtime["state"] = "Изменения → очередь" if changed else "Без изменений"
++                if new_count > 0:
++                    runtime["state"] = f"Новых файлов: {new_count} → очередь" if changed else f"Новых файлов: {new_count}"
++                elif signature == "missing":
++                    runtime["state"] = "Папка недоступна"
++                elif signature == "error":
++                    runtime["state"] = "Ошибка сканирования"
++                else:
++                    runtime["state"] = "Изменения → очередь" if changed else "Без изменений"
+                 if changed:
+                     due_signatures[tid] = signature
+                     due_changed.append(self._monitor_task_for_queue(task))
