@@ -1,0 +1,87 @@
+diff --git a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+index e97ec2a..a70a147 100644
+--- a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+@@ -1313,29 +1459,28 @@ class TelegramAdminManager(tk.Tk):
+         self.factory_all_admins_var = tk.BooleanVar(value=True)
+         ttk.Checkbutton(
+             admins_box,
+-            text="Все сохранённые аккаунты (динамически)",
++            text="Все мои сохранённые аккаунты",
+             variable=self.factory_all_admins_var,
+             command=self._factory_sync_admin_list_state,
+         ).grid(row=0, column=0, sticky="w", pady=(0, 5))
+-        self.factory_admins_list = tk.Listbox(admins_box, selectmode=tk.EXTENDED, exportselection=False, height=6)
++        self.factory_admins_list = tk.Listbox(admins_box, selectmode=tk.EXTENDED, exportselection=False, height=7)
+         self.factory_admins_list.grid(row=1, column=0, sticky="ew")
+         ttk.Button(admins_box, text="Выбрать все", command=lambda: self.factory_admins_list.select_set(0, tk.END)).grid(row=2, column=0, sticky="w", pady=(5, 0))
+ 
+         actions = ttk.Frame(t)
+         actions.grid(row=2, column=0, sticky="ew", pady=10)
+-        ttk.Button(actions, text="100 пустых / аккаунт", command=self._factory_preset_100_empty).pack(side="left")
+-        self.factory_preview_button = ttk.Button(actions, text="Предпросмотр плана", command=self._factory_preview)
+-        self.factory_preview_button.pack(side="left", padx=(6, 0))
+-        self.factory_start_button = ttk.Button(actions, text="Создать", command=self._factory_start)
++        self.factory_preview_button = ttk.Button(actions, text="Предпросмотр", command=self._factory_preview)
++        self.factory_preview_button.pack(side="left")
++        self.factory_start_button = ttk.Button(actions, text="Создать группы", command=self._factory_start)
+         self.factory_start_button.pack(side="left", padx=6)
+         self.factory_stop_button = ttk.Button(actions, text="Стоп после текущей", command=self._factory_stop, state="disabled")
+         self.factory_stop_button.pack(side="left")
+-        self.factory_progress = ttk.Progressbar(actions, mode="determinate", length=240)
++        self.factory_progress = ttk.Progressbar(actions, mode="determinate", length=260)
+         self.factory_progress.pack(side="left", padx=(12, 6))
+         self.factory_progress_var = tk.StringVar(value="0 / 0")
+         ttk.Label(actions, textvariable=self.factory_progress_var).pack(side="left")
+ 
+-        history = ttk.LabelFrame(t, text="Созданные программой группы / каналы", padding=7)
++        history = ttk.LabelFrame(t, text="Созданные группы", padding=7)
+         history.grid(row=3, column=0, sticky="nsew")
+         history.columnconfigure(0, weight=1)
+         history.rowconfigure(0, weight=1)
+@@ -1345,7 +1490,7 @@ class TelegramAdminManager(tk.Tk):
+             "title": "Название", "owner": "Владелец", "type": "Тип", "target": "Ссылка / ID",
+             "admins": "Админы", "status": "Статус", "created": "Создано",
+         }
+-        widths = {"title": 180, "owner": 160, "type": 80, "target": 260, "admins": 80, "status": 150, "created": 130}
++        widths = {"title": 190, "owner": 170, "type": 70, "target": 280, "admins": 80, "status": 150, "created": 130}
+         for col in cols:
+             self.factory_history_tree.heading(col, text=headings[col])
+             self.factory_history_tree.column(col, width=widths[col], anchor="w")
+@@ -1356,7 +1501,7 @@ class TelegramAdminManager(tk.Tk):
+         hist_buttons = ttk.Frame(history)
+         hist_buttons.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+         ttk.Button(hist_buttons, text="Копировать ссылку / ID", command=self._factory_copy_target).pack(side="left")
+-        ttk.Button(hist_buttons, text="Добавить в «Группа / админы»", command=self._factory_add_to_admin_targets).pack(side="left", padx=6)
++        ttk.Button(hist_buttons, text="Открыть в инструменте «Админы»", command=self._factory_add_to_admin_targets).pack(side="left", padx=6)
+         ttk.Button(hist_buttons, text="Удалить из истории", command=self._factory_delete_history).pack(side="right")
+         self.factory_history_tree.bind("<Double-1>", lambda _e: self._factory_copy_target())
+ 
+@@ -1428,7 +1573,7 @@ class TelegramAdminManager(tk.Tk):
+         if hasattr(self, "factory_per_creator_var"):
+             self.factory_per_creator_var.set(bool(self.store.data.get("group_factory_per_creator", False)))
+         if hasattr(self, "factory_empty_var"):
+-            self.factory_empty_var.set(bool(self.store.data.get("group_factory_empty", False)))
++            self.factory_empty_var.set(False)
+         self._factory_sync_admin_list_state(save=False)
+         self._factory_sync_empty_state(save=False)
+         self._factory_sync_type_state(save=False)
+@@ -1479,11 +1624,13 @@ class TelegramAdminManager(tk.Tk):
+             return
+         d = self.store.data
+         d["group_factory_title_template"] = self.factory_title_var.get()
+-        d["group_factory_about"] = self.factory_about_var.get()
+-        d["group_factory_entity_type"] = "channel" if getattr(self, "factory_entity_type_var", tk.StringVar(value="Группа")).get() == "Канал" else "group"
+-        d["group_factory_forum"] = bool(self.factory_forum_var.get()) and d["group_factory_entity_type"] == "group"
+-        d["group_factory_empty"] = bool(getattr(self, "factory_empty_var", tk.BooleanVar(value=False)).get())
+-        d["group_factory_seed_enabled"] = bool(getattr(self, "factory_seed_enabled_var", tk.BooleanVar(value=False)).get())
++        # 4.3.1 normal factory flow intentionally creates groups only and does not
++        # publish seed media. Keep compatibility fields deterministic for the engine.
++        d["group_factory_about"] = ""
++        d["group_factory_entity_type"] = "group"
++        d["group_factory_forum"] = False
++        d["group_factory_empty"] = False
++        d["group_factory_seed_enabled"] = False
+         d["group_factory_seed_path"] = str(getattr(self, "factory_seed_path_var", tk.StringVar()).get()).strip()
+         d["group_factory_seed_as_file"] = bool(getattr(self, "factory_seed_as_file_var", tk.BooleanVar(value=False)).get())
+         d["group_factory_seed_caption"] = str(getattr(self, "factory_seed_caption_var", tk.StringVar()).get())
