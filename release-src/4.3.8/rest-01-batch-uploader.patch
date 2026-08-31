@@ -1,0 +1,15 @@
+diff --git a/TelegramAdminManager-4.3.7/batch_uploader.py b/TelegramAdminManager-4.3.8/batch_uploader.py
+index 6ea17a0..ce57a59 100644
+--- a/TelegramAdminManager-4.3.7/batch_uploader.py
++++ b/TelegramAdminManager-4.3.8/batch_uploader.py
+@@ -3180,6 +3180,10 @@ class BatchUploaderPane:
+             account, client = clients[session]
+             if self.account_health.get(session, {}).get("disabled"):
+                 continue
++            restriction_check = getattr(self.app, "account_is_restricted", None)
++            if callable(restriction_check) and restriction_check(session):
++                self.app.log(f"{name}: {account.display} ⚠ пропуск — аккаунт помечен «Ограничен Telegram»; массовая отправка не выполняется")
++                continue
+             try:
+                 should_join = bool(task.get("join_if_needed", False)) and not bool(task.get("auto_admin", True))
+                 entity = await self.app._resolve_or_join_target(client, str(task.get("target", "")), should_join)
