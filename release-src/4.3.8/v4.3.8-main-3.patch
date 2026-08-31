@@ -1,0 +1,76 @@
+diff --git a/TelegramAdminManager-4.3.7/telegram_admin_manager.py b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+index e19f7d0..e456ee3 100644
+--- a/TelegramAdminManager-4.3.7/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+@@ -1586,6 +1942,19 @@ class TelegramAdminManager(tk.Tk):
+         ttk.Button(buttons, text="Выбрать все", command=self.select_all_accounts).pack(side="left", padx=6)
+         ttk.Button(buttons, text="Удалить локально", command=self.remove_selected_accounts).pack(side="right")
+ 
++
++        status_box = ttk.LabelFrame(t, text="Статус аккаунтов Telegram")
++        status_box.grid(row=3, column=0, sticky="ew", pady=(10, 0))
++        status_box.columnconfigure(0, weight=1)
++        self.account_status_tree = ttk.Treeview(status_box, columns=("account", "status", "detail"), show="headings", height=5, selectmode="browse")
++        for key, label, width in (("account", "Аккаунт", 240), ("status", "Статус", 190), ("detail", "Причина", 430)):
++            self.account_status_tree.heading(key, text=label); self.account_status_tree.column(key, width=width, stretch=key == "detail")
++        self.account_status_tree.grid(row=0, column=0, sticky="ew")
++        status_buttons = ttk.Frame(status_box); status_buttons.grid(row=1, column=0, sticky="w", pady=(6, 0))
++        ttk.Button(status_buttons, text="Снять отметку", command=self.clear_selected_account_restriction).pack(side="left")
++        ttk.Button(status_buttons, text="Проверить снова", command=self.recheck_selected_account_restriction).pack(side="left", padx=6)
++        ttk.Label(status_buttons, text="Снятие отметки не снимает ограничение на стороне Telegram.").pack(side="left", padx=(10, 0))
++
+     def _build_primary_tool_windows(self) -> None:
+         self._tool_panes = {}
+ 
+@@ -2125,6 +2494,9 @@ class TelegramAdminManager(tk.Tk):
+                 pass
+ 
+     async def _factory_join_admin(self, client: Any, account: Account, invite_link: str) -> None:
++        if self.account_is_restricted(account.session):
++            self.log(f"    {account.display}: ⚠ пропуск — аккаунт помечен «Ограничен Telegram»")
++            raise RuntimeError("аккаунт помечен «Ограничен Telegram»; risky write-действие пропущено")
+         invite_hash = self._extract_invite_hash(invite_link)
+         if not invite_hash:
+             raise RuntimeError("Не удалось получить приватную пригласительную ссылку для добавления аккаунтов.")
+@@ -2132,6 +2504,9 @@ class TelegramAdminManager(tk.Tk):
+             await self._factory_wait_call(account, "вступление в новую группу", lambda: client(ImportChatInviteRequest(invite_hash)))
+         except errors.UserAlreadyParticipantError:
+             return
++        except Exception as exc:
++            self.remember_account_restriction(account, exc, "factory_join_admin")
++            raise
+ 
+     async def _factory_create_async(self, plan: list[Any], admins: list[Account], delay: float) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -2162,6 +2537,11 @@ class TelegramAdminManager(tk.Tk):
+                     failed += 1
+                     self.log(f"[{pos}/{len(plan)}] {item.title}: ❌ аккаунт-создатель больше не найден.")
+                     continue
++                if self.account_is_restricted(creator.session):
++                    completed += 1
++                    self.log(f"[{pos}/{len(plan)}] {item.title}: ⚠ {creator.display} помечен «Ограничен Telegram» — создание пропущено.")
++                    self.ui_call(lambda p=completed, n=len(plan): (self.factory_progress.configure(value=p), self.factory_progress_var.set(f"{p} / {n}")))
++                    continue
+                 if creator.session in blocked_creators:
+                     completed += 1
+                     self.log(f"[{pos}/{len(plan)}] {item.title}: ⏭ {creator.display} ранее получил ограничение Telegram; пропускаю оставшиеся группы/каналы этого аккаунта.")
+@@ -2290,6 +2670,9 @@ class TelegramAdminManager(tk.Tk):
+                     if policy["enabled"] and self._is_api_credential_error(exc):
+                         self.log("🛑 Ошибка API ID/Hash — останавливаю фабрику групп.")
+                         self._factory_stop_event.set()
++                    elif self.remember_account_restriction(creator, exc, "factory_create"):
++                        blocked_creators.add(creator.session)
++                        self.log(f"🛑 {creator.display}: антиспам-ограничение сохранено; оставшиеся группы/каналы этого аккаунта будут пропущены.")
+                     elif policy["enabled"] and policy["stop_serious"] and self._is_serious_account_error(exc):
+                         blocked_creators.add(creator.session)
+                         self.log(f"🛑 Серьёзная ошибка/лимит аккаунта {creator.display}; оставшиеся группы/каналы этого аккаунта в текущем пакете будут пропущены.")
+@@ -3190,6 +3573,9 @@ class TelegramAdminManager(tk.Tk):
+             self._refresh_admin_account_list()
+         if hasattr(self, "batch_uploader"):
+             self.batch_uploader.refresh_tasks()
++        self._refresh_account_status_panel()
++        if hasattr(self, "channels_tree"):
++            self.refresh_channels_from_cache()
+ 
+     def select_all_accounts(self) -> None:
+         if self.accounts_list.size():
