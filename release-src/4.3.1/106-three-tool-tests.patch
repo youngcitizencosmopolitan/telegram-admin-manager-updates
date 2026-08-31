@@ -1,0 +1,75 @@
+diff --git a/telegram_admin_manager_v4.3.0/tests/test_three_tool_ui_v431.py b/telegram_admin_manager_v4.3.1/tests/test_three_tool_ui_v431.py
+new file mode 100644
+index 0000000..f04ae7f
+--- /dev/null
++++ b/telegram_admin_manager_v4.3.1/tests/test_three_tool_ui_v431.py
+@@ -0,0 +1,69 @@
++import inspect
++import unittest
++
++import telegram_admin_manager as main_app
++from batch_uploader import BatchUploaderPane, _parse_human_bytes
++
++
++class PrimaryToolSpecTests(unittest.TestCase):
++    def test_release_version_is_431(self):
++        self.assertEqual(main_app.APP_VERSION, "4.3.1")
++
++    def test_primary_launcher_exposes_exactly_three_telegram_tools(self):
++        self.assertTrue(
++            hasattr(main_app, "PRIMARY_TOOL_SPECS"),
++            "4.3.1 must declare the three primary Telegram launcher tools",
++        )
++        specs = getattr(main_app, "PRIMARY_TOOL_SPECS", ())
++        self.assertEqual(
++            tuple((key, label) for key, label in specs),
++            (
++                ("groups", "Создание групп"),
++                ("monitor", "Мониторинг"),
++                ("admins", "Админы"),
++            ),
++        )
++
++
++class ActivitySortingTests(unittest.TestCase):
++    def test_transfer_speed_parser_compares_units_numerically(self):
++        self.assertGreater(_parse_human_bytes("12 МБ/с"), _parse_human_bytes("900 КБ/с"))
++        self.assertGreater(_parse_human_bytes("1.5 ГБ/с"), _parse_human_bytes("950 МБ/с"))
++        self.assertEqual(_parse_human_bytes("—"), -1.0)
++        self.assertEqual(_parse_human_bytes("1,5 МБ/с"), 1.5 * 1024**2)
++
++    def test_first_speed_sort_is_descending_then_toggles(self):
++        self.assertTrue(
++            hasattr(BatchUploaderPane, "_next_sort_state"),
++            "sorting needs one shared state transition helper",
++        )
++        next_state = getattr(BatchUploaderPane, "_next_sort_state")
++        self.assertEqual(next_state(None, False, "speed"), ("speed", True))
++        self.assertEqual(next_state("speed", True, "speed"), ("speed", False))
++        self.assertEqual(next_state(None, False, "task"), ("task", False))
++
++
++class SimplifiedWorkflowStructureTests(unittest.TestCase):
++    def test_root_builds_launcher_instead_of_dashboard(self):
++        source = inspect.getsource(main_app.TelegramAdminManager._build_ui)
++        self.assertIn("PRIMARY_TOOL_SPECS", source)
++        self.assertIn("_open_primary_tool", source)
++        self.assertNotIn("dashboard_metric_vars", source)
++        self.assertNotIn("_refresh_dashboard", source)
++
++    def test_admin_tool_uses_its_own_account_selection(self):
++        build_source = inspect.getsource(main_app.TelegramAdminManager._build_group_tab)
++        promote_source = inspect.getsource(main_app.TelegramAdminManager.start_promote)
++        self.assertIn("admin_accounts_list", build_source)
++        self.assertIn("_selected_admin_accounts()", promote_source)
++        self.assertNotIn("selected = self.selected_accounts()", promote_source)
++
++    def test_group_creation_normal_ui_has_no_seed_publication_controls(self):
++        source = inspect.getsource(main_app.TelegramAdminManager._build_group_factory_tab)
++        self.assertNotIn("Первичная публикация", source)
++        self.assertNotIn("100 пустых / аккаунт", source)
++        self.assertIn("Кого добавить администраторами", source)
++
++
++if __name__ == "__main__":
++    unittest.main()

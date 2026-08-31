@@ -1,0 +1,39 @@
+diff --git a/telegram_admin_manager_v4.3.0/batch_uploader.py b/telegram_admin_manager_v4.3.1/batch_uploader.py
+index c0da985..8745089 100644
+--- a/telegram_admin_manager_v4.3.0/batch_uploader.py
++++ b/telegram_admin_manager_v4.3.1/batch_uploader.py
+@@ -1145,21 +1145,24 @@ class BatchUploaderPane:
+                 suffix = " ▼" if reverse else " ▲"
+             tree.heading(col, text=label + suffix)
+ 
++    @staticmethod
++    def _next_sort_state(active_col: str | None, reverse: bool, clicked_col: str) -> tuple[str, bool]:
++        if active_col == clicked_col:
++            return clicked_col, not bool(reverse)
++        # For a live transfer table the useful first view is fastest first.
++        return clicked_col, clicked_col == "speed"
++
+     def _sort_tasks(self, column: str) -> None:
+-        if self.task_sort_col == column:
+-            self.task_sort_reverse = not self.task_sort_reverse
+-        else:
+-            self.task_sort_col = column
+-            self.task_sort_reverse = False
++        self.task_sort_col, self.task_sort_reverse = self._next_sort_state(
++            self.task_sort_col, self.task_sort_reverse, column
++        )
+         self._apply_sort(self.tree, column, self.task_sort_reverse)
+         self._update_sort_headings(self.tree, self.task_heading_labels, self.task_sort_col, self.task_sort_reverse)
+ 
+     def _sort_activity(self, column: str) -> None:
+-        if self.activity_sort_col == column:
+-            self.activity_sort_reverse = not self.activity_sort_reverse
+-        else:
+-            self.activity_sort_col = column
+-            self.activity_sort_reverse = False
++        self.activity_sort_col, self.activity_sort_reverse = self._next_sort_state(
++            self.activity_sort_col, self.activity_sort_reverse, column
++        )
+         self._apply_sort(self.activity, column, self.activity_sort_reverse, activity=True)
+         self._update_sort_headings(self.activity, self.activity_heading_labels, self.activity_sort_col, self.activity_sort_reverse)
+ 

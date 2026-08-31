@@ -1,0 +1,158 @@
+diff --git a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+index e97ec2a..a70a147 100644
+--- a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+@@ -59,11 +59,17 @@ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.0"
++APP_VERSION = "4.3.1"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+ 
++PRIMARY_TOOL_SPECS = (
++    ("groups", "Создание групп"),
++    ("monitor", "Мониторинг"),
++    ("admins", "Админы"),
++)
++
+ 
+ def app_base_dir() -> Path:
+     if getattr(sys, "frozen", False):
+@@ -323,6 +329,74 @@ class TelegramAdminManager(tk.Tk):
+         return best_name, best_count, best_stamp
+ 
+     def _build_ui(self) -> None:
++        """Build a small launcher and keep the three Telegram workflows independent."""
++        self.geometry("780x560")
++        self.minsize(680, 500)
++        self.configure(bg="#eef2f7")
++        style = ttk.Style(self)
++        try:
++            style.theme_use("clam")
++        except Exception:
++            pass
++        style.configure("Launcher.TButton", font=("Segoe UI", 14, "bold"), padding=(18, 18))
++        style.configure("Dashboard.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 7))
++        style.configure("Quiet.TButton", font=("Segoe UI", 9), padding=(8, 6))
++
++        self.columnconfigure(0, weight=1)
++        self.rowconfigure(0, weight=1)
++        root = tk.Frame(self, bg="#eef2f7", padx=24, pady=20)
++        root.grid(row=0, column=0, sticky="nsew")
++        root.columnconfigure(0, weight=1)
++
++        header = tk.Frame(root, bg="#eef2f7")
++        header.grid(row=0, column=0, sticky="ew", pady=(0, 22))
++        header.columnconfigure(0, weight=1)
++        tk.Label(
++            header, text=f"{APP_NAME}  {APP_VERSION}", bg="#eef2f7", fg="#172033",
++            font=("Segoe UI", 20, "bold"),
++        ).grid(row=0, column=0, sticky="w")
++        tk.Label(
++            header, text="Выбери инструмент и работай в отдельном окне", bg="#eef2f7", fg="#64748b",
++            font=("Segoe UI", 10),
++        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
++        self.busy_label = tk.Label(
++            header, text="Готово", bg="#e5eaf1", fg="#334155", padx=12, pady=6,
++            font=("Segoe UI", 9, "bold"),
++        )
++        self.busy_label.grid(row=0, column=1, rowspan=2, sticky="e", padx=(10, 0))
++
++        tools = tk.Frame(root, bg="#eef2f7")
++        tools.grid(row=1, column=0, sticky="ew")
++        tools.columnconfigure(0, weight=1)
++        descriptions = {
++            "groups": "Массово создать группы и сразу добавить свои аккаунты администраторами.",
++            "monitor": "Следить за папками, очередью, текущими файлами, скоростью и ошибками.",
++            "admins": "Массово назначить свои сохранённые аккаунты админами в существующих группах.",
++        }
++        for row, (key, label) in enumerate(PRIMARY_TOOL_SPECS):
++            card = tk.Frame(tools, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=14, pady=12)
++            card.grid(row=row, column=0, sticky="ew", pady=(0, 10))
++            card.columnconfigure(0, weight=1)
++            ttk.Button(
++                card, text=label, style="Launcher.TButton",
++                command=lambda k=key: self._open_primary_tool(k),
++            ).grid(row=0, column=0, sticky="ew")
++            tk.Label(
++                card, text=descriptions[key], bg="#ffffff", fg="#64748b",
++                font=("Segoe UI", 9), wraplength=620, justify="left",
++            ).grid(row=1, column=0, sticky="w", pady=(7, 0))
++
++        secondary = tk.Frame(root, bg="#eef2f7")
++        secondary.grid(row=2, column=0, sticky="ew", pady=(8, 0))
++        ttk.Button(secondary, text="Аккаунты / настройки", style="Quiet.TButton", command=lambda: self._open_advanced("accounts")).pack(side="left")
++        ttk.Button(secondary, text="Журнал", style="Quiet.TButton", command=self._show_log_window).pack(side="left", padx=6)
++        ttk.Button(secondary, text="Twitter / X", style="Quiet.TButton", command=self._open_x_planner).pack(side="left", padx=6)
++        ttk.Button(secondary, text="↻ Обновления", style="Quiet.TButton", command=self._show_update_center).pack(side="right")
++
++        self._build_secondary_windows()
++        self._build_primary_tool_windows()
++
++    def _build_dashboard_ui_legacy(self) -> None:
+         """Build the v4 single-page dashboard.
+ 
+         The old feature-rich notebook is preserved in a secondary window so the
+@@ -631,24 +705,53 @@ class TelegramAdminManager(tk.Tk):
+ 
+         self.after(250, self._refresh_dashboard)
+ 
++    def _show_log_window(self) -> None:
++        try:
++            self.log_window.deiconify()
++            self.log_window.lift()
++            self.log_window.focus_force()
++        except Exception:
++            pass
++
++    def _open_primary_tool(self, key: str) -> None:
++        win = getattr(self, "_tool_windows", {}).get(str(key))
++        if win is None:
++            return
++        try:
++            if key == "monitor" and hasattr(self, "batch_uploader"):
++                self.batch_uploader.refresh_monitor_tab(force=True)
++            elif key == "admins" and hasattr(self, "admin_accounts_list"):
++                self._refresh_admin_account_list()
++            elif key == "groups" and hasattr(self, "factory_creators_list"):
++                self._factory_refresh_account_boxes()
++            win.deiconify()
++            win.lift()
++            win.focus_force()
++        except Exception:
++            pass
++
+     def _open_advanced(self, section: str = "uploads") -> None:
++        if section in {"groups", "admins"}:
++            self._open_primary_tool(section)
++            return
++        if section in {"uploads", "monitor"}:
++            self._open_primary_tool("monitor")
++            try:
++                self.monitor_notebook.select(self.tab_monitor if section == "monitor" else self.tab_batch_uploader)
++            except Exception:
++                pass
++            return
+         mapping = {
+             "accounts": self.tab_accounts,
+-            "admins": self.tab_group,
+-            "groups": self.tab_group_factory,
+-            "uploads": self.tab_batch_uploader,
+-            "monitor": self.tab_monitor,
+             "quick": self.tab_uploader,
+             "safety": self.tab_safety,
+             "settings": self.tab_settings,
+         }
+         try:
+-            self.advanced_notebook.select(mapping.get(section, self.tab_batch_uploader))
++            self.advanced_notebook.select(mapping.get(section, self.tab_accounts))
+             self.advanced_window.deiconify()
+             self.advanced_window.lift()
+             self.advanced_window.focus_force()
+-            if section == "monitor" and hasattr(self, "batch_uploader"):
+-                self.batch_uploader.refresh_monitor_tab(force=True)
+         except Exception:
+             pass

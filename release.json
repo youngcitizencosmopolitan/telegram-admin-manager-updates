@@ -1,17 +1,15 @@
 {
-  "version": "4.3.0",
-  "base_version": "4.2.9",
+  "version": "4.3.1",
+  "base_version": "4.3.0",
   "patch_files": [
-    "release-src/4.3.0/01-x-planner-integration.patch",
-    "release-src/4.3.0/02-x-planner-compat.patch"
+    "release-src/4.3.1/101-main-ui.patch",
+    "release-src/4.3.1/102-main-ui.patch",
+    "release-src/4.3.1/103-main-ui.patch",
+    "release-src/4.3.1/104-main-ui.patch",
+    "release-src/4.3.1/105-monitor-sort.patch",
+    "release-src/4.3.1/106-three-tool-tests.patch",
+    "release-src/4.3.1/107-x-test.patch",
+    "release-src/4.3.1/108-notes.patch"
   ],
-  "overlay_chunks": [
-    "release-src/4.3.0/overlay/overlay.b64.00",
-    "release-src/4.3.0/overlay/overlay.b64.01",
-    "release-src/4.3.0/overlay/overlay.b64.02",
-    "release-src/4.3.0/overlay/overlay.b64.03"
-  ],
-  "overlay_sha256": "85777622b6fb397e557c24ddb47faf3ce0a9ceee497191454f5a03d93ea93fb3",
-  "notes": "Добавлен встроенный Twitter / X Planner: отдельные браузерные профили для X-аккаунтов, очередь видео, ручные подписи и общий суффикс, конкретный/случайный/по кругу/наименее загруженный аккаунт, автоматическое распределение по настраиваемым временным окнам, календарь занятых дат и времени и быстрый переход к следующей публикации. Без X API, X Pro и автоматического управления сайтом x.com.",
-  "retry": 1
+  "notes": "Telegram Admin Manager 4.3.1: вместо Dashboard — три независимых инструмента: массовое создание групп с добавлением своих аккаунтов в админы, мониторинг/очередь и массовое назначение админов. Добавлена числовая сортировка скорости fastest-first. X Planner, обновления и данные пользователя сохраняются."
 }

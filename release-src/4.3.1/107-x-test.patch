@@ -1,0 +1,13 @@
+diff --git a/telegram_admin_manager_v4.3.0/tests/test_x_integration_v430.py b/telegram_admin_manager_v4.3.1/tests/test_x_integration_v430.py
+index e07698d..8fca802 100644
+--- a/telegram_admin_manager_v4.3.0/tests/test_x_integration_v430.py
++++ b/telegram_admin_manager_v4.3.1/tests/test_x_integration_v430.py
+@@ -6,7 +6,7 @@ class XPlannerMainIntegrationTests(unittest.TestCase):
+     def test_main_app_exposes_x_planner_mode_and_button(self):
+         source = Path(__file__).resolve().parents[1] / "telegram_admin_manager.py"
+         text = source.read_text(encoding="utf-8")
+-        self.assertIn('APP_VERSION = "4.3.0"', text)
++        self.assertRegex(text, r'APP_VERSION = "\d+\.\d+\.\d+"')
+         self.assertIn('"--x-planner"', text)
+         self.assertIn('text="Twitter / X"', text)
+         self.assertIn('def _open_x_planner', text)
