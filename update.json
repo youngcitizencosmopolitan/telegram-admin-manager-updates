@@ -1,6 +1,6 @@
 {
-  "version": "4.3.1",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.3.1/TelegramAdminManager_v4.3.1_update.zip",
-  "sha256": "2594f93d5fe28c87648c916ccea2675cfaada5bf6dfe25e4ee111764d9eba0bf",
-  "notes": "Telegram Admin Manager 4.3.1: вместо Dashboard — три независимых инструмента: массовое создание групп с добавлением своих аккаунтов в админы, мониторинг/очередь и массовое назначение админов. Добавлена числовая сортировка скорости fastest-first. X Planner, обновления и данные пользователя сохраняются."
+  "version": "4.3.2",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.3.2/TelegramAdminManager_v4.3.2_update.zip",
+  "sha256": "ad1f3482ccab0404dfa4541b550b77909b8ccc140bf3f40b1367b54886895b43",
+  "notes": "Telegram Admin Manager 4.3.2: инкрементальное назначение админов. Для каждой группы и каждого своего аккаунта сохраняется точный профиль успешно применённых прав, поэтому повторные запуски пропускают уже готовые группы и обрабатывают только новые или изменённые аккаунты. Успех сохраняется сразу после каждого аккаунта. Добавлена принудительная перепроверка всего без потери кэша нетронутых групп."
 }
