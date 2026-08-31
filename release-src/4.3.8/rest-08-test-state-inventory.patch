@@ -1,0 +1,35 @@
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_state_inventory.py b/TelegramAdminManager-4.3.8/tests/test_v438_state_inventory.py
+new file mode 100644
+index 0000000..3350581
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_state_inventory.py
+@@ -0,0 +1,29 @@
++import tempfile
++import unittest
++from pathlib import Path
++
++from tam_core.state_db import StateDatabase, SCHEMA_VERSION
++
++
++class V438StateInventoryTests(unittest.TestCase):
++    def test_schema_and_inventory_restriction_storage(self):
++        with tempfile.TemporaryDirectory() as td:
++            db = StateDatabase(Path(td) / 'state.db')
++            self.assertGreaterEqual(SCHEMA_VERSION, 7)
++            db.channel_upsert({'peer_id': 123, 'title': 'Alpha', 'peer_type': 'channel', 'link': 'https://t.me/alpha'})
++            db.channel_upsert({'peer_id': 123, 'title': 'Alpha 2', 'peer_type': 'channel', 'status': 'ok'})
++            rows = db.channels_all()
++            self.assertEqual(len(rows), 1)
++            self.assertEqual(rows[0]['peer_id'], 123)
++            self.assertEqual(rows[0]['title'], 'Alpha 2')
++            db.channel_account_put(123, 'acc_a', {'relation': 'admin', 'rights': {'add_admins': True}})
++            rels = db.channel_accounts(123)
++            self.assertEqual(rels[0]['session'], 'acc_a')
++            self.assertEqual(rels[0]['relation'], 'admin')
++            db.account_restriction_set('acc_a', {'status': 'restricted', 'reason': 'peer_flood', 'source_operation': 'join'})
++            self.assertEqual(db.account_restriction_get('acc_a')['status'], 'restricted')
++            db.account_restriction_clear('acc_a')
++            self.assertEqual(db.account_restriction_get('acc_a'), {})
++
++if __name__ == '__main__':
++    unittest.main()
