@@ -62,6 +62,3 @@
  
  class PermanentRightLogTests(unittest.TestCase):
      def test_primary_windows_attach_a_right_side_log_panel(self):
-@@ -1 +1 @@
--        self.assertEqual(app.APP_VERSION, '4.3.5')
-+        self.assertEqual(app.APP_VERSION, '4.3.6')
