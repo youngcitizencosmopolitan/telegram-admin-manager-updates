@@ -1,15 +1,14 @@
 {
-  "version": "4.3.1",
-  "base_version": "4.3.0",
+  "version": "4.3.2",
+  "base_version": "4.3.1",
   "patch_files": [
-    "release-src/4.3.1/101-main-ui.patch",
-    "release-src/4.3.1/102-main-ui.patch",
-    "release-src/4.3.1/103-main-ui.patch",
-    "release-src/4.3.1/104-main-ui.patch",
-    "release-src/4.3.1/105-monitor-sort.patch",
-    "release-src/4.3.1/106-three-tool-tests.patch",
-    "release-src/4.3.1/107-x-test.patch",
-    "release-src/4.3.1/108-notes.patch"
+    "release-src/4.3.2/101-cache.patch",
+    "release-src/4.3.2/102-main-part1.patch",
+    "release-src/4.3.2/103-main-part2.patch",
+    "release-src/4.3.2/104-main-part3.patch",
+    "release-src/4.3.2/105-main-part4.patch",
+    "release-src/4.3.2/106-tests.patch",
+    "release-src/4.3.2/107-notes.patch"
   ],
-  "notes": "Telegram Admin Manager 4.3.1: вместо Dashboard — три независимых инструмента: массовое создание групп с добавлением своих аккаунтов в админы, мониторинг/очередь и массовое назначение админов. Добавлена числовая сортировка скорости fastest-first. X Planner, обновления и данные пользователя сохраняются."
+  "notes": "Telegram Admin Manager 4.3.2: инкрементальное назначение админов. Для каждой группы и каждого своего аккаунта сохраняется точный профиль успешно применённых прав, поэтому повторные запуски пропускают уже готовые группы и обрабатывают только новые или изменённые аккаунты. Успех сохраняется сразу после каждого аккаунта. Добавлена принудительная перепроверка всего без потери кэша нетронутых групп."
 }
