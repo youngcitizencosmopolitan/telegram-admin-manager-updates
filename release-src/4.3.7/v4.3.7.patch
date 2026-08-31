@@ -1,0 +1,132 @@
+--- a/TelegramAdminManager-4.3.6/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.7/telegram_admin_manager.py
+@@ -59,7 +59,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.6"
++APP_VERSION = "4.3.7"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+--- a/TelegramAdminManager-4.3.6/batch_uploader.py
++++ b/TelegramAdminManager-4.3.7/batch_uploader.py
+@@ -34,6 +34,15 @@
+ 
+ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
++FILE_PART_REQUEUE_LIMIT = 2
++
++def _is_file_part_missing_error(exc: Exception) -> bool:
++    return exc.__class__.__name__ == "FilePartMissingError"
++
++def _next_file_part_requeue_cycle(completed_cycles: int) -> int | None:
++    next_cycle = int(completed_cycles) + 1
++    return next_cycle if next_cycle <= FILE_PART_REQUEUE_LIMIT else None
++
+ try:
+     import cryptg  # noqa: F401
+     CRYPTG_AVAILABLE = True
+@@ -3280,6 +3289,8 @@
+ 
+         small_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         big_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
++        file_part_deferred: list[tuple[int, Path]] = []
++        file_part_requeue_cycles: dict[str, int] = {}
+         for item in pending:
+             _idx, path = item
+             if path.stat().st_size > FREE_FILE_LIMIT:
+@@ -3554,6 +3565,28 @@
+                                 if "Topic" in exc_name or "topic" in friendly.casefold() or "тема" in friendly.casefold():
+                                     self.app.group_state_cache.invalidate_topics(task_target)
+                                     self.app.ui_call(self.refresh_monitor_tab)
++                                if _is_file_part_missing_error(exc):
++                                    path_key = str(path)
++                                    next_cycle = _next_file_part_requeue_cycle(file_part_requeue_cycles.get(path_key, 0))
++                                    if next_cycle is not None:
++                                        file_part_requeue_cycles[path_key] = next_cycle
++                                        file_part_deferred.append(item)
++                                        self.app.log(
++                                            f"{name}: {account.display} → {path.name}: Telegram потерял часть файла; "
++                                            f"возвращаю файл в конец очереди ({next_cycle}/{FILE_PART_REQUEUE_LIMIT}), "
++                                            "следующая полная загрузка будет после остальных файлов."
++                                        )
++                                        self.app.ui_call(
++                                            lambda k=key, p=path, a=account_name, r=next_cycle:
++                                            self._activity_update(k, name, p, a, size, 0.0, 0.0, f"↻ В конец очереди {r}/{FILE_PART_REQUEUE_LIMIT}")
++                                        )
++                                        self._emit_task_metrics(tid, force=True)
++                                        break
++                                    friendly = (
++                                        f"Telegram снова потерял часть файла после {FILE_PART_REQUEUE_LIMIT} возвратов в конец очереди: "
++                                        f"{friendly}"
++                                    )
++
+                                 h = health(session)
+                                 h["errors"] = int(h.get("errors", 0)) + 1
+                                 if policy["enabled"] and self.app._is_api_credential_error(exc):
+@@ -3616,7 +3649,7 @@
+                                 self.app.log(f"{name}: {account.display} → {path.name}: ❌ {friendly}")
+                                 self.app.record_upload_error(
+                                     task=name, target=task_target, path=str(path), account=account.display,
+-                                    attempts=1 + transient_retry_count, error=friendly,
++                                    attempts=1 + transient_retry_count + int(file_part_requeue_cycles.get(str(path), 0)), error=friendly,
+                                 )
+                                 self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "❌ Ошибка"))
+                                 self._emit_task_metrics(tid, force=True)
+@@ -3629,7 +3662,7 @@
+                     if not await self._sleep_stop(delay):
+                         return
+ 
+-        max_waves = max(2, len(sessions) + 1)
++        max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, len(sessions) + 1 + FILE_PART_REQUEUE_LIMIT)
+         for _wave in range(max_waves):
+             if self.stop_event.is_set() or (small_queue.empty() and big_queue.empty()):
+                 break
+@@ -3639,6 +3672,12 @@
+             workers = [asyncio.create_task(worker(session)) for session in healthy_sessions]
+             if workers:
+                 await asyncio.gather(*workers)
++            if file_part_deferred and not self.stop_event.is_set():
++                deferred_now = list(file_part_deferred)
++                file_part_deferred.clear()
++                for deferred_item in deferred_now:
++                    _idx, deferred_path = deferred_item
++                    queue_for_path(deferred_path).put_nowait(deferred_item)
+ 
+         if not self.stop_event.is_set():
+             leftovers: list[tuple[int, Path, str]] = []
+--- /dev/null
++++ b/TelegramAdminManager-4.3.7/tests/test_v437_file_part_requeue.py
+@@ -0,0 +1,31 @@
++import inspect
++import unittest
++
++import batch_uploader as bu
++
++
++class FilePartRequeuePolicyTests(unittest.TestCase):
++    def test_file_part_missing_is_detected_by_telegram_error_name(self):
++        FilePartMissingError = type('FilePartMissingError', (Exception,), {})
++        self.assertTrue(bu._is_file_part_missing_error(FilePartMissingError('Part 596 is missing')))
++        self.assertFalse(bu._is_file_part_missing_error(RuntimeError('FILE_PART_INVALID')))
++
++    def test_file_part_missing_gets_two_tail_requeues_before_final_failure(self):
++        self.assertEqual(bu.FILE_PART_REQUEUE_LIMIT, 2)
++        self.assertEqual(bu._next_file_part_requeue_cycle(0), 1)
++        self.assertEqual(bu._next_file_part_requeue_cycle(1), 2)
++        self.assertIsNone(bu._next_file_part_requeue_cycle(2))
++
++    def test_upload_worker_defers_file_part_missing_instead_of_immediate_retry(self):
++        source = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        marker = 'if _is_file_part_missing_error(exc):'
++        self.assertIn(marker, source)
++        branch = source[source.index(marker):]
++        self.assertIn('file_part_deferred.append(item)', branch)
++        self.assertIn('в конец очереди', branch)
++        self.assertIn('file_part_requeue_cycles.get(str(path), 0)', source)
++        self.assertLess(source.index(marker), source.index('if self.app._is_retryable_upload_error(exc)'))
++
++
++if __name__ == '__main__':
++    unittest.main()
