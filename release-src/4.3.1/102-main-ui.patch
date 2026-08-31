@@ -1,0 +1,241 @@
+diff --git a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+index e97ec2a..a70a147 100644
+--- a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+@@ -1150,6 +1253,57 @@ class TelegramAdminManager(tk.Tk):
+                 return None
+         return None
+ 
++    def _build_secondary_windows(self) -> None:
++        self.advanced_window = tk.Toplevel(self)
++        self.advanced_window.withdraw()
++        self.advanced_window.title(f"{APP_NAME} — аккаунты и настройки")
++        self.advanced_window.geometry("1050x760")
++        self.advanced_window.minsize(850, 600)
++        self.advanced_window.protocol("WM_DELETE_WINDOW", self.advanced_window.withdraw)
++        adv_root = ttk.Frame(self.advanced_window, padding=10)
++        adv_root.pack(fill="both", expand=True)
++        adv_root.columnconfigure(0, weight=1)
++        adv_root.rowconfigure(0, weight=1)
++        self.advanced_notebook = ttk.Notebook(adv_root)
++        self.advanced_notebook.grid(row=0, column=0, sticky="nsew")
++        self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_safety = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_settings = ttk.Frame(self.advanced_notebook, padding=12)
++        self.advanced_notebook.add(self.tab_accounts, text="Аккаунты")
++        self.advanced_notebook.add(self.tab_uploader, text="Быстрая загрузка")
++        self.advanced_notebook.add(self.tab_safety, text="Безопасность")
++        self.advanced_notebook.add(self.tab_settings, text="Настройки API")
++
++        self.log_window = tk.Toplevel(self)
++        self.log_window.withdraw()
++        self.log_window.title(f"{APP_NAME} — журнал")
++        self.log_window.geometry("920x620")
++        self.log_window.minsize(680, 420)
++        self.log_window.protocol("WM_DELETE_WINDOW", self.log_window.withdraw)
++        log_root = ttk.Frame(self.log_window, padding=10)
++        log_root.pack(fill="both", expand=True)
++        log_root.columnconfigure(0, weight=1)
++        log_root.rowconfigure(1, weight=1)
++        log_tools = ttk.Frame(log_root)
++        log_tools.grid(row=0, column=0, sticky="ew", pady=(0, 7))
++        log_tools.columnconfigure(0, weight=1)
++        ttk.Label(log_tools, text="Журнал операций", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
++        self.log_autoscroll_var = tk.BooleanVar(value=True)
++        ttk.Checkbutton(log_tools, text="Авто", variable=self.log_autoscroll_var).grid(row=0, column=1, padx=4)
++        ttk.Button(log_tools, text="Ошибки загрузки", command=self._open_upload_error_log).grid(row=0, column=2, padx=4)
++        ttk.Button(log_tools, text="Очистить", command=self._clear_visible_log).grid(row=0, column=3)
++        self.log_text = tk.Text(log_root, wrap="word", state="disabled", font=("Consolas", 9), padx=7, pady=7)
++        self.log_text.grid(row=1, column=0, sticky="nsew")
++        log_sb = ttk.Scrollbar(log_root, orient="vertical", command=self.log_text.yview)
++        log_sb.grid(row=1, column=1, sticky="ns")
++        self.log_text.configure(yscrollcommand=log_sb.set)
++
++        self._build_accounts_tab()
++        self._build_uploader_tab()
++        self._build_safety_tab()
++        self._build_settings_tab()
++
+     def _build_accounts_tab(self) -> None:
+         t = self.tab_accounts
+         t.columnconfigure(0, weight=1)
+@@ -1183,12 +1337,57 @@ class TelegramAdminManager(tk.Tk):
+         ttk.Button(buttons, text="Выбрать все", command=self.select_all_accounts).pack(side="left", padx=6)
+         ttk.Button(buttons, text="Удалить локально", command=self.remove_selected_accounts).pack(side="right")
+ 
++    def _build_primary_tool_windows(self) -> None:
++        self.group_factory_window = tk.Toplevel(self)
++        self.group_factory_window.withdraw()
++        self.group_factory_window.title(f"{APP_NAME} — Создание групп")
++        self.group_factory_window.geometry("1180x820")
++        self.group_factory_window.minsize(900, 650)
++        self.group_factory_window.protocol("WM_DELETE_WINDOW", self.group_factory_window.withdraw)
++        self.tab_group_factory = ttk.Frame(self.group_factory_window, padding=12)
++        self.tab_group_factory.pack(fill="both", expand=True)
++
++        self.monitor_window = tk.Toplevel(self)
++        self.monitor_window.withdraw()
++        self.monitor_window.title(f"{APP_NAME} — Мониторинг")
++        self.monitor_window.geometry("1450x860")
++        self.monitor_window.minsize(1050, 680)
++        self.monitor_window.protocol("WM_DELETE_WINDOW", self.monitor_window.withdraw)
++        monitor_root = ttk.Frame(self.monitor_window, padding=10)
++        monitor_root.pack(fill="both", expand=True)
++        monitor_root.columnconfigure(0, weight=1)
++        monitor_root.rowconfigure(0, weight=1)
++        self.monitor_notebook = ttk.Notebook(monitor_root)
++        self.monitor_notebook.grid(row=0, column=0, sticky="nsew")
++        self.tab_batch_uploader = ttk.Frame(self.monitor_notebook, padding=10)
++        self.tab_monitor = ttk.Frame(self.monitor_notebook, padding=10)
++        self.monitor_notebook.add(self.tab_batch_uploader, text="Очередь / загрузки")
++        self.monitor_notebook.add(self.tab_monitor, text="Правила мониторинга")
++
++        self.admin_window = tk.Toplevel(self)
++        self.admin_window.withdraw()
++        self.admin_window.title(f"{APP_NAME} — Админы")
++        self.admin_window.geometry("1260x780")
++        self.admin_window.minsize(960, 620)
++        self.admin_window.protocol("WM_DELETE_WINDOW", self.admin_window.withdraw)
++        self.tab_group = ttk.Frame(self.admin_window, padding=12)
++        self.tab_group.pack(fill="both", expand=True)
++
++        self._build_group_factory_tab()
++        self._build_group_tab()
++        self.batch_uploader = BatchUploaderPane(self, self.tab_batch_uploader, monitor_parent=self.tab_monitor)
++        self._tool_windows = {
++            "groups": self.group_factory_window,
++            "monitor": self.monitor_window,
++            "admins": self.admin_window,
++        }
++
+     def _build_group_factory_tab(self) -> None:
+         t = self.tab_group_factory
+         t.columnconfigure(0, weight=1)
+         t.rowconfigure(3, weight=1)
+ 
+-        settings = ttk.LabelFrame(t, text="План создания", padding=10)
++        settings = ttk.LabelFrame(t, text="Массовое создание групп", padding=10)
+         settings.grid(row=0, column=0, sticky="ew")
+         settings.columnconfigure(1, weight=1)
+         settings.columnconfigure(3, weight=1)
+@@ -1198,7 +1397,7 @@ class TelegramAdminManager(tk.Tk):
+         ttk.Entry(settings, textvariable=self.factory_title_var).grid(row=0, column=1, columnspan=3, sticky="ew", pady=4)
+         ttk.Label(
+             settings,
+-            text="Поддерживается: {n} — общий номер, {i} — номер внутри аккаунта, {account}, {username}, {phone}",
++            text="{n} — общий номер, {i} — номер внутри аккаунта, {account}, {username}, {phone}",
+         ).grid(row=1, column=1, columnspan=3, sticky="w")
+ 
+         ttk.Label(settings, text="Количество:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+@@ -1210,44 +1409,8 @@ class TelegramAdminManager(tk.Tk):
+             command=self._save_group_factory_settings,
+         ).grid(row=2, column=2, sticky="w", padx=(12, 8))
+         self.factory_start_var = tk.StringVar(value="1")
+-        start_box = ttk.Frame(settings)
+-        start_box.grid(row=2, column=3, sticky="e")
+-        ttk.Label(start_box, text="Начальный №:").pack(side="left", padx=(0, 6))
+-        ttk.Spinbox(start_box, from_=0, to=999999, textvariable=self.factory_start_var, width=9).pack(side="left")
+-
+-        ttk.Label(settings, text="Описание:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+-        self.factory_about_var = tk.StringVar()
+-        ttk.Entry(settings, textvariable=self.factory_about_var).grid(row=3, column=1, columnspan=3, sticky="ew", pady=4)
+ 
+-        ttk.Label(settings, text="Тип:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+-        self.factory_entity_type_var = tk.StringVar(value="Группа")
+-        self.factory_type_combo = ttk.Combobox(
+-            settings,
+-            textvariable=self.factory_entity_type_var,
+-            state="readonly",
+-            values=["Группа", "Канал"],
+-            width=16,
+-        )
+-        self.factory_type_combo.grid(row=4, column=1, sticky="w", pady=4)
+-        self.factory_type_combo.bind("<<ComboboxSelected>>", lambda _e: self._factory_sync_type_state())
+-
+-        self.factory_forum_var = tk.BooleanVar(value=True)
+-        self.factory_forum_check = ttk.Checkbutton(
+-            settings,
+-            text="Форум (темы)",
+-            variable=self.factory_forum_var,
+-            command=self._save_group_factory_settings,
+-        )
+-        self.factory_forum_check.grid(row=4, column=2, sticky="w", padx=(12, 0), pady=4)
+-        self.factory_empty_var = tk.BooleanVar(value=False)
+-        ttk.Checkbutton(
+-            settings,
+-            text="Без других участников / админов",
+-            variable=self.factory_empty_var,
+-            command=self._factory_sync_empty_state,
+-        ).grid(row=4, column=3, sticky="w", padx=(12, 0), pady=4)
+-
+-        ttk.Label(settings, text="Права админов:").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
++        ttk.Label(settings, text="Права назначаемых админов:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+         self.factory_preset_var = tk.StringVar(value=self._preset_key_to_label("full_no_add_admins"))
+         factory_preset = ttk.Combobox(
+             settings,
+@@ -1259,51 +1422,34 @@ class TelegramAdminManager(tk.Tk):
+                 "Обычный админ: удалять/банить/приглашать/закреплять",
+             ],
+         )
+-        factory_preset.grid(row=5, column=1, sticky="ew", pady=4)
++        factory_preset.grid(row=3, column=1, columnspan=2, sticky="ew", pady=4)
+         factory_preset.bind("<<ComboboxSelected>>", lambda _e: self._save_group_factory_settings())
+-        ttk.Label(settings, text="Анонимность берётся из общей настройки «Группа / админы».").grid(row=5, column=2, columnspan=2, sticky="w", padx=(12, 0))
+ 
+-        ttk.Label(settings, text="Пауза между группами/каналами:").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
++        ttk.Label(settings, text="Пауза между группами:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+         self.factory_delay_var = tk.StringVar(value="10")
+-        ttk.Entry(settings, textvariable=self.factory_delay_var, width=8).grid(row=6, column=1, sticky="w")
+-        ttk.Label(settings, text="сек. Safety Mode при FloodWait всё равно ждёт столько, сколько требует Telegram.").grid(row=6, column=2, columnspan=2, sticky="w", padx=(12, 0))
++        ttk.Entry(settings, textvariable=self.factory_delay_var, width=8).grid(row=4, column=1, sticky="w")
++        ttk.Label(settings, text="сек. FloodWait Telegram всегда соблюдается полностью.").grid(row=4, column=2, columnspan=2, sticky="w", padx=(12, 0))
+ 
++        # Compatibility variables stay available to the proven creation engine,
++        # but the normal 4.3.1 workflow is intentionally groups + own admins only.
++        self.factory_about_var = tk.StringVar(value="")
++        self.factory_entity_type_var = tk.StringVar(value="Группа")
++        self.factory_forum_var = tk.BooleanVar(value=False)
++        self.factory_empty_var = tk.BooleanVar(value=False)
+         self.factory_seed_enabled_var = tk.BooleanVar(value=False)
+-        ttk.Checkbutton(
+-            settings,
+-            text="Первичная публикация после создания",
+-            variable=self.factory_seed_enabled_var,
+-            command=self._factory_sync_seed_state,
+-        ).grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+-        self.factory_seed_path_var = tk.StringVar()
+-        self.factory_seed_entry = ttk.Entry(settings, textvariable=self.factory_seed_path_var)
+-        self.factory_seed_entry.grid(row=7, column=1, columnspan=2, sticky="ew", pady=4)
+-        self.factory_seed_browse_button = ttk.Button(settings, text="Выбрать файл…", command=self._factory_choose_seed_file)
+-        self.factory_seed_browse_button.grid(row=7, column=3, sticky="e", padx=(8, 0), pady=4)
+-
+-        ttk.Label(settings, text="Параметры публикации:").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
++        self.factory_seed_path_var = tk.StringVar(value="")
+         self.factory_seed_as_file_var = tk.BooleanVar(value=False)
+-        self.factory_seed_as_file_check = ttk.Checkbutton(
+-            settings,
+-            text="Отправлять как файл (без медиапревью/сжатия)",
+-            variable=self.factory_seed_as_file_var,
+-            command=self._save_group_factory_settings,
+-        )
+-        self.factory_seed_as_file_check.grid(row=8, column=1, sticky="w")
+-        self.factory_seed_caption_var = tk.StringVar()
+-        ttk.Label(settings, text="Подпись:").grid(row=8, column=2, sticky="e", padx=(12, 6))
+-        self.factory_seed_caption_entry = ttk.Entry(settings, textvariable=self.factory_seed_caption_var)
+-        self.factory_seed_caption_entry.grid(row=8, column=3, sticky="ew")
++        self.factory_seed_caption_var = tk.StringVar(value="")
+ 
+         account_row = ttk.Frame(t)
+         account_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+         account_row.columnconfigure(0, weight=1)
+         account_row.columnconfigure(1, weight=1)
+ 
+-        creators_box = ttk.LabelFrame(account_row, text="Аккаунты-создатели — распределение по кругу", padding=8)
++        creators_box = ttk.LabelFrame(account_row, text="Аккаунты, которые создают группы", padding=8)
+         creators_box.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+         creators_box.columnconfigure(0, weight=1)
+-        self.factory_creators_list = tk.Listbox(creators_box, selectmode=tk.EXTENDED, exportselection=False, height=7)
++        self.factory_creators_list = tk.Listbox(creators_box, selectmode=tk.EXTENDED, exportselection=False, height=8)
+         self.factory_creators_list.grid(row=0, column=0, sticky="ew")
+         ttk.Button(creators_box, text="Выбрать все", command=lambda: self.factory_creators_list.select_set(0, tk.END)).grid(row=1, column=0, sticky="w", pady=(5, 0))
