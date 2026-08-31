@@ -1,0 +1,104 @@
+diff --git a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+index a70a147..1fe181f 100644
+--- a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+@@ -3609,22 +3708,24 @@ class TelegramAdminManager(tk.Tk):
+                         groups_failed += 1
+                 except Exception as exc:
+                     groups_failed += 1
+-                    total_failed += len(selected)
++                    total_failed += len(target_selected)
+                     self.log(f"❌ Группа целиком не обработана: {self._friendly_error(exc)}")
+ 
+                 processed += 1
+                 self.ui_call(
+-                    lambda p=processed, n=len(targets): (
++                    lambda p=processed, n=len(work_plan), c=cached_groups: (
+                         self.admin_progress.configure(value=p),
+-                        self.admin_stats_var.set(f"{p} / {n} групп"),
++                        self.admin_stats_var.set(f"{c} из кэша · {p}/{n} обработано"),
+                     )
+                 )
+ 
+-            stopped = self._admin_stop_event.is_set() and processed < len(targets)
++            stopped = self._admin_stop_event.is_set() and processed < len(work_plan)
+             status = "Остановлено" if stopped else "Готово"
+             summary = (
+                 f"{status}.\n\n"
+-                f"Обработано групп: {processed}/{len(targets)}\n"
++                f"Всего выбранных групп: {total_requested_groups}\n"
++                f"Пропущено по кэшу: {cached_groups}\n"
++                f"Реально обработано: {processed}/{len(work_plan)}\n"
+                 f"Без ошибок: {groups_ok}\n"
+                 f"С ошибками: {groups_failed}\n"
+                 f"Назначений/обновлений прав: {total_promoted}\n"
+@@ -3644,6 +3745,7 @@ class TelegramAdminManager(tk.Tk):
+         preset: str,
+         title: str,
+         join_before: bool,
++        policy_key: str,
+     ) -> tuple[int, int]:
+         api_id, api_hash = self._api_credentials()
+         policy = self.safety_policy()
+@@ -3708,6 +3810,7 @@ class TelegramAdminManager(tk.Tk):
+         promoted = 0
+         failed = 0
+         successful_admin_sessions: set[str] = {effective_controller.session}
++        policy_success_sessions: set[str] = set()
+         try:
+             await controller_client.connect()
+             if not await controller_client.is_user_authorized():
+@@ -3717,6 +3820,18 @@ class TelegramAdminManager(tk.Tk):
+             target_entity = await controller_client.get_entity(target_entity)
+             self._log_controller_rights(target_entity)
+ 
++            if any(account.session == effective_controller.session for account in selected):
++                successful_admin_sessions.add(effective_controller.session)
++                policy_success_sessions.add(effective_controller.session)
++                self.group_state_cache.mark_admins(
++                    target,
++                    {effective_controller.session},
++                    controller_session=effective_controller.session,
++                    title=str(getattr(target_entity, "title", "") or ""),
++                    anonymous=bool(self.store.data.get("admin_anonymous", True)),
++                    policy_key=policy_key,
++                )
++
+             participant_map: dict[int, Any] = {}
+             try:
+                 async for user in controller_client.iter_participants(target_entity):
+@@ -3747,6 +3862,18 @@ class TelegramAdminManager(tk.Tk):
+                     )
+                     promoted += 1
+                     successful_admin_sessions.add(account.session)
++                    policy_success_sessions.add(account.session)
++                    # Persist each success immediately. If a later account hits
++                    # FloodWait or the process is interrupted, completed work is
++                    # still skipped on the next run.
++                    self.group_state_cache.mark_admins(
++                        target,
++                        {account.session},
++                        controller_session=effective_controller.session,
++                        title=str(getattr(target_entity, "title", "") or ""),
++                        anonymous=bool(self.store.data.get("admin_anonymous", True)),
++                        policy_key=policy_key,
++                    )
+                     if omitted:
+                         self.log(
+                             f"[{i}/{len(selected)}] {account.display}: ✅ права обновлены; "
+@@ -3793,6 +3920,15 @@ class TelegramAdminManager(tk.Tk):
+                 title=str(getattr(target_entity, "title", "") or ""),
+                 anonymous=bool(self.store.data.get("admin_anonymous", True)),
+             )
++            if policy_success_sessions:
++                self.group_state_cache.mark_admins(
++                    target,
++                    policy_success_sessions,
++                    controller_session=effective_controller.session,
++                    title=str(getattr(target_entity, "title", "") or ""),
++                    anonymous=bool(self.store.data.get("admin_anonymous", True)),
++                    policy_key=policy_key,
++                )
+         except Exception as cache_exc:
+             self._write_log(f"Group cache write failed for {target}: {cache_exc}")
+         self.log(f"Группа завершена. Назначено/обновлено: {promoted}; ошибок/пропусков: {failed}.")
