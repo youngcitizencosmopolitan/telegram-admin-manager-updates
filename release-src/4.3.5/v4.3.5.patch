@@ -1,0 +1,394 @@
+--- a/TelegramAdminManager-4.3.4/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.5/telegram_admin_manager.py
+@@ -59,7 +59,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.4"
++APP_VERSION = "4.3.5"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -70,6 +70,15 @@
+     ("admins", "Админы"),
+ )
+ 
++MAIN_TAB_SPECS = (
++    ("groups", "Создание групп"),
++    ("monitor", "Мониторинг"),
++    ("admins", "Админы"),
++    ("accounts", "Аккаунты / API"),
++    ("x", "Twitter / X"),
++    ("updates", "Обновления"),
++)
++
+ 
+ ADMIN_POLICY_SCHEMA = 2
+ 
+@@ -433,72 +442,133 @@
+         return best_name, best_count, best_stamp
+ 
+     def _build_ui(self) -> None:
+-        """Build a small launcher and keep the three Telegram workflows independent."""
+-        self.geometry("780x560")
+-        self.minsize(680, 500)
++        """Build one persistent tabbed workspace with a shared log on the right."""
++        self.geometry("1700x920")
++        self.minsize(1180, 700)
+         self.configure(bg="#eef2f7")
+         style = ttk.Style(self)
+         try:
+             style.theme_use("clam")
+         except Exception:
+             pass
+-        style.configure("Launcher.TButton", font=("Segoe UI", 14, "bold"), padding=(18, 18))
+-        style.configure("Dashboard.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 7))
++        style.configure("Main.TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 8))
+         style.configure("Quiet.TButton", font=("Segoe UI", 9), padding=(8, 6))
+ 
+         self.columnconfigure(0, weight=1)
+         self.rowconfigure(0, weight=1)
+-        root = tk.Frame(self, bg="#eef2f7", padx=24, pady=20)
++        root = tk.Frame(self, bg="#eef2f7", padx=10, pady=10)
+         root.grid(row=0, column=0, sticky="nsew")
+         root.columnconfigure(0, weight=1)
++        root.rowconfigure(1, weight=1)
+ 
+         header = tk.Frame(root, bg="#eef2f7")
+-        header.grid(row=0, column=0, sticky="ew", pady=(0, 22))
++        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+         header.columnconfigure(0, weight=1)
+         tk.Label(
+             header, text=f"{APP_NAME}  {APP_VERSION}", bg="#eef2f7", fg="#172033",
+-            font=("Segoe UI", 20, "bold"),
++            font=("Segoe UI", 17, "bold"),
+         ).grid(row=0, column=0, sticky="w")
+-        tk.Label(
+-            header, text="Выбери инструмент и работай в отдельном окне", bg="#eef2f7", fg="#64748b",
+-            font=("Segoe UI", 10),
+-        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+         self.busy_label = tk.Label(
+             header, text="Готово", bg="#e5eaf1", fg="#334155", padx=12, pady=6,
+             font=("Segoe UI", 9, "bold"),
+         )
+-        self.busy_label.grid(row=0, column=1, rowspan=2, sticky="e", padx=(10, 0))
++        self.busy_label.grid(row=0, column=1, sticky="e")
+ 
+-        tools = tk.Frame(root, bg="#eef2f7")
+-        tools.grid(row=1, column=0, sticky="ew")
+-        tools.columnconfigure(0, weight=1)
+-        descriptions = {
+-            "groups": "Массово создать группы и сразу добавить свои аккаунты администраторами.",
+-            "monitor": "Следить за папками, очередью, текущими файлами, скоростью и ошибками.",
+-            "admins": "Массово назначить свои сохранённые аккаунты админами в существующих группах.",
++        self.main_workspace = tk.PanedWindow(
++            root, orient="horizontal", sashwidth=7, bg="#d8dee8", bd=0, relief="flat"
++        )
++        self.main_workspace.grid(row=1, column=0, sticky="nsew")
++        left = ttk.Frame(self.main_workspace, padding=0)
++        right = ttk.Frame(self.main_workspace, padding=8)
++        self.main_workspace.add(left, stretch="always", minsize=820)
++        self.main_workspace.add(right, minsize=300)
++        self._tool_panes = {"main_workspace": self.main_workspace}
++        self.main_workspace.bind("<ButtonRelease-1>", self._save_tool_pane_sashes, add="+")
++
++        left.columnconfigure(0, weight=1)
++        left.rowconfigure(0, weight=1)
++        self.main_notebook = ttk.Notebook(left, style="Main.TNotebook")
++        self.main_notebook.grid(row=0, column=0, sticky="nsew")
++
++        self.tab_group_factory = ttk.Frame(self.main_notebook, padding=10)
++        self.monitor_workspace = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_group = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_account_api = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_x_main = ttk.Frame(self.main_notebook, padding=14)
++        self.tab_updates_main = ttk.Frame(self.main_notebook, padding=14)
++        tab_frames = {
++            "groups": self.tab_group_factory,
++            "monitor": self.monitor_workspace,
++            "admins": self.tab_group,
++            "accounts": self.tab_account_api,
++            "x": self.tab_x_main,
++            "updates": self.tab_updates_main,
+         }
+-        for row, (key, label) in enumerate(PRIMARY_TOOL_SPECS):
+-            card = tk.Frame(tools, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=14, pady=12)
+-            card.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+-            card.columnconfigure(0, weight=1)
+-            ttk.Button(
+-                card, text=label, style="Launcher.TButton",
+-                command=lambda k=key: self._open_primary_tool(k),
+-            ).grid(row=0, column=0, sticky="ew")
+-            tk.Label(
+-                card, text=descriptions[key], bg="#ffffff", fg="#64748b",
+-                font=("Segoe UI", 9), wraplength=620, justify="left",
+-            ).grid(row=1, column=0, sticky="w", pady=(7, 0))
+-
+-        secondary = tk.Frame(root, bg="#eef2f7")
+-        secondary.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+-        ttk.Button(secondary, text="Аккаунты / настройки", style="Quiet.TButton", command=lambda: self._open_advanced("accounts")).pack(side="left")
+-        ttk.Button(secondary, text="Журнал", style="Quiet.TButton", command=self._show_log_window).pack(side="left", padx=6)
+-        ttk.Button(secondary, text="Twitter / X", style="Quiet.TButton", command=self._open_x_planner).pack(side="left", padx=6)
+-        ttk.Button(secondary, text="↻ Обновления", style="Quiet.TButton", command=self._show_update_center).pack(side="right")
++        self._main_tabs = tab_frames
++        for key, label in MAIN_TAB_SPECS:
++            self.main_notebook.add(tab_frames[key], text=label)
++
++        # Shared right-side journal stays visible while switching tabs.
++        self._build_log_panel(right, title="Журнал")
++
++        # Monitoring keeps its hidden compatibility host for the proven queue engine.
++        self.monitor_workspace.columnconfigure(0, weight=1)
++        self.monitor_workspace.rowconfigure(0, weight=1)
++        self.tab_batch_uploader = ttk.Frame(self.monitor_workspace)
++        self.tab_monitor = self.monitor_workspace
++
++        # Accounts/API remain grouped inside one always-visible main tab.
++        self.tab_account_api.columnconfigure(0, weight=1)
++        self.tab_account_api.rowconfigure(0, weight=1)
++        self.advanced_notebook = ttk.Notebook(self.tab_account_api)
++        self.advanced_notebook.grid(row=0, column=0, sticky="nsew")
++        self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_safety = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_settings = ttk.Frame(self.advanced_notebook, padding=12)
++        self.advanced_notebook.add(self.tab_accounts, text="Аккаунты")
++        self.advanced_notebook.add(self.tab_uploader, text="Быстрая загрузка")
++        self.advanced_notebook.add(self.tab_safety, text="Безопасность")
++        self.advanced_notebook.add(self.tab_settings, text="Настройки API")
++
++        self._build_group_factory_tab()
++        self._build_group_tab()
++        self.batch_uploader = BatchUploaderPane(
++            self, self.tab_batch_uploader, monitor_parent=self.monitor_workspace, unified_monitor=True
++        )
++        if hasattr(self.batch_uploader, "monitor_body_pane"):
++            self._tool_panes["monitor_body"] = self.batch_uploader.monitor_body_pane
++            self.batch_uploader.monitor_body_pane.bind(
++                "<ButtonRelease-1>", self._save_tool_pane_sashes, add="+"
++            )
++        self._build_accounts_tab()
++        self._build_uploader_tab()
++        self._build_safety_tab()
++        self._build_settings_tab()
++
++        self.tab_x_main.columnconfigure(0, weight=1)
++        ttk.Label(
++            self.tab_x_main, text="Twitter / X Planner", font=("Segoe UI", 16, "bold")
++        ).grid(row=0, column=0, sticky="w")
++        ttk.Label(
++            self.tab_x_main,
++            text="Планировщик X остаётся изолированным процессом, чтобы браузерные профили не мешали Telegram. Запускается отсюда.",
++            wraplength=780,
++        ).grid(row=1, column=0, sticky="w", pady=(8, 12))
++        ttk.Button(self.tab_x_main, text="Открыть X Planner", command=self._open_x_planner).grid(row=2, column=0, sticky="w")
++
++        self.tab_updates_main.columnconfigure(0, weight=1)
++        ttk.Label(
++            self.tab_updates_main, text="Обновления", font=("Segoe UI", 16, "bold")
++        ).grid(row=0, column=0, sticky="w")
++        ttk.Label(
++            self.tab_updates_main, text=f"Текущая версия: {APP_VERSION}"
++        ).grid(row=1, column=0, sticky="w", pady=(8, 12))
++        ttk.Button(
++            self.tab_updates_main, text="Проверить обновления", command=self._show_update_center
++        ).grid(row=2, column=0, sticky="w")
+ 
+-        self._build_secondary_windows()
+-        self._build_primary_tool_windows()
++        self.after(450, self._restore_tool_pane_sashes)
+ 
+     def _build_dashboard_ui_legacy(self) -> None:
+         """Build the v4 single-page dashboard.
+@@ -810,16 +880,15 @@
+         self.after(250, self._refresh_dashboard)
+ 
+     def _show_log_window(self) -> None:
++        """The journal is permanently visible in the shared right pane."""
+         try:
+-            self.log_window.deiconify()
+-            self.log_window.lift()
+-            self.log_window.focus_force()
++            self.main_workspace.sash_place(0, max(760, self.winfo_width() - 360), 0)
+         except Exception:
+             pass
+ 
+     def _open_primary_tool(self, key: str) -> None:
+-        win = getattr(self, "_tool_windows", {}).get(str(key))
+-        if win is None:
++        frame = getattr(self, "_main_tabs", {}).get(str(key))
++        if frame is None:
+             return
+         try:
+             if key == "monitor" and hasattr(self, "batch_uploader"):
+@@ -828,17 +897,16 @@
+                 self._refresh_admin_account_list()
+             elif key == "groups" and hasattr(self, "factory_creators_list"):
+                 self._factory_refresh_account_boxes()
+-            win.deiconify()
+-            win.lift()
+-            win.focus_force()
++            self.main_notebook.select(frame)
++            self.focus_force()
+         except Exception:
+             pass
+ 
+     def _open_advanced(self, section: str = "uploads") -> None:
+-        if section in {"groups", "admins"}:
++        if section in {"groups", "admins", "monitor"}:
+             self._open_primary_tool(section)
+             return
+-        if section in {"uploads", "monitor"}:
++        if section == "uploads":
+             self._open_primary_tool("monitor")
+             return
+         mapping = {
+@@ -848,10 +916,9 @@
+             "settings": self.tab_settings,
+         }
+         try:
++            self.main_notebook.select(self.tab_account_api)
+             self.advanced_notebook.select(mapping.get(section, self.tab_accounts))
+-            self.advanced_window.deiconify()
+-            self.advanced_window.lift()
+-            self.advanced_window.focus_force()
++            self.focus_force()
+         except Exception:
+             pass
+ 
+--- a/TelegramAdminManager-4.3.4/batch_uploader.py
++++ b/TelegramAdminManager-4.3.5/batch_uploader.py
+@@ -60,6 +60,16 @@
+     return f"{_fmt_bytes(value)}/с"
+ 
+ 
++def _remaining_eta_seconds(total_bytes: int | float, done_bytes: int | float, speed: float) -> float | None:
++    remaining = max(0.0, float(total_bytes) - float(done_bytes))
++    if remaining <= 0:
++        return 0.0
++    # Avoid noisy/infinite ETA while the transfer is stalled or only starting.
++    if float(speed) <= 1024.0:
++        return None
++    return remaining / float(speed)
++
++
+ def _fmt_eta(seconds: float | None) -> str:
+     if seconds is None or seconds < 0 or seconds == float("inf"):
+         return "—"
+@@ -543,16 +553,16 @@
+         rules_panel.rowconfigure(0, weight=1)
+         body.add(rules_panel, stretch="always", minsize=260)
+ 
+-        cols = ("on", "folder", "target", "caption", "interval", "new", "queue", "progress", "speed", "state")
++        cols = ("on", "folder", "target", "caption", "interval", "new", "queue", "progress", "speed", "eta", "state")
+         self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="browse")
+         headings = {
+             "#0": "Правило", "on": "Мон.", "folder": "Папка", "target": "Группа",
+             "caption": "Подпись", "interval": "Интервал", "new": "Новые", "queue": "Работа",
+-            "progress": "%", "speed": "Скорость", "state": "Состояние",
++            "progress": "%", "speed": "Скорость", "eta": "Осталось", "state": "Состояние",
+         }
+         widths = {
+             "#0": 145, "on": 45, "folder": 220, "target": 175, "caption": 220,
+-            "interval": 65, "new": 55, "queue": 100, "progress": 62, "speed": 95, "state": 155,
++            "interval": 65, "new": 55, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
+         }
+         centered = {"on", "interval", "new", "queue", "progress"}
+         for col, title in headings.items():
+@@ -695,6 +705,8 @@
+             active_bytes = sum(int(v.get("current", 0) or 0) for v in active.values()) if isinstance(active, dict) else 0
+             speed = sum(float(v.get("speed", 0.0) or 0.0) for v in active.values()) if isinstance(active, dict) else 0.0
+             progress = ((processed + active_bytes) / total * 100.0) if total else 0.0
++            remaining = max(0, total - processed - active_bytes)
++            eta_seconds = _remaining_eta_seconds(total, processed + active_bytes, speed)
+             if tid in live_ids:
+                 work_text = "Выполняется"
+                 active_count += 1
+@@ -721,6 +733,7 @@
+                         work_text,
+                         f"{progress:.0f}%" if work_text != "—" else "—",
+                         _fmt_speed(speed),
++                        _fmt_eta(eta_seconds) if work_text == "Выполняется" else ("0с" if progress >= 100.0 and work_text == "—" else "—"),
+                         state_text,
+                     ),
+                 )
+--- a/TelegramAdminManager-4.3.4/tests/test_three_tool_ui_v431.py
++++ b/TelegramAdminManager-4.3.5/tests/test_three_tool_ui_v431.py
+@@ -44,12 +44,12 @@
+ 
+ 
+ class SimplifiedWorkflowStructureTests(unittest.TestCase):
+-    def test_root_builds_launcher_instead_of_dashboard(self):
++    def test_root_builds_tabbed_workspace_instead_of_dashboard(self):
+         source = inspect.getsource(main_app.TelegramAdminManager._build_ui)
+-        self.assertIn("PRIMARY_TOOL_SPECS", source)
+-        self.assertIn("_open_primary_tool", source)
++        self.assertIn("MAIN_TAB_SPECS", source)
++        self.assertIn("main_notebook", source)
+         self.assertNotIn("dashboard_metric_vars", source)
+-        self.assertNotIn("_refresh_dashboard", source)
++        self.assertNotIn("Launcher.TButton", source)
+ 
+     def test_admin_tool_uses_its_own_account_selection(self):
+         build_source = inspect.getsource(main_app.TelegramAdminManager._build_group_tab)
+--- /dev/null
++++ b/TelegramAdminManager-4.3.5/tests/test_v435_tabbed_ui_eta.py
+@@ -0,0 +1,58 @@
++import inspect
++import unittest
++
++import telegram_admin_manager as main_app
++import batch_uploader
++from batch_uploader import BatchUploaderPane, _fmt_eta
++
++
++class MainTabbedUiTests(unittest.TestCase):
++    def test_main_ui_uses_persistent_notebook_instead_of_launcher_cards(self):
++        source = inspect.getsource(main_app.TelegramAdminManager._build_ui)
++        self.assertIn("main_notebook", source)
++        self.assertIn("ttk.Notebook", source)
++        self.assertNotIn("Launcher.TButton", source)
++        self.assertNotIn("Выбери инструмент и работай в отдельном окне", source)
++
++    def test_main_tab_labels_keep_primary_tools_visible(self):
++        self.assertTrue(hasattr(main_app, "MAIN_TAB_SPECS"))
++        labels = [label for _key, label in main_app.MAIN_TAB_SPECS]
++        self.assertEqual(labels[:3], ["Создание групп", "Мониторинг", "Админы"])
++        self.assertIn("Аккаунты / API", labels)
++        self.assertIn("Twitter / X", labels)
++        self.assertIn("Обновления", labels)
++
++    def test_primary_tool_switch_selects_existing_tab_not_toplevel(self):
++        source = inspect.getsource(main_app.TelegramAdminManager._open_primary_tool)
++        self.assertIn("main_notebook.select", source)
++        self.assertNotIn("deiconify", source)
++
++
++class MonitoringEtaTests(unittest.TestCase):
++    def test_remaining_eta_uses_remaining_bytes_and_live_speed(self):
++        fn = getattr(batch_uploader, "_remaining_eta_seconds", None)
++        self.assertIsNotNone(fn)
++        self.assertEqual(fn(10000, 2500, 2500), 3.0)
++        self.assertEqual(_fmt_eta(fn(1024 * 60, 0, 2048)), "30с")
++
++    def test_remaining_eta_is_unknown_without_useful_speed(self):
++        fn = getattr(batch_uploader, "_remaining_eta_seconds", None)
++        self.assertIsNotNone(fn)
++        self.assertIsNone(fn(1000, 100, 0))
++        self.assertIsNone(fn(1000, 100, 512))
++        self.assertEqual(fn(1000, 1000, 2048), 0.0)
++
++    def test_monitor_rules_have_eta_column_next_to_speed(self):
++        source = inspect.getsource(BatchUploaderPane._build_unified_monitor_ui)
++        self.assertIn('"speed", "eta", "state"', source)
++        self.assertIn('"eta": "Осталось"', source)
++
++    def test_monitor_refresh_calculates_and_renders_eta(self):
++        source = inspect.getsource(BatchUploaderPane.refresh_monitor_tab)
++        self.assertIn("remaining = max(0, total - processed - active_bytes)", source)
++        self.assertIn("_remaining_eta_seconds", source)
++        self.assertIn("_fmt_eta", source)
++
++
++if __name__ == "__main__":
++    unittest.main()
