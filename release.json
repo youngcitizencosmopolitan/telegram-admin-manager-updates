@@ -2,8 +2,14 @@
   "version": "4.3.1",
   "base_version": "4.3.0",
   "patch_files": [
-    "release-src/4.3.1/00-bootstrap.patch",
-    "release-src/4.3.1/01-fix-version-locked-test.patch"
+    "release-src/4.3.1/101-main-ui.patch",
+    "release-src/4.3.1/102-main-ui.patch",
+    "release-src/4.3.1/103-main-ui.patch",
+    "release-src/4.3.1/104-main-ui.patch",
+    "release-src/4.3.1/105-monitor-sort.patch",
+    "release-src/4.3.1/106-three-tool-tests.patch",
+    "release-src/4.3.1/107-x-test.patch",
+    "release-src/4.3.1/108-notes.patch"
   ],
-  "notes": "Кандидат упрощённого Telegram-интерфейса: три независимых инструмента — создание групп, мониторинг и назначение админов. Bootstrap CI rebuild."
+  "notes": "Telegram Admin Manager 4.3.1: вместо Dashboard — три независимых инструмента: массовое создание групп с добавлением своих аккаунтов в админы, мониторинг/очередь и массовое назначение админов. Добавлена числовая сортировка скорости fastest-first. X Planner, обновления и данные пользователя сохраняются."
 }
