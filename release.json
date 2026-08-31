@@ -7,9 +7,9 @@
     "release-src/4.3.3/overlay-02.b64",
     "release-src/4.3.3/overlay-03.b64",
     "release-src/4.3.3/overlay-04.b64",
-    "release-src/4.3.3/overlay-rest-00.b64",
-    "release-src/4.3.3/overlay-gap.b64",
-    "release-src/4.3.3/overlay-05-08.b64",
+    "release-src/4.3.3/overlay-05.b64",
+    "release-src/4.3.3/overlay-06.b64",
+    "release-src/4.3.3/overlay-07.b64",
     "release-src/4.3.3/overlay-tail-00.b64",
     "release-src/4.3.3/overlay-tail-01.b64"
   ],
