@@ -1,0 +1,26 @@
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_channels_ui_contract.py b/TelegramAdminManager-4.3.8/tests/test_v438_channels_ui_contract.py
+new file mode 100644
+index 0000000..de90d01
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_channels_ui_contract.py
+@@ -0,0 +1,20 @@
++import inspect
++import unittest
++
++import telegram_admin_manager as app
++
++
++class V438ChannelsUiContractTests(unittest.TestCase):
++    def test_tab_order_contains_channels_between_admins_and_accounts(self):
++        keys = [key for key, _label in app.MAIN_TAB_SPECS]
++        self.assertEqual(keys, ['groups', 'monitor', 'admins', 'channels', 'accounts', 'x', 'updates'])
++
++    def test_channel_column_guard_and_builder_exist(self):
++        self.assertIn('Название', app.CHANNEL_COLUMN_LABELS.values())
++        self.assertEqual(app.normalize_channel_visible_columns([]), ['title'])
++        source = inspect.getsource(app.TelegramAdminManager._build_channels_tab)
++        self.assertIn('Обновить каналы', source)
++        self.assertIn('Вид', source)
++
++if __name__ == '__main__':
++    unittest.main()
