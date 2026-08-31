@@ -1,0 +1,309 @@
+diff --git a/TelegramAdminManager-4.3.7/batch_uploader.py b/TelegramAdminManager-4.3.8/batch_uploader.py
+index 6ea17a0..ce57a59 100644
+--- a/TelegramAdminManager-4.3.7/batch_uploader.py
++++ b/TelegramAdminManager-4.3.8/batch_uploader.py
+@@ -3180,6 +3180,10 @@ class BatchUploaderPane:
+             account, client = clients[session]
+             if self.account_health.get(session, {}).get("disabled"):
+                 continue
++            restriction_check = getattr(self.app, "account_is_restricted", None)
++            if callable(restriction_check) and restriction_check(session):
++                self.app.log(f"{name}: {account.display} ⚠ пропуск — аккаунт помечен «Ограничен Telegram»; массовая отправка не выполняется")
++                continue
+             try:
+                 should_join = bool(task.get("join_if_needed", False)) and not bool(task.get("auto_admin", True))
+                 entity = await self.app._resolve_or_join_target(client, str(task.get("target", "")), should_join)
+diff --git a/TelegramAdminManager-4.3.8/tam_core/account_restrictions.py b/TelegramAdminManager-4.3.8/tam_core/account_restrictions.py
+new file mode 100644
+index 0000000..e015d6a
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tam_core/account_restrictions.py
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++from typing import Any
++
++_RESTRICTED_CLASS_REASONS = {
++    'PEERFLOODERROR': 'peer_flood',
++    'USERRESTRICTEDERROR': 'user_restricted',
++    'USERDEACTIVATEDBANERROR': 'user_deactivated_ban',
++    'PHONENUMBERBANNEDERROR': 'phone_number_banned',
++}
++
++_EXCLUDED_MARKERS = (
++    'FLOODWAIT', 'FLOOD_WAIT', 'FLOODPREMIUMWAIT', 'FLOOD_PREMIUM_WAIT',
++    'USERPRIVACYRESTRICTED', 'USER_PRIVACY_RESTRICTED',
++    'FILEPARTMISSING', 'FILE_PART_MISSING', 'FILE_PART',
++    'CHATADMINREQUIRED', 'CHAT_ADMIN_REQUIRED', 'RIGHTFORBIDDEN',
++    'TIMEOUT', 'CONNECTION', 'NETWORK',
++)
++
++
++def classify_telegram_restriction(exc: BaseException | Any) -> str | None:
++    name = exc.__class__.__name__.upper()
++    text = str(exc or '').upper()
++    combined = f'{name} {text}'
++    if any(marker in combined for marker in _EXCLUDED_MARKERS):
++        return None
++    if name in _RESTRICTED_CLASS_REASONS:
++        return _RESTRICTED_CLASS_REASONS[name]
++    if 'PEER_FLOOD' in combined or 'TOO MANY REQUESTS' in combined and 'SPAM' in combined:
++        return 'peer_flood'
++    if 'ANTI-SPAM' in combined or 'ANTISPAM' in combined or 'SPAM RESTRICTION' in combined:
++        return 'anti_spam'
++    return None
++
++
++def is_risky_membership_write(operation: str) -> bool:
++    key = str(operation or '').strip().casefold()
++    return key in {
++        'join', 'join_for_admin', 'factory_join_admin', 'invite', 'promote',
++        'membership_write', 'upload_join',
++    }
+diff --git a/TelegramAdminManager-4.3.8/tam_core/channel_inventory.py b/TelegramAdminManager-4.3.8/tam_core/channel_inventory.py
+new file mode 100644
+index 0000000..72bff28
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tam_core/channel_inventory.py
+@@ -0,0 +1,69 @@
++from __future__ import annotations
++
++from typing import Any
++
++
++def serialize_admin_rights(rights: Any) -> dict[str, bool]:
++    if rights is None:
++        return {}
++    out: dict[str, bool] = {}
++    names = set()
++    try:
++        names.update(vars(rights).keys())
++    except Exception:
++        pass
++    slots = getattr(rights.__class__, '__slots__', ()) or ()
++    if isinstance(slots, str):
++        slots = (slots,)
++    names.update(slots)
++    for name in sorted(str(x) for x in names):
++        if not name or name.startswith('_') or name in {'CONSTRUCTOR_ID', 'SUBCLASS_OF_ID'}:
++            continue
++        try:
++            value = getattr(rights, name)
++        except Exception:
++            continue
++        if isinstance(value, bool) or value is None:
++            out[name] = bool(value)
++    return out
++
++
++def relation_from_entity(entity: Any) -> dict[str, Any]:
++    if bool(getattr(entity, 'creator', False)):
++        rights = serialize_admin_rights(getattr(entity, 'admin_rights', None))
++        return {'relation': 'owner', 'rights': rights, 'can_add_admins': True}
++    admin_rights = getattr(entity, 'admin_rights', None)
++    if admin_rights is not None:
++        rights = serialize_admin_rights(admin_rights)
++        return {'relation': 'admin', 'rights': rights, 'can_add_admins': bool(rights.get('add_admins', False))}
++    return {'relation': 'member', 'rights': {}, 'can_add_admins': False}
++
++
++def merge_channel_observation(existing: dict[str, Any] | None, observation: dict[str, Any]) -> dict[str, Any]:
++    base = dict(existing or {})
++    incoming = dict(observation or {})
++    if base and incoming.get('peer_id') is not None and base.get('peer_id') is not None:
++        if int(base['peer_id']) != int(incoming['peer_id']):
++            raise ValueError('cannot merge different peer ids')
++    for key, value in incoming.items():
++        if value not in (None, '') or key not in base:
++            base[key] = value
++    return base
++
++
++def observation_from_entity(entity: Any, *, now: float) -> dict[str, Any]:
++    peer_id = int(getattr(entity, 'id'))
++    username = str(getattr(entity, 'username', '') or '')
++    title = str(getattr(entity, 'title', '') or username or peer_id)
++    kind = 'channel' if entity.__class__.__name__ == 'Channel' else 'group'
++    return {
++        'peer_id': peer_id,
++        'peer_type': kind,
++        'title': title,
++        'username': username,
++        'link': f'https://t.me/{username}' if username else '',
++        'last_seen_at': float(now),
++        'last_refreshed_at': float(now),
++        'status': 'ok',
++        'error': '',
++    }
+diff --git a/TelegramAdminManager-4.3.7/tam_core/state_db.py b/TelegramAdminManager-4.3.8/tam_core/state_db.py
+index 4134ad5..a0f4ce5 100644
+--- a/TelegramAdminManager-4.3.7/tam_core/state_db.py
++++ b/TelegramAdminManager-4.3.8/tam_core/state_db.py
+@@ -10,7 +10,7 @@ import time
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 6
++SCHEMA_VERSION = 7
+@@ -175,6 +175,28 @@ class StateDatabase:
+                 CREATE INDEX IF NOT EXISTS idx_created_groups_created_at
+                     ON created_groups(created_at);
+ 
++                CREATE TABLE IF NOT EXISTS channels (
++                    peer_id INTEGER PRIMARY KEY,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL
++                );
++
++                CREATE TABLE IF NOT EXISTS channel_accounts (
++                    peer_id INTEGER NOT NULL,
++                    session TEXT NOT NULL,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL,
++                    PRIMARY KEY(peer_id, session)
++                );
++                CREATE INDEX IF NOT EXISTS idx_channel_accounts_session
++                    ON channel_accounts(session, peer_id);
++
++                CREATE TABLE IF NOT EXISTS account_restrictions (
++                    session TEXT PRIMARY KEY,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL
++                );
++
+                 CREATE TABLE IF NOT EXISTS events (
+@@ -212,6 +234,108 @@ class StateDatabase:
+                 (key, json.dumps(value, ensure_ascii=False)),
+             )
+ 
++    # ---------- channels / account restrictions ----------
++    def channel_upsert(self, payload: dict[str, Any]) -> None:
++        peer_id = int(payload.get("peer_id"))
++        current = {}
++        with self.session() as conn:
++            row = conn.execute("SELECT payload_json FROM channels WHERE peer_id=?", (peer_id,)).fetchone()
++            if row:
++                try:
++                    obj = json.loads(row[0])
++                    if isinstance(obj, dict): current = dict(obj)
++                except Exception: pass
++            merged = dict(current)
++            for key, value in dict(payload).items():
++                if value not in (None, "") or key not in merged: merged[key] = value
++            merged["peer_id"] = peer_id
++            conn.execute("INSERT INTO channels(peer_id, payload_json, updated_at) VALUES(?, ?, ?) ON CONFLICT(peer_id) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at", (peer_id, json.dumps(merged, ensure_ascii=False), time.time()))
++
++    def channels_all(self) -> list[dict[str, Any]]:
++        out=[]
++        with self.session() as conn: rows=conn.execute("SELECT payload_json FROM channels ORDER BY peer_id").fetchall()
++        for row in rows:
++            try:
++                obj=json.loads(row[0]);
++                if isinstance(obj, dict): out.append(dict(obj))
++            except Exception: pass
++        return out
++
++    def channel_get(self, peer_id: int) -> dict[str, Any]:
++        with self.session() as conn: row=conn.execute("SELECT payload_json FROM channels WHERE peer_id=?", (int(peer_id),)).fetchone()
++        if not row: return {}
++        try:
++            obj=json.loads(row[0]); return dict(obj) if isinstance(obj, dict) else {}
++        except Exception: return {}
++
++    def channel_account_put(self, peer_id: int, session: str, payload: dict[str, Any]) -> None:
++        data=dict(payload); data["peer_id"]=int(peer_id); data["session"]=str(session)
++        with self.session() as conn:
++            conn.execute("INSERT INTO channel_accounts(peer_id, session, payload_json, updated_at) VALUES(?, ?, ?, ?) ON CONFLICT(peer_id, session) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at", (int(peer_id), str(session), json.dumps(data, ensure_ascii=False), time.time()))
++
++    def channel_accounts(self, peer_id: int) -> list[dict[str, Any]]:
++        out=[]
++        with self.session() as conn: rows=conn.execute("SELECT payload_json FROM channel_accounts WHERE peer_id=? ORDER BY session", (int(peer_id),)).fetchall()
++        for row in rows:
++            try:
++                obj=json.loads(row[0]);
++                if isinstance(obj, dict): out.append(dict(obj))
++            except Exception: pass
++        return out
++
++    def account_restriction_get(self, session: str) -> dict[str, Any]:
++        with self.session() as conn: row=conn.execute("SELECT payload_json FROM account_restrictions WHERE session=?", (str(session),)).fetchone()
++        if not row: return {}
++        try:
++            obj=json.loads(row[0]); return dict(obj) if isinstance(obj, dict) else {}
++        except Exception: return {}
++
++    def account_restriction_set(self, session: str, payload: dict[str, Any]) -> None:
++        data=dict(payload); data["session"]=str(session); now=time.time(); data.setdefault("detected_at", now); data["last_seen_at"]=now
++        with self.session() as conn:
++            conn.execute("INSERT INTO account_restrictions(session, payload_json, updated_at) VALUES(?, ?, ?) ON CONFLICT(session) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at", (str(session), json.dumps(data, ensure_ascii=False), now))
++
++    def account_restriction_clear(self, session: str) -> None:
++        with self.session() as conn: conn.execute("DELETE FROM account_restrictions WHERE session=?", (str(session),))
++
+     # ---------- config / accounts / tasks ----------
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_account_restrictions.py b/TelegramAdminManager-4.3.8/tests/test_v438_account_restrictions.py
+new file mode 100644
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_account_restrictions.py
+@@ -0,0 +1,28 @@
++import unittest
++from tam_core.account_restrictions import classify_telegram_restriction
++def exc(name, text='x'): return type(name, (Exception,), {})(text)
++class V438RestrictionTests(unittest.TestCase):
++    def test_conservative_classifier(self):
++        self.assertEqual(classify_telegram_restriction(exc('PeerFloodError')), 'peer_flood')
++        self.assertEqual(classify_telegram_restriction(exc('UserRestrictedError')), 'user_restricted')
++        for name in ('FloodWaitError', 'UserPrivacyRestrictedError', 'FilePartMissingError', 'ChatAdminRequiredError', 'TimeoutError'):
++            self.assertIsNone(classify_telegram_restriction(exc(name)))
++class V438RestrictionIntegrationTests(unittest.TestCase):
++    def test_admin_write_paths_gate_persistently_restricted_accounts(self):
++        import inspect, telegram_admin_manager as app
++        promote=inspect.getsource(app.TelegramAdminManager._promote_one_target_async); factory=inspect.getsource(app.TelegramAdminManager._factory_join_admin)
++        self.assertIn('account_is_restricted', promote); self.assertIn('remember_account_restriction', promote); self.assertIn('account_is_restricted', factory)
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_channel_inventory.py b/TelegramAdminManager-4.3.8/tests/test_v438_channel_inventory.py
+new file mode 100644
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_channel_inventory.py
+@@ -0,0 +1,24 @@
++import unittest
++from tam_core.channel_inventory import merge_channel_observation, relation_from_entity, serialize_admin_rights
++class Obj: pass
++class V438ChannelInventoryTests(unittest.TestCase):
++    def test_peer_observations_merge_by_id(self):
++        a={'peer_id':99,'title':'Old','link':'','peer_type':'channel'}; b={'peer_id':99,'title':'New','link':'https://t.me/new','peer_type':'channel'}
++        merged=merge_channel_observation(a,b); self.assertEqual(merged['peer_id'],99); self.assertEqual(merged['title'],'New'); self.assertEqual(merged['link'],'https://t.me/new')
++    def test_relation_and_dynamic_rights(self):
++        rights=Obj(); rights.add_admins=True; rights.delete_messages=False; rights._internal=True
++        entity=Obj(); entity.creator=False; entity.admin_rights=rights
++        rel=relation_from_entity(entity); self.assertEqual(rel['relation'],'admin'); self.assertTrue(rel['can_add_admins'])
++        serialized=serialize_admin_rights(rights); self.assertEqual(serialized['add_admins'],True); self.assertEqual(serialized['delete_messages'],False); self.assertNotIn('_internal',serialized)
++        entity.creator=True; self.assertEqual(relation_from_entity(entity)['relation'],'owner')
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_channels_ui_contract.py b/TelegramAdminManager-4.3.8/tests/test_v438_channels_ui_contract.py
+new file mode 100644
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_channels_ui_contract.py
+@@ -0,0 +1,15 @@
++import inspect, unittest, telegram_admin_manager as app
++class V438ChannelsUiContractTests(unittest.TestCase):
++    def test_tab_order_contains_channels_between_admins_and_accounts(self):
++        keys=[key for key,_label in app.MAIN_TAB_SPECS]; self.assertEqual(keys,['groups','monitor','admins','channels','accounts','x','updates'])
++    def test_channel_column_guard_and_builder_exist(self):
++        self.assertIn('Название',app.CHANNEL_COLUMN_LABELS.values()); self.assertEqual(app.normalize_channel_visible_columns([]),['title'])
++        source=inspect.getsource(app.TelegramAdminManager._build_channels_tab); self.assertIn('Обновить каналы',source); self.assertIn('Вид',source)
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_state_inventory.py b/TelegramAdminManager-4.3.8/tests/test_v438_state_inventory.py
+new file mode 100644
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_state_inventory.py
+@@ -0,0 +1,22 @@
++import tempfile, unittest
++from pathlib import Path
++from tam_core.state_db import StateDatabase, SCHEMA_VERSION
++class V438StateInventoryTests(unittest.TestCase):
++    def test_schema_and_inventory_restriction_storage(self):
++        with tempfile.TemporaryDirectory() as td:
++            db=StateDatabase(Path(td)/'state.db'); self.assertGreaterEqual(SCHEMA_VERSION,7)
++            db.channel_upsert({'peer_id':123,'title':'Alpha','peer_type':'channel','link':'https://t.me/alpha'}); db.channel_upsert({'peer_id':123,'title':'Alpha 2','peer_type':'channel','status':'ok'})
++            rows=db.channels_all(); self.assertEqual(len(rows),1); self.assertEqual(rows[0]['peer_id'],123); self.assertEqual(rows[0]['title'],'Alpha 2')
++            db.channel_account_put(123,'acc_a',{'relation':'admin','rights':{'add_admins':True}}); rels=db.channel_accounts(123); self.assertEqual(rels[0]['session'],'acc_a'); self.assertEqual(rels[0]['relation'],'admin')
++            db.account_restriction_set('acc_a',{'status':'restricted','reason':'peer_flood','source_operation':'join'}); self.assertEqual(db.account_restriction_get('acc_a')['status'],'restricted')
++            db.account_restriction_clear('acc_a'); self.assertEqual(db.account_restriction_get('acc_a'),{})

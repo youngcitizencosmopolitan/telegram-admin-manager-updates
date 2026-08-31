@@ -1,0 +1,151 @@
+diff --git a/TelegramAdminManager-4.3.7/tam_core/state_db.py b/TelegramAdminManager-4.3.8/tam_core/state_db.py
+index 4134ad5..a0f4ce5 100644
+--- a/TelegramAdminManager-4.3.7/tam_core/state_db.py
++++ b/TelegramAdminManager-4.3.8/tam_core/state_db.py
+@@ -10,7 +10,7 @@ import time
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 6
++SCHEMA_VERSION = 7
+ 
+ 
+ class StateDatabase:
+@@ -175,6 +175,28 @@ class StateDatabase:
+                 CREATE INDEX IF NOT EXISTS idx_created_groups_created_at
+                     ON created_groups(created_at);
+ 
++                CREATE TABLE IF NOT EXISTS channels (
++                    peer_id INTEGER PRIMARY KEY,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL
++                );
++
++                CREATE TABLE IF NOT EXISTS channel_accounts (
++                    peer_id INTEGER NOT NULL,
++                    session TEXT NOT NULL,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL,
++                    PRIMARY KEY(peer_id, session)
++                );
++                CREATE INDEX IF NOT EXISTS idx_channel_accounts_session
++                    ON channel_accounts(session, peer_id);
++
++                CREATE TABLE IF NOT EXISTS account_restrictions (
++                    session TEXT PRIMARY KEY,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL
++                );
++
+                 CREATE TABLE IF NOT EXISTS events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     created_at REAL NOT NULL,
+@@ -212,6 +234,108 @@ class StateDatabase:
+                 (key, json.dumps(value, ensure_ascii=False)),
+             )
+ 
++    # ---------- channels / account restrictions ----------
++    def channel_upsert(self, payload: dict[str, Any]) -> None:
++        peer_id = int(payload.get("peer_id"))
++        current = {}
++        with self.session() as conn:
++            row = conn.execute("SELECT payload_json FROM channels WHERE peer_id=?", (peer_id,)).fetchone()
++            if row:
++                try:
++                    obj = json.loads(row[0])
++                    if isinstance(obj, dict):
++                        current = dict(obj)
++                except Exception:
++                    pass
++            merged = dict(current)
++            for key, value in dict(payload).items():
++                if value not in (None, "") or key not in merged:
++                    merged[key] = value
++            merged["peer_id"] = peer_id
++            conn.execute(
++                "INSERT INTO channels(peer_id, payload_json, updated_at) VALUES(?, ?, ?) "
++                "ON CONFLICT(peer_id) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at",
++                (peer_id, json.dumps(merged, ensure_ascii=False), time.time()),
++            )
++
++    def channels_all(self) -> list[dict[str, Any]]:
++        out: list[dict[str, Any]] = []
++        with self.session() as conn:
++            rows = conn.execute("SELECT payload_json FROM channels ORDER BY peer_id").fetchall()
++        for row in rows:
++            try:
++                obj = json.loads(row[0])
++                if isinstance(obj, dict):
++                    out.append(dict(obj))
++            except Exception:
++                pass
++        return out
++
++    def channel_get(self, peer_id: int) -> dict[str, Any]:
++        with self.session() as conn:
++            row = conn.execute("SELECT payload_json FROM channels WHERE peer_id=?", (int(peer_id),)).fetchone()
++        if not row:
++            return {}
++        try:
++            obj = json.loads(row[0])
++            return dict(obj) if isinstance(obj, dict) else {}
++        except Exception:
++            return {}
++
++    def channel_account_put(self, peer_id: int, session: str, payload: dict[str, Any]) -> None:
++        data = dict(payload)
++        data["peer_id"] = int(peer_id)
++        data["session"] = str(session)
++        with self.session() as conn:
++            conn.execute(
++                "INSERT INTO channel_accounts(peer_id, session, payload_json, updated_at) VALUES(?, ?, ?, ?) "
++                "ON CONFLICT(peer_id, session) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at",
++                (int(peer_id), str(session), json.dumps(data, ensure_ascii=False), time.time()),
++            )
++
++    def channel_accounts(self, peer_id: int) -> list[dict[str, Any]]:
++        out: list[dict[str, Any]] = []
++        with self.session() as conn:
++            rows = conn.execute(
++                "SELECT payload_json FROM channel_accounts WHERE peer_id=? ORDER BY session", (int(peer_id),)
++            ).fetchall()
++        for row in rows:
++            try:
++                obj = json.loads(row[0])
++                if isinstance(obj, dict):
++                    out.append(dict(obj))
++            except Exception:
++                pass
++        return out
++
++    def account_restriction_get(self, session: str) -> dict[str, Any]:
++        with self.session() as conn:
++            row = conn.execute("SELECT payload_json FROM account_restrictions WHERE session=?", (str(session),)).fetchone()
++        if not row:
++            return {}
++        try:
++            obj = json.loads(row[0])
++            return dict(obj) if isinstance(obj, dict) else {}
++        except Exception:
++            return {}
++
++    def account_restriction_set(self, session: str, payload: dict[str, Any]) -> None:
++        data = dict(payload)
++        data["session"] = str(session)
++        now = time.time()
++        data.setdefault("detected_at", now)
++        data["last_seen_at"] = now
++        with self.session() as conn:
++            conn.execute(
++                "INSERT INTO account_restrictions(session, payload_json, updated_at) VALUES(?, ?, ?) "
++                "ON CONFLICT(session) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at",
++                (str(session), json.dumps(data, ensure_ascii=False), now),
++            )
++
++    def account_restriction_clear(self, session: str) -> None:
++        with self.session() as conn:
++            conn.execute("DELETE FROM account_restrictions WHERE session=?", (str(session),))
++
+     # ---------- config / accounts / tasks ----------
+     def save_config(self, data: dict[str, Any]) -> None:
+         now = time.time()

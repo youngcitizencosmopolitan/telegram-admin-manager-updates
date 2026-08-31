@@ -1,0 +1,88 @@
+diff --git a/TelegramAdminManager-4.3.7/telegram_admin_manager.py b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+index e19f7d0..e456ee3 100644
+--- a/TelegramAdminManager-4.3.7/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+@@ -12,6 +12,7 @@ import sys
+ import threading
+ import time
+ import traceback
++import webbrowser
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+ 
+@@ -24,6 +25,8 @@ from tam_core import Account, ConfigStore, DEFAULT_CONFIG, GroupRegistry, GroupS
+ from tam_core.group_factory import build_group_plan, create_channel_flags
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind
+ from tam_core.updater import check_for_update, download_update, launch_update_script, write_update_script
++from tam_core.account_restrictions import classify_telegram_restriction
++from tam_core.channel_inventory import observation_from_entity, relation_from_entity
+ from tam_core.telegram_limits import (
+     UPLOAD_FLOOD_SLEEP_THRESHOLD,
+     is_premium_upload_wait,
+@@ -59,7 +62,7 @@ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.7"
++APP_VERSION = "4.3.8"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -74,6 +77,7 @@ MAIN_TAB_SPECS = (
+     ("groups", "Создание групп"),
+     ("monitor", "Мониторинг"),
+     ("admins", "Админы"),
++    ("channels", "Каналы"),
+     ("accounts", "Аккаунты / API"),
+     ("x", "Twitter / X"),
+     ("updates", "Обновления"),
+@@ -98,6 +102,25 @@ WELCOME_ADMIN_RIGHT_ALIASES = {
+     "can_send_welcome_messages", "send_welcome_messages", "manage_welcome_messages"
+ }
+ 
++CHANNEL_COLUMN_LABELS = {
++    "title": "Название",
++    "link": "Ссылка",
++    "peer_type": "Тип",
++    "peer_id": "ID",
++    "owner": "Владелец",
++    "admins": "Наши админы",
++    "members": "Наши участники",
++    "status": "Статус",
++}
++CHANNEL_DEFAULT_VISIBLE_COLUMNS = list(CHANNEL_COLUMN_LABELS)
++
++def normalize_channel_visible_columns(raw: Any) -> list[str]:
++    if not isinstance(raw, (list, tuple)):
++        return list(CHANNEL_DEFAULT_VISIBLE_COLUMNS)
++    clean = [str(x) for x in raw if str(x) in CHANNEL_COLUMN_LABELS]
++    clean = list(dict.fromkeys(clean))
++    return clean or ["title"]
++
+ def admin_right_unavailable_message(name: str) -> str:
+     if str(name) in WELCOME_ADMIN_RIGHT_ALIASES:
+         return (
+@@ -501,6 +524,7 @@ class TelegramAdminManager(tk.Tk):
+         self.tab_group_factory = ttk.Frame(self.main_notebook, padding=10)
+         self.monitor_workspace = ttk.Frame(self.main_notebook, padding=10)
+         self.tab_group = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_channels = ttk.Frame(self.main_notebook, padding=10)
+         self.tab_account_api = ttk.Frame(self.main_notebook, padding=10)
+         self.tab_x_main = ttk.Frame(self.main_notebook, padding=14)
+         self.tab_updates_main = ttk.Frame(self.main_notebook, padding=14)
+@@ -508,6 +532,7 @@ class TelegramAdminManager(tk.Tk):
+             "groups": self.tab_group_factory,
+             "monitor": self.monitor_workspace,
+             "admins": self.tab_group,
++            "channels": self.tab_channels,
+             "accounts": self.tab_account_api,
+             "x": self.tab_x_main,
+             "updates": self.tab_updates_main,
+@@ -541,6 +566,7 @@ class TelegramAdminManager(tk.Tk):
+ 
+         self._build_group_factory_tab()
+         self._build_group_tab()
++        self._build_channels_tab()
+         self.batch_uploader = BatchUploaderPane(
+             self, self.tab_batch_uploader, monitor_parent=self.monitor_workspace, unified_monitor=True
+         )

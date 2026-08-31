@@ -1,0 +1,341 @@
+diff --git a/TelegramAdminManager-4.3.7/telegram_admin_manager.py b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+index e19f7d0..e456ee3 100644
+--- a/TelegramAdminManager-4.3.7/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+@@ -1553,6 +1579,336 @@ class TelegramAdminManager(tk.Tk):
+         self._build_safety_tab()
+         self._build_settings_tab()
+ 
++    # ---------- channels inventory ----------
++    def _build_channels_tab(self) -> None:
++        t = self.tab_channels
++        t.columnconfigure(0, weight=1)
++        t.rowconfigure(1, weight=1)
++
++        toolbar = ttk.Frame(t)
++        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
++        ttk.Button(toolbar, text="Обновить каналы", command=self.refresh_channels_from_telegram).pack(side="left")
++        ttk.Button(toolbar, text="Обновить этот канал", command=self.refresh_selected_channel).pack(side="left", padx=6)
++        ttk.Label(toolbar, text="Поиск:").pack(side="left", padx=(12, 4))
++        self.channels_search_var = tk.StringVar()
++        search = ttk.Entry(toolbar, textvariable=self.channels_search_var, width=28)
++        search.pack(side="left")
++        self.channels_search_var.trace_add("write", lambda *_: self.refresh_channels_from_cache())
++        self.channels_owner_only_var = tk.BooleanVar(value=False)
++        self.channels_admin_only_var = tk.BooleanVar(value=False)
++        self.channels_problem_only_var = tk.BooleanVar(value=False)
++        for text, var in (
++            ("Только где мы владелец", self.channels_owner_only_var),
++            ("Только где есть наши админы", self.channels_admin_only_var),
++            ("Только проблемные", self.channels_problem_only_var),
++        ):
++            ttk.Checkbutton(toolbar, text=text, variable=var, command=self.refresh_channels_from_cache).pack(side="left", padx=(8, 0))
++
++        self.channels_view_button = ttk.Menubutton(toolbar, text="Вид")
++        self.channels_view_button.pack(side="right")
++        view_menu = tk.Menu(self.channels_view_button, tearoff=False)
++        self.channels_view_button["menu"] = view_menu
++        visible = normalize_channel_visible_columns(self.store.data.get("channels_visible_columns"))
++        self.channels_column_vars: dict[str, tk.BooleanVar] = {}
++        for key, label in CHANNEL_COLUMN_LABELS.items():
++            var = tk.BooleanVar(value=key in visible)
++            self.channels_column_vars[key] = var
++            view_menu.add_checkbutton(label=label, variable=var, command=self._channels_apply_view)
++
++        body = ttk.PanedWindow(t, orient="vertical")
++        body.grid(row=1, column=0, sticky="nsew")
++        table_frame = ttk.Frame(body)
++        detail_frame = ttk.LabelFrame(body, text="Аккаунты и права выбранного канала")
++        body.add(table_frame, weight=3)
++        body.add(detail_frame, weight=2)
++        table_frame.columnconfigure(0, weight=1); table_frame.rowconfigure(0, weight=1)
++        detail_frame.columnconfigure(0, weight=1); detail_frame.rowconfigure(0, weight=1)
++
++        cols = tuple(CHANNEL_COLUMN_LABELS)
++        self.channels_tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
++        for key, label in CHANNEL_COLUMN_LABELS.items():
++            self.channels_tree.heading(key, text=label)
++            width = 220 if key in {"title", "link", "owner", "admins", "members"} else 105
++            self.channels_tree.column(key, width=width, minwidth=70, stretch=key in {"title", "link", "owner", "admins", "members"})
++        self.channels_tree.grid(row=0, column=0, sticky="nsew")
++        y = ttk.Scrollbar(table_frame, orient="vertical", command=self.channels_tree.yview)
++        y.grid(row=0, column=1, sticky="ns")
++        x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.channels_tree.xview)
++        x.grid(row=1, column=0, sticky="ew")
++        self.channels_tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
++        self.channels_tree.bind("<<TreeviewSelect>>", lambda _e: self._channels_show_selected_details())
++        self.channels_tree.bind("<Double-1>", lambda _e: self._channels_open_selected())
++
++        self.channels_context = tk.Menu(self.channels_tree, tearoff=False)
++        self.channels_context.add_command(label="Копировать название", command=lambda: self._channels_copy("title"))
++        self.channels_context.add_command(label="Копировать ссылку", command=lambda: self._channels_copy("link"))
++        self.channels_context.add_command(label="Копировать ID", command=lambda: self._channels_copy("peer_id"))
++        self.channels_context.add_separator()
++        self.channels_context.add_command(label="Открыть", command=self._channels_open_selected)
++        self.channels_context.add_command(label="Обновить этот канал", command=self.refresh_selected_channel)
++        self.channels_tree.bind("<Button-3>", self._channels_popup)
++
++        dcols = ("account", "role", "can_add", "rights", "status")
++        self.channel_accounts_tree = ttk.Treeview(detail_frame, columns=dcols, show="headings", selectmode="browse", height=7)
++        for key, label, width in (
++            ("account", "Аккаунт", 220), ("role", "Роль", 120), ("can_add", "Добавляет админов", 135),
++            ("rights", "Права", 430), ("status", "Статус / ошибка", 260),
++        ):
++            self.channel_accounts_tree.heading(key, text=label)
++            self.channel_accounts_tree.column(key, width=width, stretch=key in {"rights", "status"})
++        self.channel_accounts_tree.grid(row=0, column=0, sticky="nsew")
++        ds = ttk.Scrollbar(detail_frame, orient="vertical", command=self.channel_accounts_tree.yview)
++        ds.grid(row=0, column=1, sticky="ns")
++        self.channel_accounts_tree.configure(yscrollcommand=ds.set)
++
++        self._channels_apply_view(save=False)
++        self.refresh_channels_from_cache()
++
++    def _channels_apply_view(self, save: bool = True) -> None:
++        if not hasattr(self, "channels_tree"):
++            return
++        visible = [key for key in CHANNEL_COLUMN_LABELS if self.channels_column_vars.get(key) and self.channels_column_vars[key].get()]
++        visible = normalize_channel_visible_columns(visible)
++        if visible == ["title"]:
++            for key, var in self.channels_column_vars.items():
++                if key == "title":
++                    var.set(True)
++        self.channels_tree.configure(displaycolumns=visible)
++        if save:
++            self.store.data["channels_visible_columns"] = visible
++            self.store.save()
++
++    def _channels_popup(self, event: Any) -> None:
++        try:
++            iid = self.channels_tree.identify_row(event.y)
++            if iid:
++                self.channels_tree.selection_set(iid)
++            self.channels_context.tk_popup(event.x_root, event.y_root)
++        finally:
++            try:
++                self.channels_context.grab_release()
++            except Exception:
++                pass
++
++    def _channels_selected_peer_id(self) -> int | None:
++        if not hasattr(self, "channels_tree"):
++            return None
++        sel = self.channels_tree.selection()
++        if not sel:
++            return None
++        try:
++            return int(sel[0])
++        except Exception:
++            return None
++
++    def _channels_copy(self, field: str) -> None:
++        peer_id = self._channels_selected_peer_id()
++        if peer_id is None:
++            return
++        row = self.state_db.channel_get(peer_id)
++        value = row.get(field, "")
++        if value in (None, ""):
++            self.log(f"Каналы: поле «{CHANNEL_COLUMN_LABELS.get(field, field)}» пустое — копировать нечего.")
++            return
++        self.clipboard_clear(); self.clipboard_append(str(value)); self.update_idletasks()
++
++    def _channels_open_selected(self) -> None:
++        peer_id = self._channels_selected_peer_id()
++        if peer_id is None:
++            return
++        link = str(self.state_db.channel_get(peer_id).get("link", "") or "")
++        if link:
++            webbrowser.open(link)
++        else:
++            self._channels_show_selected_details()
++
++    @staticmethod
++    def _channel_relation_label(relation: str) -> str:
++        return {
++            "owner": "Владелец", "admin": "Админ", "member": "Участник",
++            "absent": "Нет в канале", "unknown": "Не удалось проверить",
++        }.get(str(relation), str(relation or "Не удалось проверить"))
++
++    def _channel_aggregate(self, peer_id: int) -> dict[str, str | bool]:
++        accounts = {a.session: a for a in self.store.accounts()}
++        rels = self.state_db.channel_accounts(peer_id)
++        owners: list[str] = []; admins: list[str] = []; members: list[str] = []
++        problem = False
++        for rel in rels:
++            account = accounts.get(str(rel.get("session", "")))
++            label = account.display if account else str(rel.get("session", ""))
++            relation = str(rel.get("relation", "unknown"))
++            if relation == "owner": owners.append(label)
++            elif relation == "admin": admins.append(label)
++            elif relation == "member": members.append(label)
++            elif relation == "unknown": problem = True
++            if rel.get("last_error"):
++                problem = True
++            if self.account_is_restricted(str(rel.get("session", ""))):
++                problem = True
++        return {
++            "owner": ", ".join(owners), "admins": ", ".join(admins), "members": ", ".join(members),
++            "problem": problem,
++        }
++
++    def refresh_channels_from_cache(self) -> None:
++        if not hasattr(self, "channels_tree"):
++            return
++        selected = self._channels_selected_peer_id()
++        query = str(getattr(self, "channels_search_var", tk.StringVar()).get() or "").strip().casefold()
++        owner_only = bool(getattr(self, "channels_owner_only_var", tk.BooleanVar()).get())
++        admin_only = bool(getattr(self, "channels_admin_only_var", tk.BooleanVar()).get())
++        problem_only = bool(getattr(self, "channels_problem_only_var", tk.BooleanVar()).get())
++        for iid in self.channels_tree.get_children(""):
++            self.channels_tree.delete(iid)
++        for row in self.state_db.channels_all():
++            peer_id = int(row.get("peer_id", 0) or 0)
++            if not peer_id:
++                continue
++            agg = self._channel_aggregate(peer_id)
++            status = str(row.get("status", "ok") or "ok")
++            problem = bool(agg["problem"] or status not in {"ok", ""} or row.get("error"))
++            hay = " ".join(str(row.get(k, "")) for k in ("title", "link", "peer_id")).casefold()
++            if query and query not in hay: continue
++            if owner_only and not agg["owner"]: continue
++            if admin_only and not agg["admins"] and not agg["owner"]: continue
++            if problem_only and not problem: continue
++            values = (
++                row.get("title", ""), row.get("link", ""), row.get("peer_type", ""), peer_id,
++                agg["owner"], agg["admins"], agg["members"], "⚠ Проблема" if problem else "OK",
++            )
++            self.channels_tree.insert("", tk.END, iid=str(peer_id), values=values)
++        if selected is not None and self.channels_tree.exists(str(selected)):
++            self.channels_tree.selection_set(str(selected))
++        self._channels_show_selected_details()
++
++    def _channels_show_selected_details(self) -> None:
++        if not hasattr(self, "channel_accounts_tree"):
++            return
++        for iid in self.channel_accounts_tree.get_children(""):
++            self.channel_accounts_tree.delete(iid)
++        peer_id = self._channels_selected_peer_id()
++        if peer_id is None:
++            return
++        rel_by_session = {str(r.get("session", "")): r for r in self.state_db.channel_accounts(peer_id)}
++        for account in self.store.accounts():
++            rel = rel_by_session.get(account.session, {"relation": "unknown", "rights": {}, "last_error": ""})
++            rights = rel.get("rights") if isinstance(rel.get("rights"), dict) else {}
++            rights_text = ", ".join(k for k, v in rights.items() if v) or "—"
++            restriction = self.account_restriction(account.session)
++            status = str(rel.get("last_error", "") or "")
++            if restriction:
++                status = "⚠ Ограничен Telegram" + (f": {restriction.get('friendly_error')}" if restriction.get('friendly_error') else "")
++            self.channel_accounts_tree.insert("", tk.END, iid=account.session, values=(
++                account.display, self._channel_relation_label(str(rel.get("relation", "unknown"))),
++                "Да" if bool(rel.get("can_add_admins", False)) else "Нет", rights_text, status or "OK",
++            ))
++
++    def refresh_channels_from_telegram(self) -> None:
++        if TelegramClient is None:
++            self._show_missing_dependency(); return
++        self.run_worker(lambda: asyncio.run(self._refresh_channels_inventory_async()), "Обновляю каналы…")
++
++    async def _refresh_channels_inventory_async(self) -> None:
++        api_id, api_hash = self._api_credentials()
++        accounts = self.store.accounts()
++        if not accounts:
++            raise RuntimeError("Нет сохранённых Telegram-аккаунтов.")
++        successful_seen: dict[str, set[int]] = {}
++        failed_sessions: set[str] = set()
++        union: set[int] = set()
++        now = time.time()
++        for index, account in enumerate(accounts, start=1):
++            cooldown = admin_flood_remaining(self.state_db, account.session)
++            if cooldown > 0:
++                failed_sessions.add(account.session)
++                self.log(f"Каналы [{index}/{len(accounts)}] {account.display}: FloodWait ещё {cooldown}с — read-скан пропущен.")
++                continue
++            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            seen: set[int] = set()
++            try:
++                await client.connect()
++                if not await client.is_user_authorized():
++                    failed_sessions.add(account.session)
++                    self.log(f"Каналы [{index}/{len(accounts)}] {account.display}: сессия не авторизована.")
++                    continue
++                dialogs = await client.get_dialogs(limit=None)
++                for dialog in dialogs:
++                    entity = getattr(dialog, "entity", None)
++                    if entity is None or entity.__class__.__name__ not in {"Channel", "Chat"}:
++                        continue
++                    try:
++                        obs = observation_from_entity(entity, now=now)
++                    except Exception:
++                        continue
++                    peer_id = int(obs["peer_id"]); seen.add(peer_id); union.add(peer_id)
++                    self.state_db.channel_upsert(obs)
++                    rel = relation_from_entity(entity)
++                    rel.update({"last_refreshed_at": now, "last_error": ""})
++                    self.state_db.channel_account_put(peer_id, account.session, rel)
++                successful_seen[account.session] = seen
++                self.log(f"Каналы [{index}/{len(accounts)}] {account.display}: найдено {len(seen)} групп/каналов.")
++            except Exception as exc:
++                failed_sessions.add(account.session)
++                if errors is not None and isinstance(exc, getattr(errors, "FloodWaitError", ())):
++                    remember_admin_flood_wait(self.state_db, account.session, max(1, int(getattr(exc, "seconds", 1))))
++                reason = classify_telegram_restriction(exc)
++                if reason:
++                    self.remember_account_restriction(account, exc, "inventory_read")
++                self.log(f"Каналы [{index}/{len(accounts)}] {account.display}: ⚠ {self._friendly_error(exc)}")
++            finally:
++                await client.disconnect()
++        # Only a successfully completed dialog scan can prove absence from this inventory snapshot.
++        for account in accounts:
++            if account.session in failed_sessions:
++                continue
++            seen = successful_seen.get(account.session, set())
++            for peer_id in union:
++                if peer_id not in seen:
++                    self.state_db.channel_account_put(peer_id, account.session, {
++                        "relation": "absent", "rights": {}, "can_add_admins": False,
++                        "last_refreshed_at": now, "last_error": "",
++                    })
++        self.ui_call(self.refresh_channels_from_cache)
++        self.ui_call(lambda: messagebox.showinfo(APP_NAME, f"Инвентаризация завершена. В кэше: {len(self.state_db.channels_all())} каналов/групп."))
++
++    def refresh_selected_channel(self) -> None:
++        peer_id = self._channels_selected_peer_id()
++        if peer_id is None:
++            return
++        self.run_worker(lambda: asyncio.run(self._refresh_channel_async(peer_id)), "Обновляю канал…")
++
++    async def _refresh_channel_async(self, peer_id: int) -> None:
++        api_id, api_hash = self._api_credentials()
++        row = self.state_db.channel_get(peer_id)
++        peer_type = str(row.get("peer_type", "channel"))
++        now = time.time()
++        for account in self.store.accounts():
++            cooldown = admin_flood_remaining(self.state_db, account.session)
++            if cooldown > 0:
++                continue
++            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            try:
++                await client.connect()
++                if not await client.is_user_authorized():
++                    self.state_db.channel_account_put(peer_id, account.session, {"relation": "unknown", "last_error": "сессия не авторизована", "last_refreshed_at": now})
++                    continue
++                peer = tl_types.PeerChannel(int(peer_id)) if peer_type == "channel" else tl_types.PeerChat(int(peer_id))
++                entity = await client.get_entity(peer)
++                self.state_db.channel_upsert(observation_from_entity(entity, now=now))
++                rel = relation_from_entity(entity); rel.update({"last_refreshed_at": now, "last_error": ""})
++                self.state_db.channel_account_put(peer_id, account.session, rel)
++            except Exception as exc:
++                name = exc.__class__.__name__
++                relation = "absent" if name in {"ChannelPrivateError", "UserNotParticipantError"} else "unknown"
++                self.state_db.channel_account_put(peer_id, account.session, {
++                    "relation": relation, "rights": {}, "can_add_admins": False,
++                    "last_refreshed_at": now, "last_error": self._friendly_error(exc),
++                })
++            finally:
++                await client.disconnect()
++        self.ui_call(self.refresh_channels_from_cache)
++
+     def _build_accounts_tab(self) -> None:
+         t = self.tab_accounts
+         t.columnconfigure(0, weight=1)

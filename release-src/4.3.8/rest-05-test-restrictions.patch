@@ -1,0 +1,34 @@
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_account_restrictions.py b/TelegramAdminManager-4.3.8/tests/test_v438_account_restrictions.py
+new file mode 100644
+index 0000000..e9db105
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_account_restrictions.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from tam_core.account_restrictions import classify_telegram_restriction
++
++
++def exc(name, text='x'):
++    return type(name, (Exception,), {})(text)
++
++
++class V438RestrictionTests(unittest.TestCase):
++    def test_conservative_classifier(self):
++        self.assertEqual(classify_telegram_restriction(exc('PeerFloodError')), 'peer_flood')
++        self.assertEqual(classify_telegram_restriction(exc('UserRestrictedError')), 'user_restricted')
++        for name in ('FloodWaitError', 'UserPrivacyRestrictedError', 'FilePartMissingError', 'ChatAdminRequiredError', 'TimeoutError'):
++            self.assertIsNone(classify_telegram_restriction(exc(name)))
++
++if __name__ == '__main__':
++    unittest.main()
++
++class V438RestrictionIntegrationTests(unittest.TestCase):
++    def test_admin_write_paths_gate_persistently_restricted_accounts(self):
++        import inspect
++        import telegram_admin_manager as app
++        promote = inspect.getsource(app.TelegramAdminManager._promote_one_target_async)
++        factory = inspect.getsource(app.TelegramAdminManager._factory_join_admin)
++        self.assertIn('account_is_restricted', promote)
++        self.assertIn('remember_account_restriction', promote)
++        self.assertIn('account_is_restricted', factory)
