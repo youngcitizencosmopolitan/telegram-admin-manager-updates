@@ -1,0 +1,146 @@
+diff --git a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+index a70a147..1fe181f 100644
+--- a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+@@ -3521,7 +3566,6 @@ class TelegramAdminManager(tk.Tk):
+         if not selected:
+             messagebox.showerror(APP_NAME, "В окне «Админы» выбери аккаунты, которые нужно сделать администраторами.")
+             return
+-        controller = self.controller_account()  # None = автоматический выбор отдельно для каждой группы
+ 
+         try:
+             delay = max(0.0, float(self.delay_var.get().replace(",", ".")))
+@@ -3538,37 +3582,78 @@ class TelegramAdminManager(tk.Tk):
+         self._save_group_settings()
+         preset = self._preset_label_to_key(self.preset_var.get())
+         title = self.title_var.get().strip()
++        anonymous = bool(self.store.data.get("admin_anonymous", True))
++        policy_key = build_admin_policy_key(preset, title, anonymous, self._requested_admin_flags(preset))
++
++        work_plan, cache_summary = build_incremental_admin_plan(
++            self.group_state_cache, targets, selected, policy_key, force_recheck=force_recheck
++        )
++        cached_groups = int(cache_summary["cached_groups"])
++        work_groups = int(cache_summary["work_groups"])
++        cached_assignments = int(cache_summary["cached_assignments"])
++        work_assignments = int(cache_summary["work_assignments"])
++        self.admin_stats_var.set(f"{cached_groups} из кэша · {work_groups} к обработке")
++        self.log(
++            f"План админов: {cached_groups} групп полностью из кэша; {work_groups} к обработке; "
++            f"назначений из кэша {cached_assignments}; новых/изменённых {work_assignments}."
++        )
++
++        if not work_plan:
++            self.admin_progress.configure(value=1, maximum=1)
++            self.log("✅ Все выбранные группы уже имеют сохранённое состояние с такими же правами. Telegram не вызывается.")
++            messagebox.showinfo(
++                APP_NAME,
++                f"Нечего делать.\n\n{cached_groups} групп уже готовы по локальному кэшу.\nTelegram не вызывался.",
++            )
++            return
++
++        if TelegramClient is None:
++            self._show_missing_dependency()
++            return
++        self.save_api_settings(quiet=True)
++        try:
++            self._api_credentials()
++        except Exception as exc:
++            messagebox.showerror(APP_NAME, str(exc))
++            return
++
++        controller = self.controller_account()  # None = автоматический выбор отдельно для каждой группы
+         join_before = bool(self.join_var.get())
+         self._admin_stop_event.clear()
+         self._admin_safety_disabled_sessions.clear()
+-        self.admin_progress.configure(value=0, maximum=max(1, len(targets)))
+-        self.admin_stats_var.set(f"0 / {len(targets)} групп")
++        self.admin_progress.configure(value=0, maximum=max(1, len(work_plan)))
+         self.admin_stop_button.configure(state="normal")
+ 
+         def work() -> None:
+             asyncio.run(
+                 self._promote_many_async(
+-                    targets=targets,
+-                    selected=selected,
++                    work_plan=work_plan,
+                     controller=controller,
+                     delay=delay,
+                     preset=preset,
+                     title=title,
+                     join_before=join_before,
++                    policy_key=policy_key,
++                    total_requested_groups=len(targets),
++                    cached_groups=cached_groups,
++                    force_recheck=force_recheck,
+                 )
+             )
+ 
+-        self.run_worker(work, f"Обрабатываю группы: 0/{len(targets)}…")
++        self.run_worker(work, f"Обрабатываю изменения: 0/{len(work_plan)} групп…")
+ 
+     async def _promote_many_async(
+         self,
+-        targets: list[str],
+-        selected: list[Account],
++        work_plan: list[tuple[str, list[Account]]],
+         controller: Optional[Account],
+         delay: float,
+         preset: str,
+         title: str,
+         join_before: bool,
++        policy_key: str,
++        total_requested_groups: int,
++        cached_groups: int,
++        force_recheck: bool,
+     ) -> None:
+         total_promoted = 0
+         total_failed = 0
+@@ -3578,28 +3663,42 @@ class TelegramAdminManager(tk.Tk):
+ 
+         self.log("=" * 70)
+         controller_desc = controller.display if controller else "АВТО (владелец → админ с add_admins)"
+-        self.log(f"Пакет админов: групп {len(targets)}, аккаунтов {len(selected)}, главный: {controller_desc}")
++        self.log(
++            f"Пакет админов: всего групп {total_requested_groups}; из кэша {cached_groups}; "
++            f"реально обработать {len(work_plan)}; главный: {controller_desc}"
++        )
+         if bool(self.store.data.get("admin_anonymous", True)):
+             self.log("Анонимность админов: ВКЛ — для супергрупп будет запрошено право anonymous.")
+         else:
+             self.log("Анонимность админов: выкл.")
+ 
+         try:
+-            for group_index, target in enumerate(targets, start=1):
++            for group_index, (target, target_selected) in enumerate(work_plan, start=1):
+                 if self._admin_stop_event.is_set():
+                     break
+                 self.log("")
+-                self.log(f"===== ГРУППА {group_index}/{len(targets)}: {target} =====")
+-                self.ui_call(lambda i=group_index, n=len(targets): self.busy_label.configure(text=f"Группа {i}/{n}…"))
++                self.log(
++                    f"===== ГРУППА {group_index}/{len(work_plan)}: {target} · "
++                    f"нужно аккаунтов {len(target_selected)} ====="
++                )
++                self.ui_call(
++                    lambda i=group_index, n=len(work_plan): self.busy_label.configure(text=f"Группа {i}/{n}…")
++                )
++                if force_recheck:
++                    # Invalidate only when this group is actually about to be touched.
++                    # If the batch is stopped earlier, untouched groups keep their cache.
++                    for account in target_selected:
++                        self.group_state_cache.invalidate_admin_policy(target, account.session)
+                 try:
+                     promoted, failed = await self._promote_one_target_async(
+                         target=target,
+-                        selected=selected,
++                        selected=target_selected,
+                         controller=controller,
+                         delay=delay,
+                         preset=preset,
+                         title=title,
+                         join_before=join_before,
++                        policy_key=policy_key,
+                     )
+                     total_promoted += promoted
+                     total_failed += failed
