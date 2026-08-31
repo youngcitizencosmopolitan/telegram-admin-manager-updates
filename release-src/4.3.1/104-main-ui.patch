@@ -1,0 +1,133 @@
+diff --git a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+index e97ec2a..a70a147 100644
+--- a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+@@ -1973,6 +2120,7 @@ class TelegramAdminManager(tk.Tk):
+     def _build_group_tab(self) -> None:
+         t = self.tab_group
+         t.columnconfigure(1, weight=1)
++        t.columnconfigure(2, weight=0)
+         t.rowconfigure(12, weight=1)
+ 
+         ttk.Label(t, text="Главный аккаунт:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+@@ -2071,7 +2219,7 @@ class TelegramAdminManager(tk.Tk):
+             actions, text="Остановить после текущей группы", command=self.stop_admin_batch, state="disabled"
+         )
+         self.admin_stop_button.pack(side="left", padx=6)
+-        ttk.Button(actions, text="Выбрать все аккаунты", command=self.select_all_accounts).pack(side="left", padx=8)
++        ttk.Button(actions, text="Выбрать все аккаунты", command=self._select_all_admin_accounts).pack(side="left", padx=8)
+ 
+         progress_row = ttk.Frame(t)
+         progress_row.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+@@ -2085,10 +2233,57 @@ class TelegramAdminManager(tk.Tk):
+ 
+         ttk.Label(
+             t,
+-            text="Журнал операций теперь находится в постоянной панели справа и виден на любой вкладке.",
++            text="Подробности и ошибки доступны через кнопку «Журнал» в главном окне.",
+             foreground="#666666",
+         ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
+ 
++        accounts_box = ttk.LabelFrame(t, text="Мои аккаунты → сделать админами", padding=8)
++        accounts_box.grid(row=0, column=2, rowspan=13, sticky="ns", padx=(14, 0), pady=4)
++        accounts_box.rowconfigure(0, weight=1)
++        self.admin_accounts_list = tk.Listbox(
++            accounts_box, selectmode=tk.EXTENDED, exportselection=False, width=31, height=24, font=("Segoe UI", 9)
++        )
++        self.admin_accounts_list.grid(row=0, column=0, sticky="ns")
++        admin_accounts_sb = ttk.Scrollbar(accounts_box, orient="vertical", command=self.admin_accounts_list.yview)
++        admin_accounts_sb.grid(row=0, column=1, sticky="ns")
++        self.admin_accounts_list.configure(yscrollcommand=admin_accounts_sb.set)
++        self.admin_accounts_list.bind("<<ListboxSelect>>", lambda _e: self._save_admin_selection())
++        buttons = ttk.Frame(accounts_box)
++        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
++        ttk.Button(buttons, text="Все", command=self._select_all_admin_accounts).pack(side="left")
++        ttk.Button(buttons, text="Снять", command=lambda: self.admin_accounts_list.selection_clear(0, tk.END)).pack(side="left", padx=5)
++        ttk.Button(buttons, text="Обновить", command=self._refresh_admin_account_list).pack(side="left")
++        self._refresh_admin_account_list()
++
++    def _refresh_admin_account_list(self) -> None:
++        if not hasattr(self, "admin_accounts_list"):
++            return
++        accounts = self.store.accounts()
++        saved = set(self.store.data.get("admin_selected_sessions", []) or [])
++        self.admin_accounts_list.delete(0, tk.END)
++        for idx, account in enumerate(accounts):
++            self.admin_accounts_list.insert(tk.END, account.display)
++            if not saved or account.session in saved:
++                self.admin_accounts_list.select_set(idx)
++
++    def _select_all_admin_accounts(self) -> None:
++        if hasattr(self, "admin_accounts_list") and self.admin_accounts_list.size():
++            self.admin_accounts_list.select_set(0, tk.END)
++        self._save_admin_selection()
++
++    def _save_admin_selection(self) -> None:
++        if not hasattr(self, "admin_accounts_list"):
++            return
++        self.store.data["admin_selected_sessions"] = [a.session for a in self._selected_admin_accounts()]
++        self.store.save()
++
++    def _selected_admin_accounts(self) -> list[Account]:
++        accounts = self.store.accounts()
++        if not hasattr(self, "admin_accounts_list"):
++            return []
++        indices = list(self.admin_accounts_list.curselection())
++        return [accounts[i] for i in indices if 0 <= i < len(accounts)]
++
+     def _paste_admin_targets(self) -> None:
+         try:
+             text = self.clipboard_get()
+@@ -2576,17 +2771,17 @@ class TelegramAdminManager(tk.Tk):
+             self.factory_title_var.set(str(d.get("group_factory_title_template", "Group {n}")))
+             self.factory_count_var.set(str(d.get("group_factory_count", 1)))
+             self.factory_start_var.set(str(d.get("group_factory_start_index", 1)))
+-            self.factory_about_var.set(str(d.get("group_factory_about", "")))
+-            self.factory_entity_type_var.set("Канал" if str(d.get("group_factory_entity_type", "group")) == "channel" else "Группа")
+-            self.factory_forum_var.set(bool(d.get("group_factory_forum", True)))
+-            self.factory_seed_enabled_var.set(bool(d.get("group_factory_seed_enabled", False)))
++            self.factory_about_var.set("")
++            self.factory_entity_type_var.set("Группа")
++            self.factory_forum_var.set(False)
++            self.factory_seed_enabled_var.set(False)
+             self.factory_seed_path_var.set(str(d.get("group_factory_seed_path", "")))
+             self.factory_seed_as_file_var.set(bool(d.get("group_factory_seed_as_file", False)))
+             self.factory_seed_caption_var.set(str(d.get("group_factory_seed_caption", "")))
+             if hasattr(self, "factory_per_creator_var"):
+                 self.factory_per_creator_var.set(bool(d.get("group_factory_per_creator", False)))
+             if hasattr(self, "factory_empty_var"):
+-                self.factory_empty_var.set(bool(d.get("group_factory_empty", False)))
++                self.factory_empty_var.set(False)
+             self.factory_all_admins_var.set(bool(d.get("group_factory_all_admins", True)))
+             self.factory_preset_var.set(self._preset_key_to_label(str(d.get("group_factory_admin_preset", "full_no_add_admins"))))
+             self.factory_delay_var.set(str(d.get("group_factory_delay_seconds", 10.0)))
+@@ -2643,6 +2838,8 @@ class TelegramAdminManager(tk.Tk):
+         self.store.data["admin_anonymous"] = bool(self.admin_anonymous_var.get())
+         if hasattr(self, "admin_targets_text"):
+             self.store.data["admin_targets"] = self.admin_targets_text.get("1.0", "end").strip()
++        if hasattr(self, "admin_accounts_list"):
++            self.store.data["admin_selected_sessions"] = [a.session for a in self._selected_admin_accounts()]
+         self.store.data["auto_controller"] = self.controller_var.get() == AUTO_CONTROLLER_LABEL
+         controller = self._controller_session_from_display(self.controller_var.get())
+         if controller:
+@@ -2726,6 +2923,8 @@ class TelegramAdminManager(tk.Tk):
+ 
+         if hasattr(self, "factory_creators_list"):
+             self._factory_refresh_account_boxes()
++        if hasattr(self, "admin_accounts_list"):
++            self._refresh_admin_account_list()
+         if hasattr(self, "batch_uploader"):
+             self.batch_uploader.refresh_tasks()
+ 
+@@ -3318,9 +3517,9 @@ class TelegramAdminManager(tk.Tk):
+         if not targets:
+             messagebox.showerror(APP_NAME, "Вставь хотя бы одну ссылку, @username или ID группы.")
+             return
+-        selected = self.selected_accounts()
++        selected = self._selected_admin_accounts()
+         if not selected:
+-            messagebox.showerror(APP_NAME, "Во вкладке «Аккаунты» выбери аккаунты, которые нужно сделать админами.")
++            messagebox.showerror(APP_NAME, "В окне «Админы» выбери аккаунты, которые нужно сделать администраторами.")
+             return
+         controller = self.controller_account()  # None = автоматический выбор отдельно для каждой группы
+ 
