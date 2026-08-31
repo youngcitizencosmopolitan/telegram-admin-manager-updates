@@ -1,0 +1,73 @@
+--- a/TelegramAdminManager-4.3.5/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.6/telegram_admin_manager.py
+@@ -59,7 +59,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.5"
++APP_VERSION = "4.3.6"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -97,6 +97,14 @@
+ WELCOME_ADMIN_RIGHT_ALIASES = {
+     "can_send_welcome_messages", "send_welcome_messages", "manage_welcome_messages"
+ }
++
++def admin_right_unavailable_message(name: str) -> str:
++    if str(name) in WELCOME_ADMIN_RIGHT_ALIASES:
++        return (
++            "управление приветствиями пока недоступно в установленной версии Telethon; "
++            "остальные максимальные права назначаются"
++        )
++    return f"{name} пока недоступно в установленной версии Telethon"
+ 
+ ADMIN_FLOOD_META_PREFIX = "admin_flood_until:"
+ 
+@@ -2426,8 +2434,9 @@
+             t,
+             text=(
+                 "Всегда запрашивается максимальный набор прав Telegram. В профиль включено и новое "
+-                "«управление приветствиями»; если текущая Telethon ещё не exposes соответствующий MTProto-флаг, "
+-                "журнал это покажет, а после появления поля оно включится автоматически. Анонимность остаётся отдельной настройкой."
++                "«управление приветствиями». Если установленная версия Telethon пока не предоставляет соответствующий MTProto-флаг, "
++                "это не мешает созданию группы: остальные максимальные права будут назначены, а новое право включится автоматически после появления поддержки. "
++                "Анонимность остаётся отдельной настройкой."
+             ),
+             wraplength=870,
+         ).grid(row=6, column=1, sticky="w", pady=(0, 5))
+@@ -4339,7 +4348,7 @@
+         for name, want in requested.items():
+             if name not in supported:
+                 if want:
+-                    omitted.append(name + " (не поддерживается текущей Telethon)")
++                    omitted.append(admin_right_unavailable_message(name))
+                 continue
+             allowed = creator or bool(getattr(controller_rights, name, False))
+             value = bool(want and allowed)
+--- a/TelegramAdminManager-4.3.5/tests/test_v433_flood_log_rights.py
++++ b/TelegramAdminManager-4.3.6/tests/test_v433_flood_log_rights.py
+@@ -45,6 +45,14 @@
+         import telegram_admin_manager as app
+         self.assertIn('can_send_welcome_messages', app.MAX_ADMIN_RIGHT_NAMES)
+ 
++    def test_unsupported_welcome_right_is_reported_as_non_blocking_capability_notice(self):
++        from telegram_admin_manager import admin_right_unavailable_message
++        self.assertEqual(
++            admin_right_unavailable_message('can_send_welcome_messages'),
++            'управление приветствиями пока недоступно в установленной версии Telethon; остальные максимальные права назначаются',
++        )
++        self.assertNotIn('не поддерживается текущей Telethon', admin_right_unavailable_message('can_send_welcome_messages'))
++
+ 
+ class PermanentRightLogTests(unittest.TestCase):
+     def test_primary_windows_attach_a_right_side_log_panel(self):
+@@ -80,7 +88,7 @@
+ class V433IntegrationTests(unittest.TestCase):
+     def test_version_and_floodwait_path_are_incremental(self):
+         import telegram_admin_manager as app
+-        self.assertEqual(app.APP_VERSION, '4.3.5')
++        self.assertEqual(app.APP_VERSION, '4.3.6')
+         source = inspect.getsource(app.TelegramAdminManager._promote_one_target_async)
+         self.assertIn('admin_flood_remaining', source)
+         self.assertIn('remember_admin_flood_wait', source)
