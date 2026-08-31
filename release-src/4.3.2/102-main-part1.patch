@@ -1,0 +1,76 @@
+diff --git a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+index a70a147..1fe181f 100644
+--- a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+@@ -59,7 +59,7 @@ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.1"
++APP_VERSION = "4.3.2"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -71,6 +71,49 @@ PRIMARY_TOOL_SPECS = (
+ )
+ 
+ 
++ADMIN_POLICY_SCHEMA = 1
++
++
++def build_admin_policy_key(preset: str, title: str, anonymous: bool, requested_flags: dict[str, bool]) -> str:
++    payload = {
++        "schema": ADMIN_POLICY_SCHEMA,
++        "preset": str(preset),
++        "title": str(title or ""),
++        "anonymous": bool(anonymous),
++        "requested_flags": {str(k): bool(v) for k, v in sorted(requested_flags.items())},
++    }
++    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
++
++
++def build_incremental_admin_plan(
++    cache: GroupStateCache,
++    targets: list[str],
++    selected: list[Account],
++    policy_key: str,
++    force_recheck: bool = False,
++) -> tuple[list[tuple[str, list[Account]]], dict[str, int]]:
++    plan: list[tuple[str, list[Account]]] = []
++    cached_groups = 0
++    cached_assignments = 0
++    work_assignments = 0
++    for target in targets:
++        cached = set() if force_recheck else cache.admin_sessions_for_policy(target, policy_key)
++        pending = [account for account in selected if account.session not in cached]
++        cached_assignments += len(selected) - len(pending)
++        if pending:
++            plan.append((target, pending))
++            work_assignments += len(pending)
++        else:
++            cached_groups += 1
++    return plan, {
++        "cached_groups": cached_groups,
++        "work_groups": len(plan),
++        "cached_assignments": cached_assignments,
++        "work_assignments": work_assignments,
++    }
++
++
+ def app_base_dir() -> Path:
+     if getattr(sys, "frozen", False):
+         return Path(sys.executable).resolve().parent
+@@ -1994,6 +2037,12 @@ class TelegramAdminManager(tk.Tk):
+                     record["status"] = "ok" if not admin_errors and not seed_error else "partial"
+                     self.group_registry.put(str(peer_id or f"{creator.session}:{item.ordinal}"), record)
+                     try:
++                        factory_policy_key = build_admin_policy_key(
++                            preset,
++                            "",
++                            bool(self.store.data.get("admin_anonymous", True)),
++                            self._requested_admin_flags(preset),
++                        )
+                         self.group_state_cache.mark_admins(
+                             target,
+                             admin_success,
