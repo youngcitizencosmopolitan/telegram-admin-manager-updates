@@ -1,6 +1,6 @@
 {
-  "version": "4.3.0",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.3.0/TelegramAdminManager_v4.3.0_update.zip",
-  "sha256": "0e38ebd0b36cf98ac7f5ecd09ce1bfe97abea081b6714c4306feaa91d3c60b1f",
-  "notes": "Добавлен встроенный Twitter / X Planner: отдельные браузерные профили для X-аккаунтов, очередь видео, ручные подписи и общий суффикс, конкретный/случайный/по кругу/наименее загруженный аккаунт, автоматическое распределение по настраиваемым временным окнам, календарь занятых дат и времени и быстрый переход к следующей публикации. Без X API, X Pro и автоматического управления сайтом x.com."
+  "version": "4.3.1",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v4.3.1/TelegramAdminManager_v4.3.1_update.zip",
+  "sha256": "2594f93d5fe28c87648c916ccea2675cfaada5bf6dfe25e4ee111764d9eba0bf",
+  "notes": "Telegram Admin Manager 4.3.1: вместо Dashboard — три независимых инструмента: массовое создание групп с добавлением своих аккаунтов в админы, мониторинг/очередь и массовое назначение админов. Добавлена числовая сортировка скорости fastest-first. X Planner, обновления и данные пользователя сохраняются."
 }
