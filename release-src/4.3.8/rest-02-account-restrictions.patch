@@ -1,0 +1,47 @@
+diff --git a/TelegramAdminManager-4.3.8/tam_core/account_restrictions.py b/TelegramAdminManager-4.3.8/tam_core/account_restrictions.py
+new file mode 100644
+index 0000000..e015d6a
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tam_core/account_restrictions.py
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++from typing import Any
++
++_RESTRICTED_CLASS_REASONS = {
++    'PEERFLOODERROR': 'peer_flood',
++    'USERRESTRICTEDERROR': 'user_restricted',
++    'USERDEACTIVATEDBANERROR': 'user_deactivated_ban',
++    'PHONENUMBERBANNEDERROR': 'phone_number_banned',
++}
++
++_EXCLUDED_MARKERS = (
++    'FLOODWAIT', 'FLOOD_WAIT', 'FLOODPREMIUMWAIT', 'FLOOD_PREMIUM_WAIT',
++    'USERPRIVACYRESTRICTED', 'USER_PRIVACY_RESTRICTED',
++    'FILEPARTMISSING', 'FILE_PART_MISSING', 'FILE_PART',
++    'CHATADMINREQUIRED', 'CHAT_ADMIN_REQUIRED', 'RIGHTFORBIDDEN',
++    'TIMEOUT', 'CONNECTION', 'NETWORK',
++)
++
++
++def classify_telegram_restriction(exc: BaseException | Any) -> str | None:
++    name = exc.__class__.__name__.upper()
++    text = str(exc or '').upper()
++    combined = f'{name} {text}'
++    if any(marker in combined for marker in _EXCLUDED_MARKERS):
++        return None
++    if name in _RESTRICTED_CLASS_REASONS:
++        return _RESTRICTED_CLASS_REASONS[name]
++    if 'PEER_FLOOD' in combined or 'TOO MANY REQUESTS' in combined and 'SPAM' in combined:
++        return 'peer_flood'
++    if 'ANTI-SPAM' in combined or 'ANTISPAM' in combined or 'SPAM RESTRICTION' in combined:
++        return 'anti_spam'
++    return None
++
++
++def is_risky_membership_write(operation: str) -> bool:
++    key = str(operation or '').strip().casefold()
++    return key in {
++        'join', 'join_for_admin', 'factory_join_admin', 'invite', 'promote',
++        'membership_write', 'upload_join',
++    }
