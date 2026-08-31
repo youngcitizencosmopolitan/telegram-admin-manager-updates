@@ -1,1 +1,120 @@
-<PLACEHOLDER>
+diff --git a/TelegramAdminManager-4.3.7/telegram_admin_manager.py b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+index e19f7d0..e456ee3 100644
+--- a/TelegramAdminManager-4.3.7/telegram_admin_manager.py
++++ b/TelegramAdminManager-4.3.8/telegram_admin_manager.py
+@@ -3442,6 +3828,95 @@ class TelegramAdminManager(tk.Tk):
+         except Exception:
+             pass
+ 
++    # ---------- persistent Telegram restriction status ----------
++    def account_restriction(self, session: str) -> dict[str, Any]:
++        try:
++            return self.state_db.account_restriction_get(str(session))
++        except Exception:
++            return {}
++
++    def account_is_restricted(self, session: str) -> bool:
++        return str(self.account_restriction(session).get("status", "")) == "restricted"
++
++    def remember_account_restriction(self, account: Account, exc: Exception, operation: str) -> bool:
++        reason = classify_telegram_restriction(exc)
++        if not reason:
++            return False
++        payload = {
++            "status": "restricted",
++            "reason": reason,
++            "raw_error": f"{exc.__class__.__name__}: {exc}",
++            "friendly_error": self._friendly_error(exc),
++            "source_operation": str(operation),
++        }
++        self.state_db.account_restriction_set(account.session, payload)
++        self.log(f"⚠ {account.display}: помечен «Ограничен Telegram» — {payload['friendly_error']}")
++        self.ui_call(self._refresh_account_status_panel)
++        return True
++
++    def _account_status_text(self, account: Account) -> str:
++        restriction = self.account_restriction(account.session)
++        cooldown = admin_flood_remaining(self.state_db, account.session)
++        parts: list[str] = []
++        if restriction:
++            parts.append("⚠ Ограничен Telegram")
++        if cooldown > 0:
++            parts.append(f"FloodWait ещё {cooldown}с")
++        return " + ".join(parts) if parts else "OK"
++
++    def _selected_account_for_status(self) -> Account | None:
++        if not hasattr(self, "account_status_tree"):
++            return None
++        sel = self.account_status_tree.selection()
++        if not sel:
++            return None
++        return next((a for a in self.store.accounts() if a.session == sel[0]), None)
++
++    def _refresh_account_status_panel(self) -> None:
++        if not hasattr(self, "account_status_tree"):
++            return
++        for iid in self.account_status_tree.get_children(""):
++            self.account_status_tree.delete(iid)
++        for account in self.store.accounts():
++            restriction = self.account_restriction(account.session)
++            detail = str(restriction.get("friendly_error", "") or "")
++            self.account_status_tree.insert("", tk.END, iid=account.session, values=(account.display, self._account_status_text(account), detail))
++
++    def clear_selected_account_restriction(self) -> None:
++        account = self._selected_account_for_status()
++        if account is None:
++            return
++        if messagebox.askyesno(APP_NAME, "Снять локальную отметку «Ограничен Telegram»? Это не снимает ограничение на стороне Telegram."):
++            self.state_db.account_restriction_clear(account.session)
++            self._refresh_account_status_panel(); self.refresh_channels_from_cache()
++
++    def recheck_selected_account_restriction(self) -> None:
++        account = self._selected_account_for_status()
++        if account is None:
++            return
++        self.run_worker(lambda: asyncio.run(self._recheck_account_restriction_async(account)), "Проверяю аккаунт…")
++
++    async def _recheck_account_restriction_async(self, account: Account) -> None:
++        api_id, api_hash = self._api_credentials()
++        client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++        try:
++            await client.connect()
++            if not await client.is_user_authorized():
++                raise RuntimeError("Сессия не авторизована.")
++            me = await client.get_me()
++            if not me:
++                raise RuntimeError("Telegram не вернул данные аккаунта.")
++            self.log(f"Проверка {account.display}: read-only проверка успешна. Она не доказывает, что антиспам-ограничение Telegram снято.")
++            clear = self.ui_ask(lambda: messagebox.askyesno(APP_NAME, "Read-only проверка успешна. Снять локальную отметку и снова разрешить risky write-действия?"))
++            if clear:
++                self.state_db.account_restriction_clear(account.session)
++                self.log(f"{account.display}: локальная отметка ограничения снята пользователем.")
++        except Exception as exc:
++            self.log(f"Проверка {account.display}: {self._friendly_error(exc)}")
++        finally:
++            await client.disconnect()
++        self.ui_call(self._refresh_account_status_panel)
++
+     # ---------- account operations ----------
+     def add_account_qr(self) -> None:
+         if TelegramClient is None:
+@@ -3973,6 +4448,10 @@ class TelegramAdminManager(tk.Tk):
+         # First, selected accounts join (or at least resolve) the target one by one.
+         join_results: dict[int, bool] = {}
+         for i, account in enumerate(selected, start=1):
++            if self.account_is_restricted(account.session):
++                join_results[account.user_id] = False
++                self.log(f"[{i}/{len(selected)}] {account.display}: ⚠ пропуск — аккаунт помечен «Ограничен Telegram»; risky write-действие не выполняется")
++                continue
+             cooldown = admin_flood_remaining(self.state_db, account.session)
+             if cooldown > 0:
+                 join_results[account.user_id] = False
+@@ -4013,6 +4492,8 @@ class TelegramAdminManager(tk.Tk):
+                         f"[{i}/{len(selected)}] {account.display}: ⏸ FloodWait {seconds}с сохранён в state.db — "
+                         "аккаунт пропущен без ожидания"
+                     )
++                elif self.remember_account_restriction(account, exc, "join_for_admin"):
++                    self.log(f"[{i}/{len(selected)}] {account.display}: ⚠ антиспам-ограничение сохранено; дальнейшие risky write-действия будут пропускаться")
+                 elif policy["enabled"] and policy["stop_serious"] and self._is_serious_account_error(exc):
+                     self._admin_safety_disabled_sessions.add(account.session)
+                     self.log(f"[{i}/{len(selected)}] {account.display}: 🛑 серьёзная ошибка — {friendly}; аккаунт отключён до следующего запуска")
