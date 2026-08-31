@@ -1,0 +1,144 @@
+diff --git a/telegram_admin_manager_v4.3.1/tests/test_three_tool_ui_v431.py b/telegram_admin_manager_v4.3.2/tests/test_three_tool_ui_v431.py
+index f04ae7f..e948271 100644
+--- a/telegram_admin_manager_v4.3.1/tests/test_three_tool_ui_v431.py
++++ b/telegram_admin_manager_v4.3.2/tests/test_three_tool_ui_v431.py
+@@ -6,8 +6,8 @@ from batch_uploader import BatchUploaderPane, _parse_human_bytes
+ 
+ 
+ class PrimaryToolSpecTests(unittest.TestCase):
+-    def test_release_version_is_431(self):
+-        self.assertEqual(main_app.APP_VERSION, "4.3.1")
++    def test_release_version_is_semver(self):
++        self.assertRegex(main_app.APP_VERSION, r"^\d+\.\d+\.\d+$")
+ 
+     def test_primary_launcher_exposes_exactly_three_telegram_tools(self):
+         self.assertTrue(
+diff --git a/telegram_admin_manager_v4.3.2/tests/test_incremental_admins_v432.py b/telegram_admin_manager_v4.3.2/tests/test_incremental_admins_v432.py
+new file mode 100644
+index 0000000..fc7f2a5
+--- /dev/null
++++ b/telegram_admin_manager_v4.3.2/tests/test_incremental_admins_v432.py
+@@ -0,0 +1,123 @@
++from __future__ import annotations
++
++import tempfile
++import unittest
++from pathlib import Path
++
++from tam_core import GroupStateCache
++from tam_core.models import Account
++
++
++class AdminAssignmentCacheTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.tmp = tempfile.TemporaryDirectory()
++        self.cache = GroupStateCache(Path(self.tmp.name) / "group_state_cache.json")
++
++    def tearDown(self) -> None:
++        self.tmp.cleanup()
++
++    def test_policy_cache_is_persistent_and_specific_per_session(self):
++        self.cache.mark_admins("@g", {"s1", "s2"}, policy_key="policy-A")
++        self.assertEqual(self.cache.admin_sessions_for_policy("@g", "policy-A"), {"s1", "s2"})
++        self.assertEqual(self.cache.admin_sessions_for_policy("@g", "policy-B"), set())
++        reopened = GroupStateCache(Path(self.tmp.name) / "group_state_cache.json")
++        self.assertEqual(reopened.admin_sessions_for_policy("@g", "policy-A"), {"s1", "s2"})
++
++    def test_invalidate_policy_does_not_forget_known_admin_membership(self):
++        self.cache.mark_admins("@g", {"s1", "s2"}, controller_session="s1", policy_key="policy-A")
++        self.cache.invalidate_admin_policy("@g", "s2")
++        self.assertEqual(self.cache.admin_sessions_for_policy("@g", "policy-A"), {"s1"})
++        self.assertEqual(self.cache.entry("@g").get("admin_sessions"), ["s1", "s2"])
++        self.assertEqual(self.cache.cached_controller("@g", 24), "s1")
++
++
++class IncrementalAdminPlanTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.tmp = tempfile.TemporaryDirectory()
++        self.cache = GroupStateCache(Path(self.tmp.name) / "group_state_cache.json")
++        self.accounts = [
++            Account(session="s1", label="A", phone="", user_id=1),
++            Account(session="s2", label="B", phone="", user_id=2),
++            Account(session="s3", label="C", phone="", user_id=3),
++        ]
++
++    def tearDown(self) -> None:
++        self.tmp.cleanup()
++
++    def test_eighteenth_group_is_only_group_sent_to_telegram(self):
++        from telegram_admin_manager import build_incremental_admin_plan
++
++        policy = "same-rights"
++        old_groups = [f"@g{i}" for i in range(1, 18)]
++        for target in old_groups:
++            self.cache.mark_admins(target, {a.session for a in self.accounts}, policy_key=policy)
++
++        plan, summary = build_incremental_admin_plan(
++            self.cache, old_groups + ["@g18"], self.accounts, policy, force_recheck=False
++        )
++
++        self.assertEqual([item[0] for item in plan], ["@g18"])
++        self.assertEqual([a.session for a in plan[0][1]], ["s1", "s2", "s3"])
++        self.assertEqual(summary["cached_groups"], 17)
++        self.assertEqual(summary["work_groups"], 1)
++        self.assertEqual(summary["cached_assignments"], 51)
++        self.assertEqual(summary["work_assignments"], 3)
++
++    def test_partially_cached_group_only_processes_missing_account(self):
++        from telegram_admin_manager import build_incremental_admin_plan
++
++        self.cache.mark_admins("@g", {"s1", "s3"}, policy_key="p")
++        plan, summary = build_incremental_admin_plan(self.cache, ["@g"], self.accounts, "p")
++        self.assertEqual(len(plan), 1)
++        self.assertEqual([a.session for a in plan[0][1]], ["s2"])
++        self.assertEqual(summary["cached_assignments"], 2)
++        self.assertEqual(summary["work_assignments"], 1)
++
++    def test_force_recheck_processes_every_selected_account(self):
++        from telegram_admin_manager import build_incremental_admin_plan
++
++        self.cache.mark_admins("@g", {a.session for a in self.accounts}, policy_key="p")
++        plan, summary = build_incremental_admin_plan(
++            self.cache, ["@g"], self.accounts, "p", force_recheck=True
++        )
++        self.assertEqual([a.session for a in plan[0][1]], ["s1", "s2", "s3"])
++        self.assertEqual(summary["cached_groups"], 0)
++        self.assertEqual(summary["work_groups"], 1)
++        self.assertEqual(summary["work_assignments"], 3)
++
++
++if __name__ == "__main__":
++    unittest.main()
++
++class AdminPolicyFingerprintTests(unittest.TestCase):
++    def test_fingerprint_changes_when_any_desired_admin_state_changes(self):
++        from telegram_admin_manager import build_admin_policy_key
++
++        flags = {"delete_messages": True, "invite_users": True}
++        base = build_admin_policy_key("standard", "", True, flags)
++        self.assertNotEqual(base, build_admin_policy_key("full", "", True, flags))
++        self.assertNotEqual(base, build_admin_policy_key("standard", "Rank", True, flags))
++        self.assertNotEqual(base, build_admin_policy_key("standard", "", False, flags))
++        self.assertNotEqual(base, build_admin_policy_key("standard", "", True, {**flags, "ban_users": True}))
++
++
++class AdminUiIntegrationStructureTests(unittest.TestCase):
++    def test_version_and_incremental_controls_are_wired(self):
++        import inspect
++        import telegram_admin_manager as main_app
++
++        self.assertEqual(main_app.APP_VERSION, "4.3.2")
++        ui_source = inspect.getsource(main_app.TelegramAdminManager._build_group_tab)
++        start_source = inspect.getsource(main_app.TelegramAdminManager.start_promote)
++        many_source = inspect.getsource(main_app.TelegramAdminManager._promote_many_async)
++        one_source = inspect.getsource(main_app.TelegramAdminManager._promote_one_target_async)
++
++        self.assertIn("Обработать только изменения", ui_source)
++        self.assertIn("Принудительно перепроверить всё", ui_source)
++        self.assertIn("build_incremental_admin_plan", start_source)
++        self.assertIn("force_recheck", start_source)
++        self.assertIn("policy_key", many_source)
++        self.assertIn("policy_key", one_source)
++        self.assertIn("policy_success_sessions", one_source)
++        self.assertIn("policy_key=policy_key", one_source)
++        self.assertIn("invalidate_admin_policy", many_source)

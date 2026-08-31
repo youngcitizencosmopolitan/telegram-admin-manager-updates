@@ -1,0 +1,103 @@
+diff --git a/telegram_admin_manager_v4.3.1/tam_core/repositories.py b/telegram_admin_manager_v4.3.2/tam_core/repositories.py
+index 1e02872..b553513 100644
+--- a/telegram_admin_manager_v4.3.1/tam_core/repositories.py
++++ b/telegram_admin_manager_v4.3.2/tam_core/repositories.py
+@@ -172,6 +172,27 @@ class GroupStateCache:
+             return set()
+         return {str(x) for x in (e.get("admin_sessions") or []) if x}
+ 
++    def admin_sessions_for_policy(self, target: str, policy_key: str) -> set[str]:
++        """Return sessions whose last successful assignment matches this exact policy.
++
++        Unlike the legacy TTL cache this state is intentionally persistent. It is a
++        local operation journal: once an assignment succeeded, repeating the same
++        desired state is unnecessary until settings change or the user forces a
++        recheck.
++        """
++        wanted = str(policy_key or "")
++        if not wanted:
++            return set()
++        e = self.entry(target)
++        assignments = e.get("admin_assignments") or {}
++        if not isinstance(assignments, dict):
++            return set()
++        return {
++            str(session)
++            for session, state in assignments.items()
++            if session and isinstance(state, dict) and str(state.get("policy_key") or "") == wanted
++        }
++
+     def cached_controller(self, target: str, max_age_hours: float) -> str | None:
+         e = self.entry(target)
+         if not self._fresh(e.get("last_admin_sync"), max_age_hours):
+@@ -202,6 +223,7 @@ class GroupStateCache:
+         title: str | None = None,
+         replace: bool = False,
+         anonymous: bool | None = None,
++        policy_key: str | None = None,
+     ) -> None:
+         with self._lock:
+             e = self.entry(target)
+@@ -220,6 +242,19 @@ class GroupStateCache:
+                 e["title"] = str(title)
+             if anonymous is not None:
+                 e["admins_anonymous"] = bool(anonymous)
++            if policy_key:
++                assignments = e.get("admin_assignments") or {}
++                if not isinstance(assignments, dict) or replace:
++                    assignments = {}
++                else:
++                    assignments = dict(assignments)
++                for session in sessions:
++                    if session:
++                        assignments[str(session)] = {
++                            "policy_key": str(policy_key),
++                            "updated_at": now,
++                        }
++                e["admin_assignments"] = assignments
+             self._store_entry(target, e)
+ 
+     def mark_metadata(
+@@ -290,16 +325,42 @@ class GroupStateCache:
+                 e["title"] = str(title)
+             self._store_entry(target, e)
+ 
++    def invalidate_admin_policy(self, target: str, session: str | None = None) -> None:
++        """Forget assignment-policy proof while preserving known membership/controller state."""
++        with self._lock:
++            e = self.entry(target)
++            if not e:
++                return
++            assignments = e.get("admin_assignments") or {}
++            if not isinstance(assignments, dict):
++                assignments = {}
++            else:
++                assignments = dict(assignments)
++            if session is None:
++                assignments.clear()
++            else:
++                assignments.pop(str(session), None)
++            e["admin_assignments"] = assignments
++            self._store_entry(target, e)
++
+     def invalidate_admin(self, target: str, session: str | None = None) -> None:
+         with self._lock:
+             e = self.entry(target)
+             if not e:
+                 return
++            assignments = e.get("admin_assignments") or {}
++            if not isinstance(assignments, dict):
++                assignments = {}
++            else:
++                assignments = dict(assignments)
+             if session:
+                 e["admin_sessions"] = [x for x in (e.get("admin_sessions") or []) if str(x) != str(session)]
++                assignments.pop(str(session), None)
+             else:
+                 e["admin_sessions"] = []
+                 e["controller_session"] = ""
++                assignments.clear()
++            e["admin_assignments"] = assignments
+             e["last_admin_sync"] = 0
+             self._store_entry(target, e)
+ 
