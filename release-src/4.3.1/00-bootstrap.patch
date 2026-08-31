@@ -1,0 +1,13 @@
+diff --git a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+index 0000000..1111111 100644
+--- a/telegram_admin_manager_v4.3.0/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
+@@ -57,7 +57,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.0"
++APP_VERSION = "4.3.1"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
