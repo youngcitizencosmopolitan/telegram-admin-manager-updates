@@ -1,0 +1,39 @@
+diff --git a/TelegramAdminManager-4.3.8/tests/test_v438_channel_inventory.py b/TelegramAdminManager-4.3.8/tests/test_v438_channel_inventory.py
+new file mode 100644
+index 0000000..bd9bf52
+--- /dev/null
++++ b/TelegramAdminManager-4.3.8/tests/test_v438_channel_inventory.py
+@@ -0,0 +1,33 @@
++import unittest
++
++from tam_core.channel_inventory import merge_channel_observation, relation_from_entity, serialize_admin_rights
++
++
++class Obj:
++    pass
++
++
++class V438ChannelInventoryTests(unittest.TestCase):
++    def test_peer_observations_merge_by_id(self):
++        a = {'peer_id': 99, 'title': 'Old', 'link': '', 'peer_type': 'channel'}
++        b = {'peer_id': 99, 'title': 'New', 'link': 'https://t.me/new', 'peer_type': 'channel'}
++        merged = merge_channel_observation(a, b)
++        self.assertEqual(merged['peer_id'], 99)
++        self.assertEqual(merged['title'], 'New')
++        self.assertEqual(merged['link'], 'https://t.me/new')
++
++    def test_relation_and_dynamic_rights(self):
++        rights = Obj(); rights.add_admins = True; rights.delete_messages = False; rights._internal = True
++        entity = Obj(); entity.creator = False; entity.admin_rights = rights
++        rel = relation_from_entity(entity)
++        self.assertEqual(rel['relation'], 'admin')
++        self.assertTrue(rel['can_add_admins'])
++        serialized = serialize_admin_rights(rights)
++        self.assertEqual(serialized['add_admins'], True)
++        self.assertEqual(serialized['delete_messages'], False)
++        self.assertNotIn('_internal', serialized)
++        entity.creator = True
++        self.assertEqual(relation_from_entity(entity)['relation'], 'owner')
++
++if __name__ == '__main__':
++    unittest.main()
