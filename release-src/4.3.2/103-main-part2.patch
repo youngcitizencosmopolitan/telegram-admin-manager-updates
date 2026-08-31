@@ -1,0 +1,46 @@
+diff --git a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+index a70a147..1fe181f 100644
+--- a/telegram_admin_manager_v4.3.1/telegram_admin_manager.py
++++ b/telegram_admin_manager_v4.3.2/telegram_admin_manager.py
+@@ -2001,6 +2050,7 @@ class TelegramAdminManager(tk.Tk):
+                             title=item.title,
+                             replace=True,
+                             anonymous=bool(self.store.data.get("admin_anonymous", True)),
++                            policy_key=factory_policy_key,
+                         )
+                         self.group_state_cache.mark_metadata(
+                             target,
+@@ -2213,8 +2263,13 @@ class TelegramAdminManager(tk.Tk):
+ 
+         actions = ttk.Frame(t)
+         actions.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+-        self.run_button = ttk.Button(actions, text="Обработать все группы", command=self.start_promote)
++        self.run_button = ttk.Button(actions, text="Обработать только изменения", command=self.start_promote)
+         self.run_button.pack(side="left")
++        ttk.Button(
++            actions,
++            text="Принудительно перепроверить всё",
++            command=lambda: self.start_promote(force_recheck=True),
++        ).pack(side="left", padx=(6, 0))
+         self.admin_stop_button = ttk.Button(
+             actions, text="Остановить после текущей группы", command=self.stop_admin_batch, state="disabled"
+         )
+@@ -3502,17 +3557,7 @@ class TelegramAdminManager(tk.Tk):
+         self.refresh_account_list(select_all=True)
+ 
+     # ---------- group / promotion ----------
+-    def start_promote(self) -> None:
+-        if TelegramClient is None:
+-            self._show_missing_dependency()
+-            return
+-        self.save_api_settings(quiet=True)
+-        try:
+-            self._api_credentials()
+-        except Exception as exc:
+-            messagebox.showerror(APP_NAME, str(exc))
+-            return
+-
++    def start_promote(self, force_recheck: bool = False) -> None:
+         targets = self._admin_targets()
+         if not targets:
+             messagebox.showerror(APP_NAME, "Вставь хотя бы одну ссылку, @username или ID группы.")
