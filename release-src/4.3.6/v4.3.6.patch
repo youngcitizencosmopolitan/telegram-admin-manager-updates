@@ -62,12 +62,6 @@
  
  class PermanentRightLogTests(unittest.TestCase):
      def test_primary_windows_attach_a_right_side_log_panel(self):
-@@ -80,7 +88,7 @@
- class V433IntegrationTests(unittest.TestCase):
-     def test_version_and_floodwait_path_are_incremental(self):
-         import telegram_admin_manager as app
+@@ -1 +1 @@
 -        self.assertEqual(app.APP_VERSION, '4.3.5')
 +        self.assertEqual(app.APP_VERSION, '4.3.6')
-         source = inspect.getsource(app.TelegramAdminManager._promote_one_target_async)
-         self.assertIn('admin_flood_remaining', source)
-         self.assertIn('remember_admin_flood_wait', source)
