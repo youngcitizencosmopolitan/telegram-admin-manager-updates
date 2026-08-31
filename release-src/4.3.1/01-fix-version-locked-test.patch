@@ -1,6 +1,0 @@
-diff --git a/telegram_admin_manager_v4.3.0/tests/test_x_integration_v430.py b/telegram_admin_manager_v4.3.1/tests/test_x_integration_v430.py
---- a/telegram_admin_manager_v4.3.0/tests/test_x_integration_v430.py
-+++ b/telegram_admin_manager_v4.3.1/tests/test_x_integration_v430.py
-@@ -9 +9 @@
--        self.assertIn('APP_VERSION = "4.3.0"', text)
-+        self.assertRegex(text, r'APP_VERSION = "\d+\.\d+\.\d+"')
