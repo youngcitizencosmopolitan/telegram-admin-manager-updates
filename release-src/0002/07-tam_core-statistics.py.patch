@@ -1,0 +1,52 @@
+--- a/app/tam_core/statistics.py
++++ b/app/tam_core/statistics.py
+@@ -0,0 +1,49 @@
++from __future__ import annotations
++
++from typing import Any
++
++
++def aggregate_transfer_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
++    def bucket() -> dict[str, Any]:
++        return {"files": 0, "bytes": 0, "success": 0, "failed": 0, "duration": 0.0, "success_bytes": 0}
++
++    totals = bucket()
++    accounts: dict[str, dict[str, Any]] = {}
++    tasks: dict[str, dict[str, Any]] = {}
++
++    def add(b: dict[str, Any], row: dict[str, Any]) -> None:
++        size = max(0, int(row.get("size", 0) or 0))
++        duration = max(0.0, float(row.get("duration", 0) or 0))
++        success = bool(row.get("success", False))
++        b["files"] += 1
++        b["bytes"] += size
++        b["duration"] += duration
++        if success:
++            b["success"] += 1
++            b["success_bytes"] += size
++        else:
++            b["failed"] += 1
++
++    for row in rows:
++        add(totals, row)
++        session = str(row.get("session", "") or "—")
++        task = str(row.get("task", "") or "—")
++        acc = accounts.setdefault(session, bucket())
++        acc["label"] = str(row.get("account_label", "") or session)
++        add(acc, row)
++        tb = tasks.setdefault(task, bucket())
++        add(tb, row)
++
++    def finish(b: dict[str, Any]) -> None:
++        files = int(b.get("files", 0) or 0)
++        success = int(b.get("success", 0) or 0)
++        duration = float(b.get("duration", 0) or 0)
++        b["success_rate"] = (success / files * 100.0) if files else 0.0
++        b["avg_speed"] = (int(b.get("success_bytes", 0) or 0) / duration) if duration > 0 else 0.0
++
++    finish(totals)
++    for b in accounts.values():
++        finish(b)
++    for b in tasks.values():
++        finish(b)
++    return {"totals": totals, "accounts": accounts, "tasks": tasks}
