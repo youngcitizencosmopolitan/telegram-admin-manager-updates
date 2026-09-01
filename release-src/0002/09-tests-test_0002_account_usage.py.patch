@@ -1,0 +1,38 @@
+--- a/app/tests/test_0002_account_usage.py
++++ b/app/tests/test_0002_account_usage.py
+@@ -0,0 +1,35 @@
++import tempfile
++import unittest
++from pathlib import Path
++
++
++class AccountUsageTests(unittest.TestCase):
++    def test_defaults_keep_existing_accounts_enabled_everywhere(self):
++        from tam_core.account_usage import default_account_usage, usage_allows
++        policy = default_account_usage()
++        for capability in ("monitoring", "groups", "admins", "uploads", "channels", "large_files"):
++            self.assertTrue(usage_allows(policy, capability), capability)
++
++    def test_global_or_capability_disable_blocks_only_expected_capability(self):
++        from tam_core.account_usage import normalize_account_usage, usage_allows
++        policy = normalize_account_usage({"monitoring": False})
++        self.assertFalse(usage_allows(policy, "monitoring"))
++        self.assertTrue(usage_allows(policy, "admins"))
++        policy = normalize_account_usage({"enabled": False})
++        self.assertFalse(usage_allows(policy, "admins"))
++        self.assertFalse(usage_allows(policy, "uploads"))
++
++    def test_state_db_persists_policy_additively(self):
++        from tam_core.state_db import StateDatabase
++        with tempfile.TemporaryDirectory() as td:
++            db = StateDatabase(Path(td) / "state.db")
++            db.account_usage_set("s1", {"enabled": True, "monitoring": False})
++            row = db.account_usage_get("s1")
++            self.assertEqual(row["session"], "s1")
++            self.assertFalse(row["monitoring"])
++            self.assertTrue(row["admins"])
++            self.assertEqual([x["session"] for x in db.account_usage_all()], ["s1"])
++
++
++if __name__ == "__main__":
++    unittest.main()
