@@ -1,0 +1,78 @@
+--- a/app/tam_x/ui.py
++++ b/app/tam_x/ui.py
+@@ -13,6 +13,7 @@
+ from .browser import build_browser_command, find_browser_executable
+ from .planner import Account, DraftJob, PlannedJob, PlannerStore
+ from .service import compose_caption, ensure_defaults, plan_all_drafts
++from tam_core.table_sort import TreeviewSortController
+ 
+ VIDEO_PATTERNS = [("Видео", "*.mp4 *.mov *.m4v *.avi *.mkv *.webm"), ("Все файлы", "*.*")]
+ MODE_LABELS = {
+@@ -46,6 +47,7 @@
+         self.data_dir.mkdir(parents=True, exist_ok=True)
+         (self.data_dir / "x_profiles").mkdir(parents=True, exist_ok=True)
+         self.store = PlannerStore(self.data_dir / "x_planner.db")
++        self._tree_sort_controllers: list[TreeviewSortController] = []
+         ensure_defaults(self.store)
+         self.title("Twitter / X — Telegram Admin Manager 4.3.0")
+         self.geometry("1420x820")
+@@ -55,6 +57,35 @@
+         self._build_ui()
+         self._refresh_all()
+ 
++    def _load_table_sort_state(self, table_id: str) -> dict[str, object] | None:
++        raw = self.store.get_setting("table_sort:" + str(table_id), "") or ""
++        if not raw:
++            return None
++        try:
++            import json
++            value = json.loads(raw)
++            return dict(value) if isinstance(value, dict) else None
++        except Exception:
++            return None
++
++    def _save_table_sort_state(self, table_id: str, state: dict[str, object]) -> None:
++        import json
++        self.store.set_setting("table_sort:" + str(table_id), json.dumps({
++            "column": str(state.get("column", "")), "reverse": bool(state.get("reverse", False))
++        }, ensure_ascii=False))
++
++    def _register_sortable_tree(
++        self, tree: ttk.Treeview, table_id: str, column_types: dict[str, str] | None = None,
++        *, first_descending: set[str] | None = None,
++    ) -> TreeviewSortController:
++        controller = TreeviewSortController(
++            tree, table_id=table_id, column_types=column_types,
++            load_state=self._load_table_sort_state, save_state=self._save_table_sort_state,
++            first_descending=first_descending,
++        )
++        self._tree_sort_controllers.append(controller)
++        return controller
++
+     def _build_ui(self) -> None:
+         style = ttk.Style(self)
+         try:
+@@ -117,6 +148,7 @@
+         self.accounts_tree.column("browser", width=70, anchor="center")
+         self.accounts_tree.column("state", width=70, anchor="center")
+         self.accounts_tree.grid(row=2, column=0, sticky="nsew")
++        self._register_sortable_tree(self.accounts_tree, "x.accounts")
+         ttk.Button(left, text="Удалить аккаунт", command=self._delete_account).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+ 
+         center = tk.Frame(panes, bg="#ffffff", padx=10, pady=10)
+@@ -148,6 +180,7 @@
+         self.jobs_tree.grid(row=2, column=0, sticky="nsew")
+         sb = ttk.Scrollbar(center, orient="vertical", command=self.jobs_tree.yview)
+         self.jobs_tree.configure(yscrollcommand=sb.set)
++        self._register_sortable_tree(self.jobs_tree, "x.jobs", {"date": "datetime", "time": "time"})
+         sb.grid(row=2, column=1, sticky="ns")
+         self.jobs_tree.bind("<Double-1>", lambda _e: self._edit_selected_job())
+ 
+@@ -382,6 +415,7 @@
+         for key, title, width in [("label","Название",160),("start","С",65),("end","До",65),("days","Дни",230),("state","Статус",80)]:
+             tree.heading(key, text=title); tree.column(key, width=width, anchor="w")
+         tree.grid(row=1, column=0, sticky="nsew")
++        self._register_sortable_tree(tree, "x.windows", {"start": "time", "end": "time"})
+ 
+         def refresh() -> None:
+             for iid in tree.get_children(): tree.delete(iid)

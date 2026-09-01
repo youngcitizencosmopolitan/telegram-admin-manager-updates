@@ -1,0 +1,362 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -30,6 +30,8 @@
+ from tam_core.statistics import aggregate_transfer_stats
+ from tam_core.channel_management import choose_controller_session, eligible_channel_sessions
+ from tam_core.channel_inventory import observation_from_entity, relation_from_entity
++from tam_core.channel_links import pick_active_invite_link, relation_can_manage_invites
++from tam_core.table_sort import TreeviewSortController
+ from tam_core.telegram_limits import (
+     UPLOAD_FLOOD_SLEEP_THRESHOLD,
+     is_premium_upload_wait,
+@@ -65,7 +67,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0002"
++APP_VERSION = "0003"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -114,6 +116,7 @@
+     "admins": "Наши админы",
+     "members": "Наши участники",
+     "status": "Статус",
++    "last_refreshed_at": "Обновлён",
+ }
+ CHANNEL_DEFAULT_VISIBLE_COLUMNS = list(CHANNEL_COLUMN_LABELS)
+ 
+@@ -347,6 +350,7 @@
+         self._ui_queue: queue.Queue[Callable[[], Any]] = queue.Queue()
+         self._visible_log_lines = 0
+         self._log_text_widgets: list[tk.Text] = []
++        self._tree_sort_controllers: list[TreeviewSortController] = []
+         self.log_autoscroll_var = tk.BooleanVar(value=True)
+         self._build_ui()
+         self._install_keyboard_shortcuts()
+@@ -364,6 +368,33 @@
+             # The check is delayed and runs off the UI thread.
+             self.after(4500, self._maybe_check_for_updates)
+ 
++    # ---------- table sorting ----------
++    def _load_table_sort_state(self, table_id: str) -> dict[str, Any] | None:
++        raw = self.store.data.get("table_sorts", {})
++        if not isinstance(raw, dict):
++            return None
++        state = raw.get(str(table_id))
++        return dict(state) if isinstance(state, dict) else None
++
++    def _save_table_sort_state(self, table_id: str, state: dict[str, Any]) -> None:
++        raw = self.store.data.get("table_sorts", {})
++        table_sorts = dict(raw) if isinstance(raw, dict) else {}
++        table_sorts[str(table_id)] = {"column": str(state.get("column", "")), "reverse": bool(state.get("reverse", False))}
++        self.store.data["table_sorts"] = table_sorts
++        self.store.save()
++
++    def _register_sortable_tree(
++        self, tree: ttk.Treeview, table_id: str, column_types: dict[str, str] | None = None,
++        *, first_descending: set[str] | None = None,
++    ) -> TreeviewSortController:
++        controller = TreeviewSortController(
++            tree, table_id=table_id, column_types=column_types,
++            load_state=self._load_table_sort_state, save_state=self._save_table_sort_state,
++            first_descending=first_descending,
++        )
++        self._tree_sort_controllers.append(controller)
++        return controller
++
+     # ---------- UI ----------
+ 
+     def _open_x_planner(self) -> None:
+@@ -792,6 +823,7 @@
+         qsb = ttk.Scrollbar(queue_card, orient="vertical", command=self.dashboard_queue_tree.yview)
+         qsb.grid(row=1, column=1, sticky="ns")
+         self.dashboard_queue_tree.configure(yscrollcommand=qsb.set)
++        self._register_sortable_tree(self.dashboard_queue_tree, "dashboard.queue")
+ 
+         # Groups / channels catalog -----------------------------------------
+         groups_card = tk.Frame(body_panes, bg="#ffffff", highlightbackground="#d9e0ea", highlightthickness=1, padx=10, pady=9)
+@@ -817,6 +849,7 @@
+         gsb = ttk.Scrollbar(groups_card, orient="vertical", command=self.dashboard_groups_tree.yview)
+         gsb.grid(row=1, column=1, sticky="ns")
+         self.dashboard_groups_tree.configure(yscrollcommand=gsb.set)
++        self._register_sortable_tree(self.dashboard_groups_tree, "dashboard.groups")
+         self.dashboard_groups_tree.bind("<Double-1>", lambda _e: self._dashboard_open_selected_group_admins())
+ 
+         # Active / recent files ---------------------------------------------
+@@ -840,6 +873,7 @@
+         asb = ttk.Scrollbar(activity_card, orient="vertical", command=self.dashboard_activity_tree.yview)
+         asb.grid(row=1, column=1, sticky="ns")
+         self.dashboard_activity_tree.configure(yscrollcommand=asb.set)
++        self._register_sortable_tree(self.dashboard_activity_tree, "dashboard.activity", {"size": "bytes", "progress": "percent", "speed": "speed"}, first_descending={"speed"})
+         self.dashboard_activity_tree.tag_configure("uploading", foreground="#2563eb")
+         self.dashboard_activity_tree.tag_configure("success", foreground="#16803c")
+         self.dashboard_activity_tree.tag_configure("error", foreground="#b42318")
+@@ -1597,6 +1631,7 @@
+         toolbar = ttk.Frame(t)
+         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+         ttk.Button(toolbar, text="Обновить каналы", command=self.refresh_channels_from_telegram).pack(side="left")
++        ttk.Button(toolbar, text="Обновить ссылки", command=self.refresh_channel_links_from_telegram).pack(side="left", padx=6)
+         ttk.Button(toolbar, text="Обновить этот канал", command=self.refresh_selected_channel).pack(side="left", padx=6)
+         ttk.Label(toolbar, text="Поиск:").pack(side="left", padx=(12, 4))
+         self.channels_search_var = tk.StringVar()
+@@ -1645,6 +1680,9 @@
+         x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.channels_tree.xview)
+         x.grid(row=1, column=0, sticky="ew")
+         self.channels_tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
++        self._register_sortable_tree(self.channels_tree, "channels.inventory", {
++            "peer_id": "number", "last_refreshed_at": "datetime",
++        })
+         self.channels_tree.bind("<<TreeviewSelect>>", lambda _e: self._channels_show_selected_details())
+         self.channels_tree.bind("<Double-1>", lambda _e: self._channels_open_selected())
+ 
+@@ -1669,6 +1707,7 @@
+         ds = ttk.Scrollbar(detail_frame, orient="vertical", command=self.channel_accounts_tree.yview)
+         ds.grid(row=0, column=1, sticky="ns")
+         self.channel_accounts_tree.configure(yscrollcommand=ds.set)
++        self._register_sortable_tree(self.channel_accounts_tree, "channels.accounts")
+ 
+         manage = ttk.Frame(detail_frame)
+         manage.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+@@ -1737,6 +1776,9 @@
+         if value in (None, ""):
+             self.log(f"Каналы: поле «{CHANNEL_COLUMN_LABELS.get(field, field)}» пустое — копировать нечего.")
+             return
++        if field == "link" and not str(value).startswith(("https://", "http://", "tg://")):
++            self.log("Каналы: действующая ссылка для выбранного канала пока не сохранена.")
++            return
+         self.clipboard_clear(); self.clipboard_append(str(value)); self.update_idletasks()
+ 
+     def _channels_open_selected(self) -> None:
+@@ -1778,6 +1820,14 @@
+             "problem": problem,
+         }
+ 
++    @staticmethod
++    def _format_channel_refresh_time(value: Any) -> str:
++        try:
++            stamp = float(value or 0)
++        except Exception:
++            stamp = 0.0
++        return time.strftime("%d.%m.%Y %H:%M", time.localtime(stamp)) if stamp > 0 else "—"
++
+     def refresh_channels_from_cache(self) -> None:
+         if not hasattr(self, "channels_tree"):
+             return
+@@ -1800,9 +1850,11 @@
+             if owner_only and not agg["owner"]: continue
+             if admin_only and not agg["admins"] and not agg["owner"]: continue
+             if problem_only and not problem: continue
++            link_value = str(row.get("link", "") or "") or str(row.get("link_status", "") or "") or "—"
++            refreshed = self._format_channel_refresh_time(row.get("last_refreshed_at"))
+             values = (
+-                row.get("title", ""), row.get("link", ""), row.get("peer_type", ""), peer_id,
+-                agg["owner"], agg["admins"], agg["members"], "⚠ Проблема" if problem else "OK",
++                row.get("title", ""), link_value, row.get("peer_type", ""), peer_id,
++                agg["owner"], agg["admins"], agg["members"], "⚠ Проблема" if problem else "OK", refreshed,
+             )
+             self.channels_tree.insert("", tk.END, iid=str(peer_id), values=values)
+         if selected is not None and self.channels_tree.exists(str(selected)):
+@@ -2171,6 +2223,148 @@
+                     await client.disconnect()
+             await self._refresh_channel_async(peer_id)
+ 
++    def refresh_channel_links_from_telegram(self) -> None:
++        if TelegramClient is None:
++            self._show_missing_dependency(); return
++        selected = self._channels_selected_peer_ids()
++        peer_ids = selected or [int(row.get("peer_id", 0) or 0) for row in self.state_db.channels_all()]
++        peer_ids = [x for x in peer_ids if x]
++        if not peer_ids:
++            messagebox.showinfo(APP_NAME, "В кэше пока нет каналов/групп.")
++            return
++        self.run_worker(
++            lambda: asyncio.run(self._refresh_channel_links_async(peer_ids, create_missing=True, show_message=True)),
++            "Обновляю ссылки каналов…",
++        )
++
++    async def _channel_existing_invite_link(self, client: Any, entity: Any) -> str:
++        cls = getattr(getattr(tl_functions, "messages", None), "GetExportedChatInvitesRequest", None)
++        if cls is None:
++            return ""
++        params = inspect.signature(cls).parameters
++        kwargs: dict[str, Any] = {"peer": entity}
++        if "admin_id" in params:
++            kwargs["admin_id"] = await client.get_input_entity("me")
++        if "offset_date" in params:
++            kwargs["offset_date"] = None
++        if "offset_link" in params:
++            kwargs["offset_link"] = None
++        if "limit" in params:
++            kwargs["limit"] = 50
++        if "revoked" in params:
++            kwargs["revoked"] = False
++        result = await client(cls(**kwargs))
++        return pick_active_invite_link(getattr(result, "invites", ()) or ())
++
++    async def _channel_create_invite_link(self, client: Any, entity: Any) -> str:
++        cls = getattr(getattr(tl_functions, "messages", None), "ExportChatInviteRequest", None)
++        if cls is None:
++            return ""
++        params = inspect.signature(cls).parameters
++        kwargs: dict[str, Any] = {"peer": entity}
++        # Keep the generated fallback simple and reusable. Optional expiry/limits
++        # are intentionally omitted so an explicit refresh does not create a
++        # short-lived link that silently stops working later.
++        for name in ("expire_date", "usage_limit", "request_needed", "title"):
++            if name in params:
++                kwargs[name] = None
++        result = await client(cls(**kwargs))
++        return str(getattr(result, "link", "") or "")
++
++    async def _refresh_channel_links_async(
++        self, peer_ids: list[int], *, create_missing: bool, show_message: bool,
++    ) -> None:
++        rows = {int(row.get("peer_id", 0) or 0): row for row in self.state_db.channels_all()}
++        target_ids = [int(x) for x in peer_ids if int(x) in rows]
++        remaining: set[int] = set()
++        now = time.time()
++        for peer_id in target_ids:
++            row = rows[peer_id]
++            username = str(row.get("username", "") or "")
++            if username:
++                self.state_db.channel_upsert({
++                    "peer_id": peer_id, "link": f"https://t.me/{username}",
++                    "link_status": "ok", "link_updated_at": now,
++                })
++            else:
++                remaining.add(peer_id)
++        if not remaining:
++            self.ui_call(self.refresh_channels_from_cache)
++            if show_message:
++                self.ui_call(lambda: messagebox.showinfo(APP_NAME, "Ссылки публичных каналов уже актуальны."))
++            return
++
++        all_accounts = {a.session: a for a in self.store.accounts()}
++        accounts = self.accounts_for("channels")
++        errors_by_peer: dict[int, str] = {}
++        candidate_seen: set[int] = set()
++        for account in accounts:
++            if not remaining:
++                break
++            if self.account_is_restricted(account.session):
++                continue
++            cooldown = admin_flood_remaining(self.state_db, account.session)
++            if cooldown > 0:
++                continue
++            eligible: list[int] = []
++            for peer_id in list(remaining):
++                relations = {str(x.get("session", "")): x for x in self.state_db.channel_accounts(peer_id)}
++                relation = relations.get(account.session, {})
++                if relation_can_manage_invites(relation):
++                    eligible.append(peer_id)
++                    candidate_seen.add(peer_id)
++            if not eligible:
++                continue
++            client = TelegramClient(str(SESSIONS_DIR / account.session), *self._api_credentials(), flood_sleep_threshold=0)
++            try:
++                await client.connect()
++                if not await client.is_user_authorized():
++                    continue
++                for peer_id in list(eligible):
++                    if peer_id not in remaining:
++                        continue
++                    row = rows[peer_id]
++                    try:
++                        peer = tl_types.PeerChannel(peer_id) if str(row.get("peer_type", "channel")) == "channel" else tl_types.PeerChat(peer_id)
++                        entity = await client.get_entity(peer)
++                        link = await self._channel_existing_invite_link(client, entity)
++                        if not link and create_missing:
++                            link = await self._channel_create_invite_link(client, entity)
++                        if link:
++                            self.state_db.channel_upsert({
++                                "peer_id": peer_id, "link": link, "link_status": "ok",
++                                "link_source_session": account.session, "link_updated_at": time.time(),
++                            })
++                            remaining.discard(peer_id)
++                            self.log(f"Каналы: {row.get('title', peer_id)}: ✅ ссылка обновлена через {account.display}")
++                        else:
++                            errors_by_peer[peer_id] = "Нет активной invite-ссылки"
++                    except Exception as exc:
++                        if errors is not None and isinstance(exc, getattr(errors, "FloodWaitError", ())):
++                            remember_admin_flood_wait(self.state_db, account.session, max(1, int(getattr(exc, "seconds", 1))))
++                        self.remember_account_restriction(account, exc, "channel_invite_link")
++                        errors_by_peer[peer_id] = self._friendly_error(exc)
++            finally:
++                await client.disconnect()
++
++        for peer_id in remaining:
++            current = self.state_db.channel_get(peer_id)
++            if current.get("link"):
++                continue
++            if peer_id not in candidate_seen:
++                status = "Нет доступа к invite-ссылке"
++            else:
++                status = errors_by_peer.get(peer_id) or ("Нет активной invite-ссылки" if not create_missing else "Не удалось получить invite-ссылку")
++            self.state_db.channel_upsert({
++                "peer_id": peer_id, "link_status": status, "link_updated_at": time.time(),
++            })
++        self.ui_call(self.refresh_channels_from_cache)
++        if show_message:
++            resolved = len(target_ids) - len(remaining)
++            self.ui_call(lambda: messagebox.showinfo(
++                APP_NAME, f"Ссылки обновлены. Получено: {resolved}; без доступной ссылки: {len(remaining)}."
++            ))
++
+     def refresh_channels_from_telegram(self) -> None:
+         if TelegramClient is None:
+             self._show_missing_dependency(); return
+@@ -2236,6 +2430,11 @@
+                         "relation": "absent", "rights": {}, "can_add_admins": False,
+                         "last_refreshed_at": now, "last_error": "",
+                     })
++        # Reuse already-existing invite links during a normal inventory scan, but
++        # do not create new invite links as a side effect. The explicit
++        # «Обновить ссылки» action may create a missing link when rights allow it.
++        if union:
++            await self._refresh_channel_links_async(list(union), create_missing=False, show_message=False)
+         self.ui_call(self.refresh_channels_from_cache)
+         self.ui_call(lambda: messagebox.showinfo(APP_NAME, f"Инвентаризация завершена. В кэше: {len(self.state_db.channels_all())} каналов/групп."))
+ 
+@@ -2329,6 +2528,7 @@
+         sb2 = ttk.Scrollbar(status_box, orient="vertical", command=self.account_status_tree.yview)
+         sb2.grid(row=0, column=1, sticky="ns")
+         self.account_status_tree.configure(yscrollcommand=sb2.set)
++        self._register_sortable_tree(self.account_status_tree, "accounts.status", {"speed": "speed"}, first_descending={"speed"})
+ 
+         status_buttons = ttk.Frame(status_box); status_buttons.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+         ttk.Label(status_buttons, text="Поле:").pack(side="left")
+@@ -2508,6 +2708,7 @@
+             self.factory_history_tree.heading(col, text=headings[col])
+             self.factory_history_tree.column(col, width=widths[col], anchor="w")
+         self.factory_history_tree.grid(row=0, column=0, sticky="nsew")
++        self._register_sortable_tree(self.factory_history_tree, "factory.history")
+         hist_sb = ttk.Scrollbar(history, orient="vertical", command=self.factory_history_tree.yview)
+         hist_sb.grid(row=0, column=1, sticky="ns")
+         self.factory_history_tree.configure(yscrollcommand=hist_sb.set)
+@@ -3445,6 +3646,7 @@
+         self.upload_tree.heading("account", text="Аккаунт")
+         self.upload_tree.heading("size", text="Размер")
+         self.upload_tree.heading("progress", text="Прогресс")
++        self._register_sortable_tree(self.upload_tree, "uploads.files", {"size": "bytes", "progress": "percent"})
+         self.upload_tree.column("#0", width=430, minwidth=180)
+         self.upload_tree.column("status", width=150, anchor="w")
+         self.upload_tree.column("account", width=170, anchor="w")
+@@ -3558,6 +3760,7 @@
+         self.safety_health_tree.column("floods", width=75, minwidth=60, anchor="center")
+         self.safety_health_tree.column("errors", width=70, minwidth=55, anchor="center")
+         self.safety_health_tree.column("reason", width=410, minwidth=180)
++        self._register_sortable_tree(self.safety_health_tree, "safety.health", {"floods": "number", "errors": "number"})
+         self.safety_health_tree.grid(row=0, column=0, sticky="ew")
+         ttk.Button(health_box, text="Обновить", command=self.refresh_safety_health_table).grid(row=1, column=0, sticky="w", pady=(7, 0))
+ 
+@@ -3745,6 +3948,9 @@
+             ):
+                 tree.heading(key, text=label); tree.column(key, width=width, stretch=key == "name")
+             tree.grid(row=0, column=0, sticky="nsew")
++        stat_types = {"files": "number", "bytes": "bytes", "success": "number", "failed": "number", "rate": "percent", "speed": "speed"}
++        self._register_sortable_tree(self.stats_accounts_tree, "statistics.accounts", stat_types, first_descending={"bytes", "speed"})
++        self._register_sortable_tree(self.stats_tasks_tree, "statistics.tasks", stat_types, first_descending={"bytes", "speed"})
+         self.refresh_statistics()
+ 
+     def refresh_statistics(self) -> None:

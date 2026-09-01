@@ -1,0 +1,28 @@
+--- a/app/tests/test_0003_sorting.py
++++ b/app/tests/test_0003_sorting.py
+@@ -0,0 +1,25 @@
++import unittest
++from datetime import datetime
++
++from tam_core.table_sort import natural_key, typed_sort_key
++
++
++class Sorting0003Tests(unittest.TestCase):
++    def test_natural_text_orders_embedded_numbers_numerically(self):
++        values = ["VIP 10", "VIP 2", "VIP 1"]
++        self.assertEqual(sorted(values, key=natural_key), ["VIP 1", "VIP 2", "VIP 10"])
++
++    def test_typed_numeric_bytes_speed_percent_duration_and_datetime(self):
++        self.assertLess(typed_sort_key("9", "number"), typed_sort_key("10", "number"))
++        self.assertLess(typed_sort_key("950 МБ", "bytes"), typed_sort_key("1.2 ГБ", "bytes"))
++        self.assertLess(typed_sort_key("2 МБ/с", "speed"), typed_sort_key("12 МБ/с", "speed"))
++        self.assertLess(typed_sort_key("9.5%", "percent"), typed_sort_key("80%", "percent"))
++        self.assertLess(typed_sort_key("2м 05с", "duration"), typed_sort_key("1ч 00м", "duration"))
++        self.assertLess(typed_sort_key("01.09.2026 12:00", "datetime"), typed_sort_key("01.09.2026 13:00", "datetime"))
++
++    def test_missing_values_sort_after_real_values(self):
++        self.assertLess(typed_sort_key("10", "number"), typed_sort_key("—", "number"))
++
++
++if __name__ == "__main__":
++    unittest.main()

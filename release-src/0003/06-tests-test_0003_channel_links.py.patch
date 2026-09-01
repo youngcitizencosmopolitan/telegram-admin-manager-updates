@@ -1,0 +1,37 @@
+--- a/app/tests/test_0003_channel_links.py
++++ b/app/tests/test_0003_channel_links.py
+@@ -0,0 +1,34 @@
++import time
++import unittest
++from types import SimpleNamespace
++
++from tam_core.channel_links import pick_active_invite_link, relation_can_manage_invites
++
++
++class ChannelLinks0003Tests(unittest.TestCase):
++    def test_active_invite_prefers_permanent_link(self):
++        now = time.time()
++        invites = [
++            SimpleNamespace(link="https://t.me/+temporary", revoked=False, expire_date=now + 3600, usage_limit=None, usage=0, date=now),
++            SimpleNamespace(link="https://t.me/+permanent", revoked=False, expire_date=None, usage_limit=None, usage=0, date=now - 100),
++        ]
++        self.assertEqual(pick_active_invite_link(invites, now=now), "https://t.me/+permanent")
++
++    def test_revoked_expired_and_exhausted_invites_are_rejected(self):
++        now = time.time()
++        invites = [
++            SimpleNamespace(link="a", revoked=True, expire_date=None, usage_limit=None, usage=0, date=now),
++            SimpleNamespace(link="b", revoked=False, expire_date=now - 1, usage_limit=None, usage=0, date=now),
++            SimpleNamespace(link="c", revoked=False, expire_date=None, usage_limit=2, usage=2, date=now),
++        ]
++        self.assertEqual(pick_active_invite_link(invites, now=now), "")
++
++    def test_owner_or_admin_with_invite_users_can_manage_links(self):
++        self.assertTrue(relation_can_manage_invites({"relation": "owner", "rights": {}}))
++        self.assertTrue(relation_can_manage_invites({"relation": "admin", "rights": {"invite_users": True}}))
++        self.assertFalse(relation_can_manage_invites({"relation": "admin", "rights": {"invite_users": False}}))
++        self.assertFalse(relation_can_manage_invites({"relation": "member", "rights": {"invite_users": True}}))
++
++
++if __name__ == "__main__":
++    unittest.main()

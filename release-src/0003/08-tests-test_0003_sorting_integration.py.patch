@@ -1,0 +1,25 @@
+--- a/app/tests/test_0003_sorting_integration.py
++++ b/app/tests/test_0003_sorting_integration.py
+@@ -0,0 +1,22 @@
++import unittest
++from pathlib import Path
++
++
++class SortingIntegration0003Tests(unittest.TestCase):
++    def test_batch_and_x_tables_register_shared_sorting(self):
++        batch = Path("batch_uploader.py").read_text(encoding="utf-8")
++        xui = Path("tam_x/ui.py").read_text(encoding="utf-8")
++        for table_id in ("batch.queue", "monitor.rules", "monitor.activity"):
++            self.assertIn(table_id, batch)
++        for table_id in ("x.accounts", "x.jobs", "x.windows"):
++            self.assertIn(table_id, xui)
++
++    def test_existing_batch_task_and_activity_sort_is_persisted(self):
++        batch = Path("batch_uploader.py").read_text(encoding="utf-8")
++        self.assertIn("batch.tasks", batch)
++        self.assertIn("batch.activity", batch)
++        self.assertIn("table_sort", batch)
++
++
++if __name__ == "__main__":
++    unittest.main()
