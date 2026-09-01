@@ -1,0 +1,30 @@
+--- a/app/tests/test_0002_ui_contract.py
++++ b/app/tests/test_0002_ui_contract.py
+@@ -0,0 +1,27 @@
++import unittest
++from pathlib import Path
++
++
++class UIContract0002Tests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.source = Path("telegram_admin_manager.py").read_text(encoding="utf-8")
++        cls.batch = Path("batch_uploader.py").read_text(encoding="utf-8")
++
++    def test_account_center_and_statistics_are_present(self):
++        self.assertIn("Центр состояния и использования аккаунтов", self.source)
++        self.assertIn('text="Статистика"', self.source)
++        self.assertIn("Файлы 2–4 ГБ", self.source)
++
++    def test_monitoring_has_preflight_action(self):
++        self.assertIn('text="Preflight"', self.batch)
++        self.assertIn("def run_preflight", self.batch)
++
++    def test_channels_have_multi_select_management_actions(self):
++        self.assertIn('selectmode="extended"', self.source)
++        for label in ("Вступить выбранными", "Сделать админами", "Изменить права…", "Снять админа", "Выйти из каналов"):
++            self.assertIn(label, self.source)
++
++
++if __name__ == "__main__":
++    unittest.main()

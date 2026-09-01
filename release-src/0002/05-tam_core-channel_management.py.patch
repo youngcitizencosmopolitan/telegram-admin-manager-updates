@@ -1,0 +1,43 @@
+--- a/app/tam_core/channel_management.py
++++ b/app/tam_core/channel_management.py
+@@ -0,0 +1,40 @@
++from __future__ import annotations
++
++from typing import Any
++
++from .account_usage import usage_allows
++
++
++def eligible_channel_sessions(
++    sessions: list[str],
++    *,
++    usage_by_session: dict[str, dict[str, Any]],
++    restricted_sessions: set[str],
++    flood_seconds: dict[str, int | float],
++) -> tuple[list[str], dict[str, str]]:
++    eligible: list[str] = []
++    skipped: dict[str, str] = {}
++    for session in sessions:
++        s = str(session)
++        if not usage_allows(usage_by_session.get(s), "channels"):
++            skipped[s] = "отключён для управления каналами"
++        elif s in restricted_sessions:
++            skipped[s] = "ограничен Telegram"
++        elif float(flood_seconds.get(s, 0) or 0) > 0:
++            skipped[s] = "FloodWait"
++        else:
++            eligible.append(s)
++    return eligible, skipped
++
++
++def choose_controller_session(relations: list[dict[str, Any]], allowed_sessions: set[str]) -> str | None:
++    allowed = {str(x) for x in allowed_sessions}
++    for relation in relations:
++        session = str(relation.get("session", ""))
++        if session in allowed and str(relation.get("relation", "")) == "owner":
++            return session
++    for relation in relations:
++        session = str(relation.get("session", ""))
++        if session in allowed and bool(relation.get("can_add_admins", False)):
++            return session
++    return None

@@ -1,0 +1,128 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -10,7 +10,7 @@
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 7
++SCHEMA_VERSION = 9
+ 
+ 
+ class StateDatabase:
+@@ -197,6 +197,30 @@
+                     updated_at REAL NOT NULL
+                 );
+ 
++                CREATE TABLE IF NOT EXISTS account_usage (
++                    session TEXT PRIMARY KEY,
++                    payload_json TEXT NOT NULL,
++                    updated_at REAL NOT NULL
++                );
++
++                CREATE TABLE IF NOT EXISTS transfer_stats (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    created_at REAL NOT NULL,
++                    session TEXT NOT NULL,
++                    account_label TEXT,
++                    task TEXT,
++                    target TEXT,
++                    path TEXT,
++                    size INTEGER NOT NULL DEFAULT 0,
++                    duration REAL NOT NULL DEFAULT 0,
++                    success INTEGER NOT NULL DEFAULT 0,
++                    error TEXT
++                );
++                CREATE INDEX IF NOT EXISTS idx_transfer_stats_created
++                    ON transfer_stats(created_at);
++                CREATE INDEX IF NOT EXISTS idx_transfer_stats_session
++                    ON transfer_stats(session, created_at);
++
+                 CREATE TABLE IF NOT EXISTS events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     created_at REAL NOT NULL,
+@@ -827,6 +851,85 @@
+             else:
+                 conn.execute("DELETE FROM created_groups WHERE id=?", (str(group_id),))
+ 
++
++    # ---------- account usage ----------
++    def account_usage_get(self, session: str) -> dict[str, Any]:
++        from .account_usage import normalize_account_usage
++        with self.session() as conn:
++            row = conn.execute("SELECT payload_json FROM account_usage WHERE session=?", (str(session),)).fetchone()
++        payload: dict[str, Any] = {}
++        if row:
++            try:
++                obj = json.loads(row[0])
++                if isinstance(obj, dict):
++                    payload = dict(obj)
++            except Exception:
++                pass
++        out = normalize_account_usage(payload)
++        out["session"] = str(session)
++        return out
++
++    def account_usage_set(self, session: str, payload: dict[str, Any]) -> None:
++        from .account_usage import normalize_account_usage
++        data = normalize_account_usage(payload)
++        data["session"] = str(session)
++        with self.session() as conn:
++            conn.execute(
++                "INSERT INTO account_usage(session, payload_json, updated_at) VALUES(?, ?, ?) "
++                "ON CONFLICT(session) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at",
++                (str(session), json.dumps(data, ensure_ascii=False), time.time()),
++            )
++
++    def account_usage_all(self) -> list[dict[str, Any]]:
++        from .account_usage import normalize_account_usage
++        out: list[dict[str, Any]] = []
++        with self.session() as conn:
++            rows = conn.execute("SELECT session, payload_json FROM account_usage ORDER BY session").fetchall()
++        for row in rows:
++            try:
++                obj = json.loads(row["payload_json"])
++                payload = normalize_account_usage(obj if isinstance(obj, dict) else {})
++            except Exception:
++                payload = normalize_account_usage({})
++            payload["session"] = str(row["session"])
++            out.append(payload)
++        return out
++
++    # ---------- transfer statistics ----------
++    def transfer_stat_record(
++        self, *, session: str, account_label: str, task: str, target: str, path: str,
++        size: int, duration: float, success: bool, error: str = "", created_at: float | None = None,
++    ) -> None:
++        stamp = time.time() if created_at is None else float(created_at)
++        with self.session() as conn:
++            conn.execute(
++                "INSERT INTO transfer_stats(created_at, session, account_label, task, target, path, size, duration, success, error) "
++                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                (stamp, str(session), str(account_label), str(task), str(target), str(path), max(0, int(size or 0)),
++                 max(0.0, float(duration or 0)), 1 if success else 0, str(error or "")),
++            )
++
++    def transfer_stats_query(self, *, since: float | None = None, limit: int = 100000) -> list[dict[str, Any]]:
++        sql = "SELECT created_at, session, account_label, task, target, path, size, duration, success, error FROM transfer_stats"
++        params: list[Any] = []
++        if since is not None:
++            sql += " WHERE created_at>=?"
++            params.append(float(since))
++        sql += " ORDER BY id DESC LIMIT ?"
++        params.append(max(1, int(limit)))
++        with self.session() as conn:
++            rows = conn.execute(sql, params).fetchall()
++        return [
++            {
++                "created_at": float(r["created_at"]), "session": str(r["session"]),
++                "account_label": str(r["account_label"] or ""), "task": str(r["task"] or ""),
++                "target": str(r["target"] or ""), "path": str(r["path"] or ""),
++                "size": int(r["size"] or 0), "duration": float(r["duration"] or 0),
++                "success": bool(r["success"]), "error": str(r["error"] or ""),
++            }
++            for r in reversed(rows)
++        ]
++
+     # ---------- event log ----------
+     def record_event(
+         self,

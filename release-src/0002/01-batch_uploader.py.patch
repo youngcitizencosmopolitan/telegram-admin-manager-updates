@@ -1,0 +1,220 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -8,11 +8,12 @@
+ import threading
+ import time
+ import uuid
+-from pathlib import Path
++from pathlib import Path, PureWindowsPath
+ from typing import Any
+ 
+ from video_preview import PreviewError, make_video_thumbnail
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind as _media_kind
++from tam_core.preflight import build_preflight_report, format_preflight_report
+ from tam_core.telegram_limits import (
+     UPLOAD_FLOOD_SLEEP_THRESHOLD,
+     is_premium_upload_wait,
+@@ -485,6 +486,7 @@
+         self.monitor_btn = ttk.Button(top, text="👁 Включить мониторинг", command=self.toggle_monitoring)
+         self.monitor_btn.pack(side="left", padx=(16, 5))
+         ttk.Button(top, text="Обновить список", command=self.refresh_monitor_tab).pack(side="left", padx=5)
++        ttk.Button(top, text="Preflight", command=self.run_preflight).pack(side="left", padx=5)
+         self.monitor_state_var = tk.StringVar(value="Остановлен")
+         ttk.Label(top, textvariable=self.monitor_state_var, font=("Segoe UI", 10, "bold")).pack(side="right")
+ 
+@@ -561,6 +563,7 @@
+         self.monitor_btn = ttk.Button(top, text="👁 Включить мониторинг", command=self.toggle_monitoring)
+         self.monitor_btn.pack(side="left", padx=(16, 5))
+         ttk.Button(top, text="Обновить", command=lambda: self.refresh_monitor_tab(force=True)).pack(side="left", padx=5)
++        ttk.Button(top, text="Preflight", command=self.run_preflight).pack(side="left", padx=5)
+         self.monitor_state_var = tk.StringVar(value="Остановлен")
+         ttk.Label(top, textvariable=self.monitor_state_var, font=("Segoe UI", 10, "bold")).pack(side="right")
+ 
+@@ -661,6 +664,63 @@
+         self.activity_rows = {}
+         self.activity_paths = {}
+ 
++    def run_preflight(self) -> None:
++        rules = self.monitor_rules()
++        selected = self._monitor_selected_tid()
++        if selected:
++            chosen = [r for r in rules if str(r.get("id", "")) == selected]
++        else:
++            chosen = [r for r in rules if bool(r.get("monitor_folder", False))]
++        if not chosen:
++            messagebox.showinfo("Telegram Admin Manager", "Нет выбранного или включённого правила для Preflight.", parent=self.app)
++            return
++        tasks = [self._monitor_task_for_queue(r) for r in chosen]
++        file_rows: list[dict[str, Any]] = []
++        scan_warnings: list[str] = []
++        for task in tasks:
++            try:
++                files, _total = self._scan_task_files(task)
++                for path in files:
++                    try:
++                        file_rows.append({"task_id": str(task.get("id", "")), "size": int(path.stat().st_size)})
++                    except OSError:
++                        scan_warnings.append(f"{task.get('name', 'Правило')}: файл недоступен: {path.name}")
++            except Exception as exc:
++                scan_warnings.append(f"{task.get('name', 'Правило')}: {exc}")
++        accounts = self.app.store.accounts()
++        usage = {a.session: self.app.account_usage(a.session) for a in accounts}
++        restricted = {a.session for a in accounts if self.app.account_is_restricted(a.session)}
++        now = time.time()
++        flood: dict[str, int] = {}
++        for a in accounts:
++            try:
++                until = float(self.app.state_db.get_meta("admin_flood_until:" + a.session, 0) or 0)
++                flood[a.session] = max(0, int(until - now + 0.999))
++            except Exception:
++                flood[a.session] = 0
++        task_rows: list[dict[str, Any]] = []
++        for task in tasks:
++            sessions = list(self._effective_task_sessions(task, {a.session: a for a in accounts}))
++            task_rows.append({**task, "sessions": sessions, "use_all_accounts": False})
++        report = build_preflight_report(
++            tasks=task_rows,
++            accounts=[{"session": a.session, "premium": bool(a.premium)} for a in accounts],
++            usage_by_session=usage, restricted_sessions=restricted, flood_seconds=flood, file_rows=file_rows,
++        )
++        report["warnings"].extend(scan_warnings)
++        # Cached target/admin readiness is advisory: no Telegram write/read bursts here.
++        for task in tasks:
++            target = str(task.get("target", "") or "")
++            if not target:
++                report["warnings"].append(f"{task.get('name', 'Правило')}: не указан канал/группа.")
++                continue
++            cached = self.app.group_state_cache.entry(target)
++            if bool(task.get("auto_admin", True)) and not (cached.get("controller_session") or cached.get("admin_sessions")):
++                report["warnings"].append(f"{task.get('name', 'Правило')}: права/контроллер не подтверждены кэшем; будут проверены при запуске.")
++        text = format_preflight_report(report)
++        self.app.log("Preflight:\n" + text.replace("\n", " | "))
++        messagebox.showinfo("Telegram Admin Manager — Preflight", text, parent=self.app)
++
+     def _save_cache_ttl(self) -> None:
+         if not hasattr(self, "cache_ttl_var"):
+             return
+@@ -1133,11 +1193,36 @@
+         except Exception:
+             pass
+ 
+-    @staticmethod
+-    def _effective_task_sessions(task: dict[str, Any], accounts_by_session: dict[str, Any]) -> list[str]:
++    def _effective_task_sessions(self, task: dict[str, Any], accounts_by_session: dict[str, Any]) -> list[str]:
+         if bool(task.get("use_all_accounts", True)):
+-            return list(accounts_by_session.keys())
+-        return [s for s in task.get("account_sessions", []) or [] if s in accounts_by_session]
++            requested = list(accounts_by_session.keys())
++        else:
++            requested = [s for s in task.get("account_sessions", []) or [] if s in accounts_by_session]
++        capability = "monitoring" if bool(task.get("monitor_folder", False)) else "uploads"
++        return [s for s in requested if self.app.account_usage_allows(s, capability)]
++
++    def account_runtime_snapshot(self) -> dict[str, dict[str, Any]]:
++        out: dict[str, dict[str, Any]] = {}
++        for state in getattr(self, "task_states", {}).values():
++            task_name = str(state.get("name", "") or "")
++            target = str(state.get("target", "") or "")
++            active = state.get("active") if isinstance(state.get("active"), dict) else {}
++            for transfer in active.values():
++                if not isinstance(transfer, dict):
++                    continue
++                session = str(transfer.get("session", "") or "")
++                if not session:
++                    continue
++                path = str(transfer.get("path", "") or "")
++                out[session] = {
++                    "task": task_name,
++                    "target": target,
++                    "file": (PureWindowsPath(path).name if "\\" in path else Path(path).name) if path else "",
++                    "speed": float(transfer.get("speed", 0) or 0),
++                    "current": int(transfer.get("current", 0) or 0),
++                    "size": int(transfer.get("size", 0) or 0),
++                }
++        return out
+ 
+     def _patch_task(self, tid: str, **fields: Any) -> None:
+         tasks = self.tasks()
+@@ -2757,8 +2842,12 @@
+                     me = await client.get_me()
+                     is_premium = bool(getattr(me, "premium", False))
+                     clients[session] = (account, client)
+-                    premium_by_session[session] = is_premium
+-                    self.app.log(f"Пакет: {account.display} подключён — {'Premium' if is_premium else 'обычный'}")
++                    large_ok = self.app.account_usage_allows(session, "large_files")
++                    premium_by_session[session] = bool(is_premium and large_ok)
++                    premium_text = "Premium" if is_premium else "обычный"
++                    if is_premium and not large_ok:
++                        premium_text += " (2–4 ГБ отключены)"
++                    self.app.log(f"Пакет: {account.display} подключён — {premium_text}")
+                 except Exception as exc:
+                     friendly = self.app._friendly_error(exc)
+                     h = self.account_health.setdefault(session, {})
+@@ -3320,6 +3409,7 @@
+ 
+         state = {
+             "name": name,
++            "target": str(task_target),
+             "total_bytes": total_bytes,
+             "total_files": total_files,
+             "processed_bytes": 0,
+@@ -3540,7 +3630,7 @@
+ 
+                         transfer = {
+                             "current": 0, "size": size, "speed": 0.0, "last_current": 0,
+-                            "last_time": time.monotonic(), "session": session,
++                            "last_time": time.monotonic(), "session": session, "path": str(path),
+                         }
+                         state["active"][key] = transfer
+                         last_ui = 0.0
+@@ -3567,6 +3657,7 @@
+                                 self._emit_task_metrics(tid)
+ 
+                         self.app.log(f"{name}: {account.display} → {path.name}: начинаю")
++                        transfer_started = time.monotonic()
+                         transient_retry_count = 0
+                         max_transient_retries = int(policy.get("upload_retries", 3) or 0)
+                         retry_base_delay = float(policy.get("retry_base_delay", 5) or 5)
+@@ -3598,6 +3689,13 @@
+                                     message = await client.send_file(entity, str(path), **send_kwargs)
+                                 message_id = getattr(message, "id", None)
+                                 self.app.upload_history.record_completed(path, history_key_for_path(path), fingerprint, account, int(message_id) if message_id else None)
++                                try:
++                                    self.app.state_db.transfer_stat_record(
++                                        session=session, account_label=account.display, task=name, target=task_target, path=str(path),
++                                        size=size, duration=max(0.001, time.monotonic() - transfer_started), success=True,
++                                    )
++                                except Exception:
++                                    pass
+                                 state["active"].pop(key, None)
+                                 state["processed_bytes"] += size
+                                 state["processed_files"] += 1
+@@ -3760,10 +3858,18 @@
+                                 state["processed_files"] += 1
+                                 state["failed"] += 1
+                                 self.app.log(f"{name}: {account.display} → {path.name}: ❌ {friendly}")
++                                attempts_total = 1 + transient_retry_count + int(file_part_requeue_cycles.get(str(path), 0))
+                                 self.app.record_upload_error(
+                                     task=name, target=task_target, path=str(path), account=account.display,
+-                                    attempts=1 + transient_retry_count + int(file_part_requeue_cycles.get(str(path), 0)), error=friendly,
++                                    attempts=attempts_total, error=friendly,
+                                 )
++                                try:
++                                    self.app.state_db.transfer_stat_record(
++                                        session=session, account_label=account.display, task=name, target=task_target, path=str(path),
++                                        size=size, duration=max(0.001, time.monotonic() - transfer_started), success=False, error=friendly,
++                                    )
++                                except Exception:
++                                    pass
+                                 self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "❌ Ошибка"))
+                                 self._emit_task_metrics(tid, force=True)
+                                 break
+@@ -3893,6 +3999,8 @@
+         }
+         active_count = len(active_sessions)
+         self.app.ui_call(lambda: self._set_dashboard(speed, processed_files, total_files, remaining, eta, failures, pct, active_count))
++        if hasattr(self.app, "_refresh_account_status_panel"):
++            self.app.ui_call(self.app._refresh_account_status_panel)
+ 
+     def _set_dashboard(self, speed: float, done_files: int, total_files: int, remaining: int, eta: float | None, failures: int, pct: float, active_count: int = 0) -> None:
+         self.total_speed_var.set(_fmt_speed(speed))

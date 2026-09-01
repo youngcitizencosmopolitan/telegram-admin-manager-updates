@@ -1,0 +1,42 @@
+--- a/app/tests/test_0002_preflight.py
++++ b/app/tests/test_0002_preflight.py
+@@ -0,0 +1,39 @@
++import unittest
++
++
++class PreflightTests(unittest.TestCase):
++    def test_report_counts_eligibility_premium_limits_and_account_blocks(self):
++        from tam_core.preflight import build_preflight_report
++        accounts = [
++            {"session": "a", "premium": False},
++            {"session": "b", "premium": True},
++            {"session": "c", "premium": True},
++        ]
++        usage = {
++            "a": {"enabled": True, "monitoring": True},
++            "b": {"enabled": True, "monitoring": True, "large_files": True},
++            "c": {"enabled": False},
++        }
++        report = build_preflight_report(
++            tasks=[{"id": "t", "name": "VIP", "sessions": ["a", "b", "c"]}],
++            accounts=accounts,
++            usage_by_session=usage,
++            restricted_sessions={"a"},
++            flood_seconds={"b": 120},
++            file_rows=[
++                {"task_id": "t", "size": 100},
++                {"task_id": "t", "size": 3 * 1024**3},
++                {"task_id": "t", "size": 5 * 1024**3},
++            ],
++        )
++        self.assertEqual(report["files_total"], 3)
++        self.assertEqual(report["files_over_2g"], 1)
++        self.assertEqual(report["files_over_4g"], 1)
++        self.assertEqual(report["restricted_accounts"], 1)
++        self.assertEqual(report["floodwait_accounts"], 1)
++        self.assertEqual(report["eligible_accounts_now"], 0)
++        self.assertTrue(any("Нет доступных аккаунтов" in w for w in report["warnings"]))
++
++
++if __name__ == "__main__":
++    unittest.main()

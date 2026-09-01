@@ -54,12 +54,16 @@ jobs:
           patches = d.get('patch_files') or ([d.get('patch_file')] if d.get('patch_file') else [])
           patches = [str(x).strip() for x in patches if str(x).strip()]
           overlays = [str(x).strip() for x in (d.get('overlay_chunks') or []) if str(x).strip()]
-          if not patches and not overlays:
-              raise SystemExit('release.json requires patch_files/patch_file or overlay_chunks')
+          bundle_chunks = [str(x).strip() for x in (d.get('patch_bundle_chunks') or []) if str(x).strip()]
+          if not patches and not overlays and not bundle_chunks:
+              raise SystemExit('release.json requires patch_files, overlay_chunks or patch_bundle_chunks')
           Path('.release-patches.txt').write_text('\n'.join(patches) + ('\n' if patches else ''), encoding='utf-8')
           Path('.release-overlay-chunks.txt').write_text('\n'.join(overlays) + ('\n' if overlays else ''), encoding='utf-8')
+          Path('.release-patch-bundle-chunks.txt').write_text('\n'.join(bundle_chunks) + ('\n' if bundle_chunks else ''), encoding='utf-8')
           if overlays and not str(d.get('overlay_sha256', '')).strip():
               raise SystemExit('release.json requires overlay_sha256 when overlay_chunks are used')
+          if bundle_chunks and not str(d.get('patch_bundle_sha256', '')).strip():
+              raise SystemExit('release.json requires patch_bundle_sha256 when patch_bundle_chunks are used')
           PY
 
       - name: Rebuild package from previous verified release
@@ -69,7 +73,7 @@ jobs:
           BASE_ZIP="TelegramAdminManager_v${BASE_VERSION}_update.zip"
           NEW_ZIP="TelegramAdminManager_v${VERSION}_update.zip"
           BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${BASE_VERSION}/${BASE_ZIP}"
-          rm -rf extracted package "$BASE_ZIP" "$NEW_ZIP" .release-overlay.zip
+          rm -rf extracted package "$BASE_ZIP" "$NEW_ZIP" .release-overlay.zip .release-patches.zip .release-patches-dir
           mkdir -p extracted package
           curl -fL --retry 3 --retry-delay 2 "$BASE_URL" -o "$BASE_ZIP"
           unzip -q "$BASE_ZIP" -d extracted
@@ -85,6 +89,29 @@ jobs:
               echo "Applying $PATCH_FILE"
               (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
             done < .release-patches.txt
+          fi
+
+          if [[ -s .release-patch-bundle-chunks.txt ]]; then
+            python3 - <<'PY'
+          import base64, hashlib, json
+          from pathlib import Path
+          release = json.loads(Path('release.json').read_text(encoding='utf-8'))
+          chunks = [Path(x) for x in release.get('patch_bundle_chunks') or []]
+          encoded = ''.join(p.read_text(encoding='utf-8').strip() for p in chunks)
+          payload = base64.b64decode(encoded, validate=True)
+          actual = hashlib.sha256(payload).hexdigest()
+          expected = str(release.get('patch_bundle_sha256', '')).strip().lower()
+          if actual != expected:
+              raise SystemExit(f'Patch bundle SHA mismatch: expected {expected}, got {actual}')
+          Path('.release-patches.zip').write_bytes(payload)
+          print('Patch bundle verified:', actual)
+          PY
+            mkdir -p .release-patches-dir
+            unzip -q .release-patches.zip -d .release-patches-dir
+            while IFS= read -r PATCH_FILE; do
+              echo "Applying bundled $PATCH_FILE"
+              (cd "$DEST" && patch -p2 --batch --forward < "$GITHUB_WORKSPACE/$PATCH_FILE")
+            done < <(find .release-patches-dir -type f -name '*.patch' | sort)
           fi
 
           if [[ -s .release-overlay-chunks.txt ]]; then
@@ -128,16 +155,10 @@ jobs:
           from pathlib import Path
           version = os.environ['VERSION']
           root = Path('package') / ('TelegramAdminManager-' + version)
-          p = root / 'telegram_admin_manager.py'
-          text = p.read_text(encoding='utf-8')
+          text = (root / 'telegram_admin_manager.py').read_text(encoding='utf-8')
           m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
           if not m or m.group(1) != version:
               raise SystemExit(f'APP_VERSION mismatch: expected {version}, got {m.group(1) if m else None}')
-          if version == '4.3.0':
-              required = [root/'tam_x'/'app.py', root/'tam_x'/'planner.py', root/'tam_x'/'store.py', root/'tests'/'test_x_planner_core.py']
-              missing = [str(x) for x in required if not x.is_file()]
-              if missing:
-                  raise SystemExit('X planner files missing from candidate: ' + ', '.join(missing))
           PY
           python3 -m compileall -q "$DEST"
           (cd "$DEST" && python3 -m unittest discover -s tests -v)
@@ -154,8 +175,6 @@ jobs:
           SHA256="$(sha256sum "$NEW_ZIP" | awk '{print $1}')"
           echo "NEW_ZIP=$NEW_ZIP" >> "$GITHUB_ENV"
           echo "SHA256=$SHA256" >> "$GITHUB_ENV"
-          echo "Package: $NEW_ZIP"
-          echo "SHA256: $SHA256"
 
       - name: Upload pull request candidate
         if: github.event_name == 'pull_request'
@@ -177,10 +196,7 @@ jobs:
           if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "v${VERSION}" "$NEW_ZIP" --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "v${VERSION}" "$NEW_ZIP" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Telegram Admin Manager v${VERSION}" \
-              --notes "$NOTES"
+            gh release create "v${VERSION}" "$NEW_ZIP" --repo "$GITHUB_REPOSITORY" --title "Telegram Admin Manager v${VERSION}" --notes "$NOTES"
           fi
 
       - name: Publish update manifest last
