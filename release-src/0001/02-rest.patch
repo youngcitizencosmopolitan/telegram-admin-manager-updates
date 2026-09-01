@@ -1,0 +1,179 @@
+--- a/TelegramAdminManager-4.3.8/tam_core/updater.py
++++ b/TelegramAdminManager-0001/tam_core/updater.py
+@@ -44,18 +44,30 @@
+     return obj
+ 
+ 
++def _is_serial_version(value: str) -> bool:
++    text = str(value or "").strip().lstrip("vV")
++    return len(text) == 4 and text.isdigit()
++
++
+ def check_for_update(current_version: str, manifest_url: str) -> Optional[UpdateInfo]:
+     if not manifest_url.strip():
+         return None
+     m = fetch_manifest(manifest_url.strip())
+-    version = str(m.get("version", "")).strip()
++    compat_version = str(m.get("version", "")).strip()
++    display_version = str(m.get("display_version", compat_version)).strip() or compat_version
+     package_url = str(m.get("package_url", "")).strip()
+     sha256 = str(m.get("sha256", "")).strip().lower()
+-    if not version or not package_url or len(sha256) != 64:
++    if not compat_version or not package_url or len(sha256) != 64:
+         raise ValueError("manifest requires version, package_url and sha256")
+-    if not is_newer(version, current_version):
++
++    # Legacy 4.x installs must compare against the compatibility version so they
++    # can cross the version-scheme bridge. Serial installs compare only the
++    # user-facing four-digit sequence, otherwise 0001 would repeatedly see
++    # 4.3.8.0001 as newer forever.
++    candidate_for_compare = display_version if _is_serial_version(current_version) else compat_version
++    if not is_newer(candidate_for_compare, current_version):
+         return None
+-    return UpdateInfo(version, package_url, sha256, str(m.get("notes", "")))
++    return UpdateInfo(display_version, package_url, sha256, str(m.get("notes", "")))
+ 
+ 
+ def download_update(info: UpdateInfo, dest: Path) -> Path:
+--- a/TelegramAdminManager-4.3.8/telegram_admin_manager.py
++++ b/TelegramAdminManager-0001/telegram_admin_manager.py
+@@ -62,7 +62,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "4.3.8"
++APP_VERSION = "0001"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+--- a/TelegramAdminManager-4.3.8/tests/test_incremental_admins_v432.py
++++ b/TelegramAdminManager-0001/tests/test_incremental_admins_v432.py
+@@ -106,7 +106,7 @@
+         import inspect
+         import telegram_admin_manager as main_app
+ 
+-        self.assertRegex(main_app.APP_VERSION, r"^\d+\.\d+\.\d+$")
++        self.assertRegex(main_app.APP_VERSION, r"^(?:\d+\.\d+\.\d+|\d{4})$")
+         ui_source = inspect.getsource(main_app.TelegramAdminManager._build_group_tab)
+         start_source = inspect.getsource(main_app.TelegramAdminManager.start_promote)
+         many_source = inspect.getsource(main_app.TelegramAdminManager._promote_many_async)
+--- a/TelegramAdminManager-4.3.8/tests/test_three_tool_ui_v431.py
++++ b/TelegramAdminManager-0001/tests/test_three_tool_ui_v431.py
+@@ -7,7 +7,7 @@
+ 
+ class PrimaryToolSpecTests(unittest.TestCase):
+     def test_release_version_is_semver(self):
+-        self.assertRegex(main_app.APP_VERSION, r"^\d+\.\d+\.\d+$")
++        self.assertRegex(main_app.APP_VERSION, r"^(?:\d+\.\d+\.\d+|\d{4})$")
+ 
+     def test_primary_launcher_exposes_exactly_three_telegram_tools(self):
+         self.assertTrue(
+--- a/TelegramAdminManager-4.3.8/tests/test_v433_flood_log_rights.py
++++ b/TelegramAdminManager-0001/tests/test_v433_flood_log_rights.py
+@@ -88,7 +88,7 @@
+ class V433IntegrationTests(unittest.TestCase):
+     def test_version_and_floodwait_path_are_incremental(self):
+         import telegram_admin_manager as app
+-        self.assertRegex(app.APP_VERSION, r"^\d+\.\d+\.\d+$")
++        self.assertRegex(app.APP_VERSION, r"^(?:\d+\.\d+\.\d+|\d{4})$")
+         source = inspect.getsource(app.TelegramAdminManager._promote_one_target_async)
+         self.assertIn('admin_flood_remaining', source)
+         self.assertIn('remember_admin_flood_wait', source)
+--- a/TelegramAdminManager-4.3.8/tests/test_x_integration_v430.py
++++ b/TelegramAdminManager-0001/tests/test_x_integration_v430.py
+@@ -6,7 +6,7 @@
+     def test_main_app_exposes_x_planner_mode_and_button(self):
+         source = Path(__file__).resolve().parents[1] / "telegram_admin_manager.py"
+         text = source.read_text(encoding="utf-8")
+-        self.assertRegex(text, r'APP_VERSION = "\d+\.\d+\.\d+"')
++        self.assertRegex(text, r'APP_VERSION = "(?:\d+\.\d+\.\d+|\d{4})"')
+         self.assertIn('"--x-planner"', text)
+         self.assertIn('text="Twitter / X"', text)
+         self.assertIn('def _open_x_planner', text)
+--- a/TelegramAdminManager-4.3.8/tests/test_0001_monitor_pipeline.py
++++ b/TelegramAdminManager-0001/tests/test_0001_monitor_pipeline.py
+@@ -0,0 +1,45 @@
++import inspect
++import unittest
++
++import batch_uploader as bu
++
++
++class MonitorPipelineTests(unittest.TestCase):
++    def _item(self, qid, source, *task_ids):
++        return {"id": qid, "source": source, "task_ids": list(task_ids)}
++
++    def test_collects_only_consecutive_monitor_items(self):
++        first = self._item("a", "Мониторинг", "t1")
++        pending = [
++            self._item("b", "Мониторинг: новые файлы", "t2"),
++            self._item("m", "Ручной запуск", "t3"),
++            self._item("c", "Мониторинг", "t4"),
++        ]
++        wave = bu._take_monitor_pipeline_wave(first, pending)
++        self.assertEqual([x["id"] for x in wave], ["a", "b"])
++        self.assertEqual([x["id"] for x in pending], ["m", "c"])
++
++    def test_overlapping_task_id_stops_pipeline_before_duplicate_snapshot(self):
++        first = self._item("a", "Мониторинг", "t1")
++        pending = [
++            self._item("b", "Мониторинг", "t2"),
++            self._item("c", "Мониторинг", "t1"),
++            self._item("d", "Мониторинг", "t4"),
++        ]
++        wave = bu._take_monitor_pipeline_wave(first, pending)
++        self.assertEqual([x["id"] for x in wave], ["a", "b"])
++        self.assertEqual([x["id"] for x in pending], ["c", "d"])
++
++    def test_pipeline_contract_uses_task_release_events_and_shared_batch(self):
++        run_batch = inspect.getsource(bu.BatchUploaderPane._run_batch)
++        run_task = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        queue_worker = inspect.getsource(bu.BatchUploaderPane._queue_worker)
++        self.assertIn("pipeline: bool = False", run_batch)
++        self.assertIn("start_after", run_task)
++        self.assertIn("drained_event", run_task)
++        self.assertIn("_take_monitor_pipeline_wave", queue_worker)
++        self.assertIn("pipeline=len(wave_items) > 1", queue_worker)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/TelegramAdminManager-4.3.8/tests/test_0001_updater_serial_versions.py
++++ b/TelegramAdminManager-0001/tests/test_0001_updater_serial_versions.py
+@@ -0,0 +1,36 @@
++import unittest
++from unittest.mock import patch
++
++from tam_core import updater
++
++
++class SerialUpdaterTests(unittest.TestCase):
++    def manifest(self, compat, display):
++        return {
++            "version": compat,
++            "display_version": display,
++            "package_url": "https://example.invalid/update.zip",
++            "sha256": "a" * 64,
++            "notes": "x",
++        }
++
++    def test_legacy_438_sees_0001_bridge_as_newer(self):
++        with patch.object(updater, "fetch_manifest", return_value=self.manifest("4.3.8.0001", "0001")):
++            info = updater.check_for_update("4.3.8", "https://manifest.invalid")
++        self.assertIsNotNone(info)
++        self.assertEqual(info.version, "0001")
++
++    def test_installed_0001_does_not_loop_on_bridge_manifest(self):
++        with patch.object(updater, "fetch_manifest", return_value=self.manifest("4.3.8.0001", "0001")):
++            info = updater.check_for_update("0001", "https://manifest.invalid")
++        self.assertIsNone(info)
++
++    def test_0001_sees_0002_by_display_version(self):
++        with patch.object(updater, "fetch_manifest", return_value=self.manifest("4.3.8.0002", "0002")):
++            info = updater.check_for_update("0001", "https://manifest.invalid")
++        self.assertIsNotNone(info)
++        self.assertEqual(info.version, "0002")
++
++
++if __name__ == "__main__":
++    unittest.main()

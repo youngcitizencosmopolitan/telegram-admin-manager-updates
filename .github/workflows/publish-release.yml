@@ -42,10 +42,15 @@ jobs:
           missing = [k for k in required if not str(d.get(k, '')).strip()]
           if missing:
               raise SystemExit('release.json missing: ' + ', '.join(missing))
+          version = str(d['version']).strip()
+          manifest_version = str(d.get('manifest_version') or version).strip()
+          display_version = str(d.get('display_version') or version).strip()
           env = Path(os.environ['GITHUB_ENV'])
           with env.open('a', encoding='utf-8') as f:
-              f.write(f"VERSION={str(d['version']).strip()}\n")
+              f.write(f"VERSION={version}\n")
               f.write(f"BASE_VERSION={str(d['base_version']).strip()}\n")
+              f.write(f"MANIFEST_VERSION={manifest_version}\n")
+              f.write(f"DISPLAY_VERSION={display_version}\n")
           patches = d.get('patch_files') or ([d.get('patch_file')] if d.get('patch_file') else [])
           patches = [str(x).strip() for x in patches if str(x).strip()]
           overlays = [str(x).strip() for x in (d.get('overlay_chunks') or []) if str(x).strip()]
@@ -189,7 +194,8 @@ jobs:
           release = json.loads(Path('release.json').read_text(encoding='utf-8'))
           version = os.environ['VERSION']
           data = {
-              'version': version,
+              'version': os.environ.get('MANIFEST_VERSION', version),
+              'display_version': os.environ.get('DISPLAY_VERSION', version),
               'package_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/v{version}/TelegramAdminManager_v{version}_update.zip",
               'sha256': os.environ['SHA256'],
               'notes': str(release['notes']),
@@ -222,7 +228,8 @@ jobs:
           if expected not in names:
               raise SystemExit('Release asset missing: ' + expected)
           manifest = json.loads(Path('update.json').read_text(encoding='utf-8'))
-          assert manifest['version'] == version
+          assert manifest['version'] == os.environ.get('MANIFEST_VERSION', version)
+          assert manifest['display_version'] == os.environ.get('DISPLAY_VERSION', version)
           assert manifest['sha256'] == os.environ['SHA256']
           print('Publication verified:', version, manifest['sha256'])
           PY
