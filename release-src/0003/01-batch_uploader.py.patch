@@ -1,0 +1,101 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -14,6 +14,7 @@
+ from video_preview import PreviewError, make_video_thumbnail
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind as _media_kind
+ from tam_core.preflight import build_preflight_report, format_preflight_report
++from tam_core.table_sort import TreeviewSortController
+ from tam_core.telegram_limits import (
+     UPLOAD_FLOOD_SLEEP_THRESHOLD,
+     is_premium_upload_wait,
+@@ -179,10 +180,13 @@
+         self.activity_paths: dict[str, Path] = {}
+         self.live_tasks: dict[str, dict[str, Any]] = {}
+         self._live_task_lock = threading.RLock()
+-        self.task_sort_col: str | None = None
+-        self.task_sort_reverse = False
+-        self.activity_sort_col: str | None = None
+-        self.activity_sort_reverse = False
++        task_sort = self._load_table_sort_state("batch.tasks") or {}
++        activity_sort = self._load_table_sort_state("monitor.activity") or self._load_table_sort_state("batch.activity") or {}
++        self.task_sort_col: str | None = str(task_sort.get("column", "") or "") or None
++        self.task_sort_reverse = bool(task_sort.get("reverse", False))
++        self.activity_sort_col: str | None = str(activity_sort.get("column", "") or "") or None
++        self.activity_sort_reverse = bool(activity_sort.get("reverse", False))
++        self._tree_sort_controllers: list[TreeviewSortController] = []
+         self._last_sort_refresh = 0.0
+         self._last_dashboard_emit = 0.0
+         self.account_health: dict[str, dict[str, Any]] = {}
+@@ -210,9 +214,38 @@
+                 self._build_monitor_ui()
+         self.refresh_tasks()
+         self.refresh_monitor_tab()
++        if self.activity_sort_col and hasattr(self, "activity"):
++            self._apply_sort(self.activity, self.activity_sort_col, self.activity_sort_reverse, activity=True)
++            self._update_sort_headings(self.activity, self.activity_heading_labels, self.activity_sort_col, self.activity_sort_reverse)
+         self._restore_persistent_queue()
+ 
+     # ---------- persistence ----------
++    def _load_table_sort_state(self, table_id: str) -> dict[str, Any] | None:
++        raw = self.app.store.data.get("table_sorts", {})
++        if not isinstance(raw, dict):
++            return None
++        state = raw.get(str(table_id))
++        return dict(state) if isinstance(state, dict) else None
++
++    def _save_table_sort_state(self, table_id: str, state: dict[str, Any]) -> None:
++        raw = self.app.store.data.get("table_sorts", {})
++        table_sorts = dict(raw) if isinstance(raw, dict) else {}
++        table_sorts[str(table_id)] = {"column": str(state.get("column", "")), "reverse": bool(state.get("reverse", False))}
++        self.app.store.data["table_sorts"] = table_sorts
++        self.app.store.save()
++
++    def _register_sortable_tree(
++        self, tree: ttk.Treeview, table_id: str, column_types: dict[str, str] | None = None,
++        *, first_descending: set[str] | None = None,
++    ) -> TreeviewSortController:
++        controller = TreeviewSortController(
++            tree, table_id=table_id, column_types=column_types,
++            load_state=self._load_table_sort_state, save_state=self._save_table_sort_state,
++            first_descending=first_descending,
++        )
++        self._tree_sort_controllers.append(controller)
++        return controller
++
+     def tasks(self) -> list[dict[str, Any]]:
+         raw = self.app.store.data.get("upload_tasks", [])
+         return [dict(x) for x in raw if isinstance(x, dict)]
+@@ -419,6 +452,7 @@
+         qsb = ttk.Scrollbar(queue_frame, orient="vertical", command=self.queue_tree.yview)
+         qsb.grid(row=0, column=1, sticky="ns")
+         self.queue_tree.configure(yscrollcommand=qsb.set)
++        self._register_sortable_tree(self.queue_tree, "batch.queue", {"created": "time"})
+         qtools = ttk.Frame(queue_frame)
+         qtools.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+         self.resume_queue_btn = ttk.Button(qtools, text="▶ Продолжить очередь", command=self.resume_queue, state="disabled")
+@@ -605,6 +639,7 @@
+         msb = ttk.Scrollbar(rules_panel, orient="vertical", command=self.monitor_tree.yview)
+         msb.grid(row=0, column=1, sticky="ns")
+         self.monitor_tree.configure(yscrollcommand=msb.set)
++        self._register_sortable_tree(self.monitor_tree, "monitor.rules", {"interval": "number", "new": "number", "progress": "percent", "speed": "speed", "eta": "duration"}, first_descending={"speed"})
+         self.monitor_tree.bind("<Double-1>", lambda _e: self.edit_monitor_rule())
+         self.monitor_tree.bind("<Button-3>", self._show_monitor_context)
+ 
+@@ -1525,6 +1560,7 @@
+         )
+         self._apply_sort(self.tree, column, self.task_sort_reverse)
+         self._update_sort_headings(self.tree, self.task_heading_labels, self.task_sort_col, self.task_sort_reverse)
++        self._save_table_sort_state("batch.tasks", {"column": self.task_sort_col, "reverse": self.task_sort_reverse})
+ 
+     def _sort_activity(self, column: str) -> None:
+         self.activity_sort_col, self.activity_sort_reverse = self._next_sort_state(
+@@ -1532,6 +1568,9 @@
+         )
+         self._apply_sort(self.activity, column, self.activity_sort_reverse, activity=True)
+         self._update_sort_headings(self.activity, self.activity_heading_labels, self.activity_sort_col, self.activity_sort_reverse)
++        state = {"column": self.activity_sort_col, "reverse": self.activity_sort_reverse}
++        self._save_table_sort_state("monitor.activity", state)
++        self._save_table_sort_state("batch.activity", state)  # compatibility alias for the hidden classic table
+ 
+     def _refresh_live_sort(self) -> None:
+         now = time.monotonic()
