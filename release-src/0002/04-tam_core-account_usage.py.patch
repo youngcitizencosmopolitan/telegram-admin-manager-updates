@@ -1,0 +1,36 @@
+--- a/app/tam_core/account_usage.py
++++ b/app/tam_core/account_usage.py
+@@ -0,0 +1,33 @@
++from __future__ import annotations
++
++from typing import Any
++
++ACCOUNT_CAPABILITIES = (
++    "monitoring",
++    "groups",
++    "admins",
++    "uploads",
++    "channels",
++    "large_files",
++)
++
++
++def default_account_usage() -> dict[str, bool]:
++    return {"enabled": True, **{name: True for name in ACCOUNT_CAPABILITIES}}
++
++
++def normalize_account_usage(payload: Any) -> dict[str, bool]:
++    out = default_account_usage()
++    if isinstance(payload, dict):
++        for key in ("enabled",) + ACCOUNT_CAPABILITIES:
++            if key in payload:
++                out[key] = bool(payload.get(key))
++    return out
++
++
++def usage_allows(payload: Any, capability: str) -> bool:
++    policy = normalize_account_usage(payload)
++    if not policy["enabled"]:
++        return False
++    key = str(capability or "").strip()
++    return bool(policy.get(key, True))
