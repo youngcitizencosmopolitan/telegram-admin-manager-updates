@@ -1,0 +1,243 @@
+--- a/app/tam_core/table_sort.py
++++ b/app/tam_core/table_sort.py
+@@ -0,0 +1,240 @@
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from typing import Any, Callable
++
++_MISSING = {"", "—", "-", "нет", "none", "n/a"}
++_SIZE_UNITS = {
++    "б": 1.0, "b": 1.0,
++    "кб": 1024.0, "kb": 1024.0, "kib": 1024.0,
++    "мб": 1024.0 ** 2, "mb": 1024.0 ** 2, "mib": 1024.0 ** 2,
++    "гб": 1024.0 ** 3, "gb": 1024.0 ** 3, "gib": 1024.0 ** 3,
++    "тб": 1024.0 ** 4, "tb": 1024.0 ** 4, "tib": 1024.0 ** 4,
++}
++
++
++def natural_key(value: Any) -> tuple[Any, ...]:
++    text = str(value or "").casefold()
++    parts = re.split(r"(\d+)", text)
++    return tuple((1, int(part)) if part.isdigit() else (0, part) for part in parts if part != "")
++
++
++def _first_number(text: str) -> float | None:
++    match = re.search(r"-?\d+(?:[.,]\d+)?", text)
++    if not match:
++        return None
++    try:
++        return float(match.group(0).replace(",", "."))
++    except Exception:
++        return None
++
++
++def _human_bytes(text: str) -> float | None:
++    raw = str(text or "").strip().casefold().replace(",", ".")
++    raw = raw.replace("/с", "").replace("/s", "").strip()
++    number = _first_number(raw)
++    if number is None:
++        return None
++    unit_match = re.search(r"([a-zа-я]+)", raw)
++    if not unit_match:
++        return number
++    unit = unit_match.group(1)
++    return number * _SIZE_UNITS.get(unit, 1.0)
++
++
++def _duration_seconds(text: str) -> float | None:
++    raw = str(text or "").strip().casefold().replace(",", ".")
++    if not raw or raw in _MISSING:
++        return None
++    if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", raw):
++        parts = [int(x) for x in raw.split(":")]
++        if len(parts) == 2:
++            return float(parts[0] * 60 + parts[1])
++        return float(parts[0] * 3600 + parts[1] * 60 + parts[2])
++    total = 0.0
++    found = False
++    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(д|дн|день|дней|ч|час|часов|м|мин|с|сек)", raw):
++        found = True
++        n = float(number)
++        if unit.startswith("д"):
++            total += n * 86400
++        elif unit.startswith("ч"):
++            total += n * 3600
++        elif unit.startswith("м"):
++            total += n * 60
++        else:
++            total += n
++    if found:
++        return total
++    return _first_number(raw)
++
++
++def _datetime_value(text: str) -> float | None:
++    raw = str(text or "").strip()
++    if not raw or raw.casefold() in _MISSING:
++        return None
++    candidates = (
++        "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y",
++        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
++        "%H:%M:%S", "%H:%M",
++    )
++    for fmt in candidates:
++        try:
++            dt = datetime.strptime(raw, fmt)
++            return dt.timestamp() if "%Y" in fmt else float(dt.hour * 3600 + dt.minute * 60 + dt.second)
++        except ValueError:
++            pass
++    try:
++        return datetime.fromisoformat(raw).timestamp()
++    except Exception:
++        return None
++
++
++def typed_sort_key(value: Any, kind: str = "text") -> tuple[Any, ...]:
++    raw = str(value if value is not None else "").strip()
++    lowered = raw.casefold()
++    missing = lowered in _MISSING
++    kind = str(kind or "text").casefold()
++    parsed: Any
++    if kind in {"number", "numeric", "int", "float", "percent"}:
++        parsed = _first_number(raw)
++    elif kind in {"bytes", "size", "speed"}:
++        parsed = _human_bytes(raw)
++    elif kind in {"duration", "eta"}:
++        parsed = _duration_seconds(raw)
++    elif kind in {"datetime", "date", "time"}:
++        parsed = _datetime_value(raw)
++    else:
++        return (1 if missing else 0, natural_key(raw))
++    if parsed is None:
++        return (1, float("inf"))
++    return (0, parsed)
++
++
++class TreeviewSortController:
++    """Attach persistent, typed sorting to one ttk.Treeview.
++
++    Persistence callbacks are intentionally generic so the main app can use its
++    JSON config while the X planner can use its SQLite settings table.
++    """
++
++    def __init__(
++        self,
++        tree: Any,
++        *,
++        table_id: str,
++        column_types: dict[str, str] | None = None,
++        load_state: Callable[[str], dict[str, Any] | None] | None = None,
++        save_state: Callable[[str, dict[str, Any]], None] | None = None,
++        first_descending: set[str] | None = None,
++    ) -> None:
++        self.tree = tree
++        self.table_id = str(table_id)
++        self.column_types = dict(column_types or {})
++        self.load_state = load_state
++        self.save_state = save_state
++        self.first_descending = set(first_descending or ())
++        self._scheduled = False
++        self._labels: dict[str, str] = {}
++        self.active_column: str | None = None
++        self.reverse = False
++
++        columns = list(tree["columns"])
++        show = str(tree.cget("show") or "")
++        self.columns = (["#0"] if "tree" in show else []) + columns
++        for col in self.columns:
++            try:
++                self._labels[col] = str(tree.heading(col, "text") or col)
++            except Exception:
++                self._labels[col] = col
++
++        state = load_state(self.table_id) if load_state else None
++        if isinstance(state, dict):
++            column = str(state.get("column", "") or "")
++            if column in self.columns:
++                self.active_column = column
++                self.reverse = bool(state.get("reverse", False))
++
++        for col in self.columns:
++            tree.heading(col, text=self._labels[col], command=lambda c=col: self.toggle(c))
++        self._wrap_mutations()
++        self._update_headings()
++        self.schedule()
++
++    def _wrap_mutations(self) -> None:
++        # Treeview has no row-changed virtual event. Wrapping instance methods keeps
++        # a persisted sort active when live upload/progress rows are inserted/updated.
++        original_insert = self.tree.insert
++        original_item = self.tree.item
++        original_set = self.tree.set
++
++        def insert_wrapper(*args: Any, **kwargs: Any) -> Any:
++            result = original_insert(*args, **kwargs)
++            self.schedule()
++            return result
++
++        def item_wrapper(item: Any, option: Any = None, **kwargs: Any) -> Any:
++            result = original_item(item, option, **kwargs)
++            if kwargs:
++                self.schedule()
++            return result
++
++        def set_wrapper(item: Any, column: Any = None, value: Any = None) -> Any:
++            result = original_set(item, column, value)
++            if value is not None:
++                self.schedule()
++            return result
++
++        self.tree.insert = insert_wrapper
++        self.tree.item = item_wrapper
++        self.tree.set = set_wrapper
++
++    def _row_value(self, iid: str, column: str) -> str:
++        if column == "#0":
++            return str(self.tree.item(iid, "text") or "")
++        return str(self.tree.set(iid, column) or "")
++
++    def toggle(self, column: str) -> None:
++        if column not in self.columns:
++            return
++        if self.active_column == column:
++            self.reverse = not self.reverse
++        else:
++            self.active_column = column
++            self.reverse = column in self.first_descending
++        if self.save_state:
++            self.save_state(self.table_id, {"column": self.active_column, "reverse": self.reverse})
++        self._update_headings()
++        self.resort()
++
++    def _update_headings(self) -> None:
++        for col in self.columns:
++            label = self._labels.get(col, col)
++            if col == self.active_column:
++                label += " ▼" if self.reverse else " ▲"
++            self.tree.heading(col, text=label, command=lambda c=col: self.toggle(c))
++
++    def resort(self) -> None:
++        self._scheduled = False
++        column = self.active_column
++        if not column:
++            return
++        try:
++            rows = list(self.tree.get_children(""))
++            kind = self.column_types.get(column, "text")
++            rows.sort(key=lambda iid: typed_sort_key(self._row_value(iid, column), kind), reverse=self.reverse)
++            for index, iid in enumerate(rows):
++                self.tree.move(iid, "", index)
++        except Exception:
++            # Sorting is a UI affordance and must never break the operational path.
++            return
++
++    def schedule(self) -> None:
++        if not self.active_column or self._scheduled:
++            return
++        self._scheduled = True
++        try:
++            self.tree.after_idle(self.resort)
++        except Exception:
++            self._scheduled = False
