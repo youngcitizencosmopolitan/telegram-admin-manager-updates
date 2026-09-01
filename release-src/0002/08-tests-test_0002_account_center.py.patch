@@ -1,0 +1,28 @@
+--- a/app/tests/test_0002_account_center.py
++++ b/app/tests/test_0002_account_center.py
+@@ -0,0 +1,25 @@
++import unittest
++
++
++class AccountCenterTests(unittest.TestCase):
++    def test_runtime_snapshot_reports_active_task_target_speed_and_file(self):
++        from batch_uploader import BatchUploaderPane
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.task_states = {
++            "t1": {
++                "name": "VIP 8",
++                "target": "https://t.me/example",
++                "active": {
++                    "k": {"session": "s1", "speed": 12.5 * 1024 * 1024, "path": r"N:\\video.mp4", "current": 50, "size": 100}
++                },
++            }
++        }
++        snap = pane.account_runtime_snapshot()
++        self.assertEqual(snap["s1"]["task"], "VIP 8")
++        self.assertEqual(snap["s1"]["target"], "https://t.me/example")
++        self.assertEqual(snap["s1"]["file"], "video.mp4")
++        self.assertGreater(snap["s1"]["speed"], 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
