@@ -1,0 +1,132 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -26,6 +26,9 @@
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind
+ from tam_core.updater import check_for_update, download_update, launch_update_script, write_update_script
+ from tam_core.account_restrictions import classify_telegram_restriction
++from tam_core.account_usage import usage_allows
++from tam_core.statistics import aggregate_transfer_stats
++from tam_core.channel_management import choose_controller_session, eligible_channel_sessions
+ from tam_core.channel_inventory import observation_from_entity, relation_from_entity
+ from tam_core.telegram_limits import (
+     UPLOAD_FLOOD_SLEEP_THRESHOLD,
+@@ -62,7 +65,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0001"
++APP_VERSION = "0002"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -558,10 +561,12 @@
+         self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=12)
+         self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=12)
+         self.tab_safety = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_statistics = ttk.Frame(self.advanced_notebook, padding=12)
+         self.tab_settings = ttk.Frame(self.advanced_notebook, padding=12)
+         self.advanced_notebook.add(self.tab_accounts, text="Аккаунты")
+         self.advanced_notebook.add(self.tab_uploader, text="Быстрая загрузка")
+         self.advanced_notebook.add(self.tab_safety, text="Безопасность")
++        self.advanced_notebook.add(self.tab_statistics, text="Статистика")
+         self.advanced_notebook.add(self.tab_settings, text="Настройки API")
+ 
+         self._build_group_factory_tab()
+@@ -578,6 +583,7 @@
+         self._build_accounts_tab()
+         self._build_uploader_tab()
+         self._build_safety_tab()
++        self._build_statistics_tab()
+         self._build_settings_tab()
+ 
+         self.tab_x_main.columnconfigure(0, weight=1)
+@@ -1558,10 +1564,12 @@
+         self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=12)
+         self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=12)
+         self.tab_safety = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_statistics = ttk.Frame(self.advanced_notebook, padding=12)
+         self.tab_settings = ttk.Frame(self.advanced_notebook, padding=12)
+         self.advanced_notebook.add(self.tab_accounts, text="Аккаунты")
+         self.advanced_notebook.add(self.tab_uploader, text="Быстрая загрузка")
+         self.advanced_notebook.add(self.tab_safety, text="Безопасность")
++        self.advanced_notebook.add(self.tab_statistics, text="Статистика")
+         self.advanced_notebook.add(self.tab_settings, text="Настройки API")
+ 
+         self.log_window = tk.Toplevel(self)
+@@ -1577,6 +1585,7 @@
+         self._build_accounts_tab()
+         self._build_uploader_tab()
+         self._build_safety_tab()
++        self._build_statistics_tab()
+         self._build_settings_tab()
+ 
+     # ---------- channels inventory ----------
+@@ -1625,7 +1634,7 @@
+         detail_frame.columnconfigure(0, weight=1); detail_frame.rowconfigure(0, weight=1)
+ 
+         cols = tuple(CHANNEL_COLUMN_LABELS)
+-        self.channels_tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
++        self.channels_tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="extended")
+         for key, label in CHANNEL_COLUMN_LABELS.items():
+             self.channels_tree.heading(key, text=label)
+             width = 220 if key in {"title", "link", "owner", "admins", "members"} else 105
+@@ -1649,7 +1658,7 @@
+         self.channels_tree.bind("<Button-3>", self._channels_popup)
+ 
+         dcols = ("account", "role", "can_add", "rights", "status")
+-        self.channel_accounts_tree = ttk.Treeview(detail_frame, columns=dcols, show="headings", selectmode="browse", height=7)
++        self.channel_accounts_tree = ttk.Treeview(detail_frame, columns=dcols, show="headings", selectmode="extended", height=7)
+         for key, label, width in (
+             ("account", "Аккаунт", 220), ("role", "Роль", 120), ("can_add", "Добавляет админов", 135),
+             ("rights", "Права", 430), ("status", "Статус / ошибка", 260),
+@@ -1661,6 +1670,15 @@
+         ds.grid(row=0, column=1, sticky="ns")
+         self.channel_accounts_tree.configure(yscrollcommand=ds.set)
+ 
++        manage = ttk.Frame(detail_frame)
++        manage.grid(row=1, column=0, sticky="ew", pady=(6, 0))
++        ttk.Label(manage, text="Выдели каналы сверху и аккаунты здесь:").pack(side="left")
++        ttk.Button(manage, text="Вступить выбранными", command=self.channel_manage_join_selected).pack(side="left", padx=(8, 3))
++        ttk.Button(manage, text="Сделать админами", command=self.channel_manage_promote_selected).pack(side="left", padx=3)
++        ttk.Button(manage, text="Изменить права…", command=self.channel_manage_edit_rights_selected).pack(side="left", padx=3)
++        ttk.Button(manage, text="Снять админа", command=self.channel_manage_demote_selected).pack(side="left", padx=3)
++        ttk.Button(manage, text="Выйти из каналов", command=self.channel_manage_leave_selected).pack(side="left", padx=3)
++
+         self._channels_apply_view(save=False)
+         self.refresh_channels_from_cache()
+ 
+@@ -1690,16 +1708,25 @@
+             except Exception:
+                 pass
+ 
+-    def _channels_selected_peer_id(self) -> int | None:
++    def _channels_selected_peer_ids(self) -> list[int]:
+         if not hasattr(self, "channels_tree"):
+-            return None
+-        sel = self.channels_tree.selection()
+-        if not sel:
+-            return None
+-        try:
+-            return int(sel[0])
+-        except Exception:
+-            return None
++            return []
++        out: list[int] = []
++        for raw in self.channels_tree.selection():
++            try:
++                out.append(int(raw))
++            except Exception:
++                pass
++        return out
++
++    def _channels_selected_peer_id(self) -> int | None:
++        ids = self._channels_selected_peer_ids()
++        return ids[0] if ids else None
++
++    def _channels_selected_account_sessions(self) -> list[str]:
++        if not hasattr(self, "channel_accounts_tree"):
++            return []
++        return [str(x) for x in self.channel_accounts_tree.selection() if str(x)]
+ 
+     def _channels_copy(self, field: str) -> None:
+         peer_id = self._channels_selected_peer_id()
