@@ -1,0 +1,35 @@
+--- a/app/tests/test_0003_ui_contract.py
++++ b/app/tests/test_0003_ui_contract.py
+@@ -0,0 +1,32 @@
++import inspect
++import unittest
++from pathlib import Path
++
++import telegram_admin_manager as app
++
++
++class UIContract0003Tests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.source = Path("telegram_admin_manager.py").read_text(encoding="utf-8")
++        cls.batch = Path("batch_uploader.py").read_text(encoding="utf-8")
++        cls.xui = Path("tam_x/ui.py").read_text(encoding="utf-8")
++
++    def test_version_and_private_link_refresh_action_exist(self):
++        self.assertEqual(app.APP_VERSION, "0003")
++        source = inspect.getsource(app.TelegramAdminManager._build_channels_tab)
++        self.assertIn("Обновить ссылки", source)
++        self.assertIn("last_refreshed_at", app.CHANNEL_COLUMN_LABELS)
++
++    def test_all_ui_areas_import_shared_sort_controller(self):
++        self.assertIn("TreeviewSortController", self.source)
++        self.assertIn("TreeviewSortController", self.batch)
++        self.assertIn("TreeviewSortController", self.xui)
++
++    def test_channel_target_never_uses_no_access_placeholder(self):
++        source = inspect.getsource(app.TelegramAdminManager._channel_target_ref)
++        self.assertNotIn("link_status", source)
++
++
++if __name__ == "__main__":
++    unittest.main()
