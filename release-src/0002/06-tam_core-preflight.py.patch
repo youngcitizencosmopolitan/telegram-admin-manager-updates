@@ -1,0 +1,86 @@
+--- a/app/tam_core/preflight.py
++++ b/app/tam_core/preflight.py
+@@ -0,0 +1,83 @@
++from __future__ import annotations
++
++from typing import Any
++
++from .account_usage import usage_allows
++
++FREE_LIMIT = 2 * 1024**3
++PREMIUM_LIMIT = 4 * 1024**3
++
++
++def build_preflight_report(
++    *,
++    tasks: list[dict[str, Any]],
++    accounts: list[dict[str, Any]],
++    usage_by_session: dict[str, dict[str, Any]],
++    restricted_sessions: set[str],
++    flood_seconds: dict[str, int | float],
++    file_rows: list[dict[str, Any]],
++) -> dict[str, Any]:
++    by_session = {str(a.get("session", "")): a for a in accounts if str(a.get("session", ""))}
++    configured: set[str] = set()
++    for task in tasks:
++        sessions = task.get("sessions") or task.get("account_sessions") or []
++        if task.get("use_all_accounts", False) or not sessions:
++            configured.update(by_session)
++        else:
++            configured.update(str(s) for s in sessions if str(s) in by_session)
++
++    enabled = {s for s in configured if usage_allows(usage_by_session.get(s), "monitoring")}
++    restricted = enabled.intersection(restricted_sessions)
++    flood = {s for s in enabled if float(flood_seconds.get(s, 0) or 0) > 0}
++    eligible = enabled - restricted - flood
++    premium = {
++        s for s in eligible
++        if bool(by_session.get(s, {}).get("premium", False))
++        and usage_allows(usage_by_session.get(s), "large_files")
++    }
++
++    over_4 = sum(1 for row in file_rows if int(row.get("size", 0) or 0) > PREMIUM_LIMIT)
++    over_2 = sum(1 for row in file_rows if FREE_LIMIT < int(row.get("size", 0) or 0) <= PREMIUM_LIMIT)
++    warnings: list[str] = []
++    if not eligible:
++        warnings.append("Нет доступных аккаунтов для запуска сейчас.")
++    if over_2 and not premium:
++        warnings.append("Есть файлы 2–4 ГБ, но нет доступного Premium аккаунта, разрешённого для больших файлов.")
++    if over_4:
++        warnings.append(f"Файлы >4 ГБ будут пропущены: {over_4}.")
++
++    return {
++        "tasks": len(tasks),
++        "files_total": len(file_rows),
++        "files_over_2g": over_2,
++        "files_over_4g": over_4,
++        "configured_accounts": len(configured),
++        "enabled_accounts": len(enabled),
++        "restricted_accounts": len(restricted),
++        "floodwait_accounts": len(flood),
++        "eligible_accounts_now": len(eligible),
++        "eligible_premium_now": len(premium),
++        "warnings": warnings,
++    }
++
++
++def format_preflight_report(report: dict[str, Any]) -> str:
++    lines = [
++        f"Заданий: {int(report.get('tasks', 0))}",
++        f"Файлов: {int(report.get('files_total', 0))}",
++        f"2–4 ГБ: {int(report.get('files_over_2g', 0))}",
++        f">4 ГБ: {int(report.get('files_over_4g', 0))}",
++        f"Аккаунтов настроено: {int(report.get('configured_accounts', 0))}",
++        f"Доступно сейчас: {int(report.get('eligible_accounts_now', 0))}",
++        f"Premium доступно: {int(report.get('eligible_premium_now', 0))}",
++        f"FloodWait: {int(report.get('floodwait_accounts', 0))}",
++        f"Ограничен Telegram: {int(report.get('restricted_accounts', 0))}",
++    ]
++    warnings = [str(x) for x in report.get("warnings", []) if str(x)]
++    if warnings:
++        lines.append("")
++        lines.append("Предупреждения:")
++        lines.extend(f"• {x}" for x in warnings)
++    else:
++        lines.extend(["", "Критических предупреждений нет."])
++    return "\n".join(lines)
