@@ -1,0 +1,48 @@
+--- a/app/tests/test_0002_statistics.py
++++ b/app/tests/test_0002_statistics.py
+@@ -0,0 +1,45 @@
++import tempfile
++import time
++import unittest
++from pathlib import Path
++
++
++class StatisticsTests(unittest.TestCase):
++    def test_state_db_records_and_queries_transfer_stats(self):
++        from tam_core.state_db import StateDatabase
++        with tempfile.TemporaryDirectory() as td:
++            db = StateDatabase(Path(td) / "state.db")
++            now = time.time()
++            db.transfer_stat_record(session="s1", account_label="A", task="VIP", target="x", path="a.mp4", size=1000, duration=2.0, success=True, created_at=now)
++            db.transfer_stat_record(session="s1", account_label="A", task="VIP", target="x", path="b.mp4", size=500, duration=1.0, success=False, error="boom", created_at=now)
++            rows = db.transfer_stats_query(since=now - 5)
++            self.assertEqual(len(rows), 2)
++            self.assertEqual(sum(1 for r in rows if r["success"]), 1)
++
++    def test_aggregate_stats_builds_totals_accounts_and_tasks(self):
++        from tam_core.statistics import aggregate_transfer_stats
++        rows = [
++            {"session": "s1", "account_label": "A", "task": "VIP", "size": 1000, "duration": 2.0, "success": True},
++            {"session": "s1", "account_label": "A", "task": "VIP", "size": 500, "duration": 1.0, "success": False},
++            {"session": "s2", "account_label": "B", "task": "VIP2", "size": 2000, "duration": 4.0, "success": True},
++        ]
++        agg = aggregate_transfer_stats(rows)
++        self.assertEqual(agg["totals"]["files"], 3)
++        self.assertEqual(agg["totals"]["success"], 2)
++        self.assertEqual(agg["totals"]["failed"], 1)
++        self.assertEqual(agg["accounts"]["s1"]["bytes"], 1500)
++        self.assertAlmostEqual(agg["accounts"]["s1"]["success_rate"], 50.0)
++        self.assertIn("VIP2", agg["tasks"])
++
++
++if __name__ == "__main__":
++    unittest.main()
++
++class StatisticsIntegrationContractTests(unittest.TestCase):
++    def test_quick_uploader_records_transfer_statistics(self):
++        source = Path("telegram_admin_manager.py").read_text(encoding="utf-8")
++        start = source.index("    async def _upload_files_async(")
++        end = source.index("    # ---------- updates ----------", start)
++        body = source[start:end]
++        self.assertIn("transfer_stat_record", body)
++        self.assertIn('task="Ручная загрузка"', body)
