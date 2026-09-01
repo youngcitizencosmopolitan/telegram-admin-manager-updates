@@ -1,0 +1,61 @@
+--- a/app/tam_core/channel_links.py
++++ b/app/tam_core/channel_links.py
+@@ -0,0 +1,58 @@
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any, Iterable
++import time
++
++
++def _as_timestamp(value: Any) -> float | None:
++    if value is None:
++        return None
++    if isinstance(value, datetime):
++        return value.timestamp()
++    try:
++        return float(value)
++    except Exception:
++        return None
++
++
++def _active_invite(invite: Any, now: float) -> bool:
++    link = str(getattr(invite, "link", "") or "")
++    if not link or bool(getattr(invite, "revoked", False)):
++        return False
++    expires = _as_timestamp(getattr(invite, "expire_date", None))
++    if expires is not None and expires <= now:
++        return False
++    limit = getattr(invite, "usage_limit", None)
++    usage = getattr(invite, "usage", None)
++    try:
++        if limit is not None and int(limit) > 0 and usage is not None and int(usage) >= int(limit):
++            return False
++    except Exception:
++        pass
++    return True
++
++
++def pick_active_invite_link(invites: Iterable[Any], *, now: float | None = None) -> str:
++    current = float(time.time() if now is None else now)
++    candidates = [x for x in invites if _active_invite(x, current)]
++    if not candidates:
++        return ""
++
++    def key(invite: Any) -> tuple[int, float]:
++        # Prefer a permanent/unlimited link; within a class prefer the newest.
++        permanent = getattr(invite, "expire_date", None) is None and getattr(invite, "usage_limit", None) in (None, 0)
++        stamp = _as_timestamp(getattr(invite, "date", None)) or 0.0
++        return (1 if permanent else 0, stamp)
++
++    best = max(candidates, key=key)
++    return str(getattr(best, "link", "") or "")
++
++
++def relation_can_manage_invites(relation: dict[str, Any] | None) -> bool:
++    row = dict(relation or {})
++    role = str(row.get("relation", "") or "").casefold()
++    if role == "owner":
++        return True
++    rights = row.get("rights") if isinstance(row.get("rights"), dict) else {}
++    return role == "admin" and bool(rights.get("invite_users", False))
