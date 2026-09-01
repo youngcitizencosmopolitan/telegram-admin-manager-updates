@@ -1,0 +1,30 @@
+--- a/app/docs/superpowers/specs/2026-09-01-channel-links-and-universal-sorting-0003-design.md
++++ b/app/docs/superpowers/specs/2026-09-01-channel-links-and-universal-sorting-0003-design.md
+@@ -0,0 +1,27 @@
++# Telegram Admin Manager 0003 — Channel Links and Universal Sorting
++
++## Goal
++Make channel inventory useful for private channels by resolving invite links, and make sorting a consistent persistent behavior in every tabular list in the application.
++
++## Channel links
++- Public channels/groups use `https://t.me/<username>`.
++- Private channels/groups keep a cached invite link in `state.db` when one is available.
++- Full channel inventory may read existing invite links but must not create new links solely as a side effect of scanning.
++- `Обновить ссылки` explicitly refreshes selected/all private channel links. It first tries to reuse an active existing invite created by the current account, then may create a new invite only when that account is owner/admin with `invite_users` capability.
++- No account rotation or repeated retries to bypass Telegram restrictions. FloodWait/restriction handling remains unchanged.
++- When no eligible account can read/create a link, UI displays `Нет доступа к invite-ссылке`; this placeholder is never stored in `link` and is never used as a Telegram target.
++- Cache metadata may include link source session, link refresh timestamp and link status.
++
++## Universal sorting
++- Every `ttk.Treeview` in Telegram Admin Manager and the embedded Twitter/X planner is sortable by clicking a heading.
++- First click sorts ascending; repeated click toggles descending/ascending. Existing live-transfer behavior may keep speed-first-descending where already established, but persisted user choice wins after restart.
++- Each table persists its own sort column and direction.
++- Natural text sort must order `VIP 2` before `VIP 10`.
++- Typed sorting supports numeric, bytes, speed, percent, duration/ETA, date/time and generic text.
++- Dynamic inserts/updates must retain the active sort, not just the initial render.
++- Existing 0001/0002 upload pipeline, account controls, preflight, statistics, channel admin management, FloodWait, Telegram restrictions, FilePartMissing tail requeue, sessions and user data are preserved.
++
++## Version
++- User-visible version: `0003`.
++- Base release: `0002`.
++- Updater manifest compatibility version: `4.3.8.0003`.
