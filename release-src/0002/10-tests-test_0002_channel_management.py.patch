@@ -1,0 +1,35 @@
+--- a/app/tests/test_0002_channel_management.py
++++ b/app/tests/test_0002_channel_management.py
+@@ -0,0 +1,32 @@
++import unittest
++
++
++class ChannelManagementTests(unittest.TestCase):
++    def test_eligible_sessions_respect_capability_restriction_and_floodwait(self):
++        from tam_core.channel_management import eligible_channel_sessions
++        sessions = ["a", "b", "c", "d"]
++        usage = {
++            "a": {"enabled": True, "channels": True},
++            "b": {"enabled": True, "channels": False},
++            "c": {"enabled": True, "channels": True},
++            "d": {"enabled": True, "channels": True},
++        }
++        got, skipped = eligible_channel_sessions(
++            sessions, usage_by_session=usage, restricted_sessions={"c"}, flood_seconds={"d": 30}
++        )
++        self.assertEqual(got, ["a"])
++        self.assertEqual(set(skipped), {"b", "c", "d"})
++
++    def test_controller_selection_prefers_owner_then_add_admin(self):
++        from tam_core.channel_management import choose_controller_session
++        rels = [
++            {"session": "a", "relation": "admin", "can_add_admins": False},
++            {"session": "b", "relation": "admin", "can_add_admins": True},
++            {"session": "c", "relation": "owner", "can_add_admins": True},
++        ]
++        self.assertEqual(choose_controller_session(rels, {"a", "b", "c"}), "c")
++        self.assertEqual(choose_controller_session(rels[:2], {"a", "b"}), "b")
++
++
++if __name__ == "__main__":
++    unittest.main()
