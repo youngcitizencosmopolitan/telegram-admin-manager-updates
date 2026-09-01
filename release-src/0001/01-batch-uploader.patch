@@ -1,0 +1,375 @@
+--- a/TelegramAdminManager-4.3.8/batch_uploader.py
++++ b/TelegramAdminManager-0001/batch_uploader.py
+@@ -43,6 +43,26 @@
+     next_cycle = int(completed_cycles) + 1
+     return next_cycle if next_cycle <= FILE_PART_REQUEUE_LIMIT else None
+ 
++def _is_monitor_queue_item(item: dict[str, Any]) -> bool:
++    return str(item.get("source", "")).casefold().startswith("мониторинг")
++
++def _take_monitor_pipeline_wave(first: dict[str, Any], pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Take consecutive non-overlapping monitoring items while preserving queue order."""
++    wave = [first]
++    if not _is_monitor_queue_item(first):
++        return wave
++    seen = {str(x) for x in (first.get("task_ids", []) or []) if str(x)}
++    while pending:
++        candidate = pending[0]
++        if not _is_monitor_queue_item(candidate):
++            break
++        candidate_ids = {str(x) for x in (candidate.get("task_ids", []) or []) if str(x)}
++        if seen.intersection(candidate_ids):
++            break
++        wave.append(pending.pop(0))
++        seen.update(candidate_ids)
++    return wave
++
+ try:
+     import cryptg  # noqa: F401
+     CRYPTG_AVAILABLE = True
+@@ -176,6 +196,7 @@
+         # scans folders and adds work here, so it never monopolizes the UI.
+         self.pending_batches: list[dict[str, Any]] = []
+         self.current_batch_id: str | None = None
++        self.current_batch_ids: set[str] = set()
+         self.current_batch_source: str = ""
+         self.queue_worker_active = False
+         self.queue_halt_requested = False
+@@ -2271,9 +2292,10 @@
+     def _refresh_queue_status(self) -> None:
+         with self._queue_lock:
+             pending = len(self.pending_batches)
+-        current = 1 if self.current_batch_id else 0
++        current_ids = getattr(self, "current_batch_ids", set())
++        current = len(current_ids) if current_ids else (1 if self.current_batch_id else 0)
+         if current:
+-            text = f"Выполняется 1 · ожидает {pending}"
++            text = f"Выполняется {current} · ожидает {pending}"
+         elif pending:
+             text = f"Ожидает {pending}"
+         else:
+@@ -2290,7 +2312,7 @@
+         if not sel:
+             return
+         qid = sel[0]
+-        if qid == self.current_batch_id:
++        if qid == self.current_batch_id or qid in getattr(self, "current_batch_ids", set()):
+             messagebox.showinfo(
+                 "Telegram Admin Manager",
+                 "Текущий элемент уже выполняется. Используй «Стоп текущего / очередь на паузу».",
+@@ -2408,47 +2430,76 @@
+             with self._queue_lock:
+                 if not self.pending_batches:
+                     break
+-                item = self.pending_batches.pop(0)
+-            qid = str(item.get("id", ""))
+-            self.current_batch_id = qid
+-            self.current_batch_source = str(item.get("source", ""))
+-            self._current_batch_snapshot = [item]
+-            try:
+-                self.app.store.db.queue_mark(qid, "running", item)
+-            except Exception:
+-                pass
+-            self.app.ui_call(lambda q=qid: self._set_queue_row(q, "Выполняется"))
++                first_item = self.pending_batches.pop(0)
++                wave_items = _take_monitor_pipeline_wave(first_item, self.pending_batches)
++
++            self.current_batch_id = str(first_item.get("id", ""))
++            self.current_batch_ids = {str(x.get("id", "")) for x in wave_items if str(x.get("id", ""))}
++            self.current_batch_source = (
++                "Мониторинг pipeline" if len(wave_items) > 1 else str(first_item.get("source", ""))
++            )
++            self._current_batch_snapshot = list(wave_items)
++            for queued_item in wave_items:
++                qid = str(queued_item.get("id", ""))
++                try:
++                    self.app.store.db.queue_mark(qid, "running", queued_item)
++                except Exception:
++                    pass
++                self.app.ui_call(lambda q=qid: self._set_queue_row(q, "Выполняется"))
+             self.app.ui_call(self._refresh_queue_status)
+ 
+-            # Monitoring rules are independent from legacy upload packages.
+-            # A linked package may still contain the old caption after a rule edit.
+-            from_monitor = self.current_batch_source.casefold().startswith("мониторинг")
++            # Resolve every original queue item independently, then execute all
++            # distinct monitoring tasks with one shared Telethon client pool.
+             current_map = {str(t.get("id", "")): dict(t) for t in self.tasks()}
+             monitor_map = {
+                 str(t.get("id", "")): self._monitor_task_for_queue(t)
+                 for t in self.monitor_rules()
+                 if str(t.get("id", ""))
+             }
+-            snapshot_map = {
+-                str(t.get("id", "")): dict(t)
+-                for t in (item.get("task_snapshots", []) or [])
+-                if isinstance(t, dict) and str(t.get("id", ""))
+-            }
+-            tasks = []
+-            for tid in item.get("task_ids", []):
+-                if from_monitor:
+-                    task = monitor_map.get(str(tid)) or snapshot_map.get(str(tid)) or current_map.get(str(tid))
++            tasks: list[dict[str, Any]] = []
++            task_by_id: dict[str, dict[str, Any]] = {}
++            item_task_ids: dict[str, list[str]] = {}
++            active_items: list[dict[str, Any]] = []
++            seen_task_ids: set[str] = set()
++
++            for queued_item in wave_items:
++                qid = str(queued_item.get("id", ""))
++                from_monitor = _is_monitor_queue_item(queued_item)
++                snapshot_map = {
++                    str(t.get("id", "")): dict(t)
++                    for t in (queued_item.get("task_snapshots", []) or [])
++                    if isinstance(t, dict) and str(t.get("id", ""))
++                }
++                resolved_ids: list[str] = []
++                for raw_tid in queued_item.get("task_ids", []):
++                    tid = str(raw_tid)
++                    if from_monitor:
++                        task = monitor_map.get(tid) or snapshot_map.get(tid) or current_map.get(tid)
++                    else:
++                        task = current_map.get(tid) or monitor_map.get(tid) or snapshot_map.get(tid)
++                    if task is None:
++                        continue
++                    resolved_ids.append(tid)
++                    task_by_id[tid] = dict(task)
++                    if tid not in seen_task_ids:
++                        seen_task_ids.add(tid)
++                        tasks.append(dict(task))
++                item_task_ids[qid] = resolved_ids
++                if resolved_ids:
++                    active_items.append(queued_item)
+                 else:
+-                    task = current_map.get(str(tid)) or monitor_map.get(str(tid)) or snapshot_map.get(str(tid))
+-                if task is not None:
+-                    tasks.append(dict(task))
++                    try:
++                        self.app.store.db.queue_mark(qid, "orphaned", queued_item)
++                    except Exception:
++                        pass
++                    self.app.ui_call(lambda q=qid: self._set_queue_row(q, "Пропущено: нет снимка задания"))
++                    self.current_batch_ids.discard(qid)
++
+             if not tasks:
+-                try:
+-                    self.app.store.db.queue_mark(qid, "orphaned", item)
+-                except Exception:
+-                    pass
+-                self.app.ui_call(lambda q=qid: self._set_queue_row(q, "Пропущено: нет снимка задания"))
+                 self.current_batch_id = None
++                self.current_batch_ids.clear()
++                self._current_batch_snapshot = []
++                self.app.ui_call(self._refresh_queue_status)
+                 continue
+ 
+             self.task_states = {}
+@@ -2465,55 +2516,74 @@
+ 
+             global_parallel = self._effective_global_parallel(tasks)
+             names = ", ".join(str(t.get("name", "Задание")) for t in tasks)
+-            self.app.log(f"Очередь: ▶ {names}; параллельный лимит {global_parallel}.")
++            if len(active_items) > 1:
++                self.app.log(
++                    f"Очередь: ▶ pipeline {len(active_items)} заданий — {names}; "
++                    f"параллельный лимит {global_parallel}."
++                )
++            else:
++                self.app.log(f"Очередь: ▶ {names}; параллельный лимит {global_parallel}.")
+             hard_error_ids: set[str] = set()
+             try:
+-                result = asyncio.run(self._run_batch(tasks, global_parallel, notify=bool(item.get("notify", False))))
++                result = asyncio.run(
++                    self._run_batch(
++                        tasks, global_parallel,
++                        notify=any(bool(x.get("notify", False)) for x in active_items),
++                        pipeline=len(wave_items) > 1 and all(_is_monitor_queue_item(x) for x in active_items),
++                    )
++                )
+                 hard_error_ids = result or set()
+             except Exception as exc:
+                 hard_error_ids = {str(t.get("id", "")) for t in tasks}
+                 self.app.log(f"Очередь: пакет завершился ошибкой — {self.app._friendly_error(exc)}")
+ 
+-            failed = False
+-            for task in tasks:
+-                tid = str(task.get("id", ""))
+-                state = self.task_states.get(tid, {})
+-                if tid in hard_error_ids or int(state.get("failed", 0) or 0) > 0:
+-                    failed = True
+             was_stopped = bool(self.stop_event.is_set())
+-            status = "Завершено с ошибками" if failed else ("Остановлено — можно продолжить" if was_stopped else "Готово")
+-            self.app.ui_call(lambda q=qid, st=status: self._set_queue_row(q, st))
+-            try:
+-                self.app.store.db.queue_mark(qid, "recovered" if was_stopped else ("done_with_errors" if failed else "done"), item)
+-            except Exception:
+-                pass
++            for queued_item in active_items:
++                qid = str(queued_item.get("id", ""))
++                tids = item_task_ids.get(qid, [])
++                failed = any(
++                    tid in hard_error_ids or int(self.task_states.get(tid, {}).get("failed", 0) or 0) > 0
++                    for tid in tids
++                )
++                status = "Завершено с ошибками" if failed else ("Остановлено — можно продолжить" if was_stopped else "Готово")
++                self.app.ui_call(lambda q=qid, st=status: self._set_queue_row(q, st))
++                try:
++                    self.app.store.db.queue_mark(
++                        qid,
++                        "recovered" if was_stopped else ("done_with_errors" if failed else "done"),
++                        queued_item,
++                    )
++                except Exception:
++                    pass
+ 
+-            sigs = dict(item.get("monitor_signatures", {}) or {})
+-            if sigs:
+-                for task in tasks:
+-                    tid = str(task.get("id", ""))
+-                    state = self.task_states.get(tid, {})
+-                    success = tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0 and not self.stop_event.is_set()
+-                    if success and tid in sigs:
+-                        self.monitor_last_signatures[tid] = sigs[tid]
+-                        self._persist_monitor_signature(tid, sigs[tid])
+-                        target = str(task.get("target", "")).strip()
+-                        if target:
+-                            self.monitor_prepared_targets.add(target)
+-                        runtime = self.monitor_runtime.setdefault(tid, {})
+-                        runtime["state"] = "✅ Синхронизировано"
+-                    self.monitor_pending_signatures.pop(tid, None)
++                sigs = dict(queued_item.get("monitor_signatures", {}) or {})
++                if sigs:
++                    for tid in tids:
++                        task = task_by_id.get(tid, {})
++                        state = self.task_states.get(tid, {})
++                        success = tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0 and not was_stopped
++                        if success and tid in sigs:
++                            self.monitor_last_signatures[tid] = sigs[tid]
++                            self._persist_monitor_signature(tid, sigs[tid])
++                            target = str(task.get("target", "")).strip()
++                            if target:
++                                self.monitor_prepared_targets.add(target)
++                            runtime = self.monitor_runtime.setdefault(tid, {})
++                            runtime["state"] = "✅ Синхронизировано"
++                        self.monitor_pending_signatures.pop(tid, None)
++            if any((x.get("monitor_signatures", {}) or {}) for x in active_items):
+                 self.app.ui_call(self.refresh_monitor_tab)
+ 
+             self.current_batch_id = None
++            self.current_batch_ids.clear()
+             self._current_batch_snapshot = []
+             if self.stop_event.is_set():
+-                # Keep the interrupted package in the queue. Successfully uploaded
+-                # files are already in upload history, so continuation only retries
+-                # unfinished work.
++                # Reinsert all interrupted original items in their original order.
++                # Upload history makes already-finished files idempotent on resume.
+                 with self._queue_lock:
+-                    if not any(str(x.get("id", "")) == qid for x in self.pending_batches):
+-                        self.pending_batches.insert(0, item)
++                    existing = {str(x.get("id", "")) for x in self.pending_batches}
++                    restore = [x for x in active_items if str(x.get("id", "")) not in existing]
++                    self.pending_batches[0:0] = restore
+                 self.queue_halt_requested = True
+                 self.app.ui_call(self._refresh_queue_status)
+                 break
+@@ -2611,6 +2681,7 @@
+         self.queue_worker_active = False
+         self.running = False
+         self.current_batch_id = None
++        self.current_batch_ids.clear()
+         self.current_batch_source = ""
+         with self._live_task_lock:
+             self.live_tasks = {}
+@@ -2643,7 +2714,7 @@
+         return True
+ 
+     # ---------- async engine ----------
+-    async def _run_batch(self, tasks: list[dict[str, Any]], global_parallel: int, notify: bool = True) -> set[str] | None:
++    async def _run_batch(self, tasks: list[dict[str, Any]], global_parallel: int, notify: bool = True, pipeline: bool = False) -> set[str] | None:
+         api_id, api_hash = self.app._api_credentials()
+         try:
+             self.app._admin_safety_disabled_sessions.clear()
+@@ -2725,10 +2796,22 @@
+                 f"Пакет: Premium аккаунтов {premium_count}/{len(clients)}. "
+                 "Файлы >2 ГБ маршрутизируются только на Premium; >4 ГБ пропускаются."
+             )
+-            task_coros = [
+-                self._run_one_task(task, clients, premium_by_session, account_locks, global_sem, preview_sem, scan_sem)
+-                for task in tasks
+-            ]
++            drain_events = [asyncio.Event() for _ in tasks] if pipeline else []
++
++            async def run_task(pos: int, task: dict[str, Any]):
++                start_after = drain_events[pos - 1] if pipeline and pos > 0 else None
++                drained_event = drain_events[pos] if pipeline else None
++                try:
++                    return await self._run_one_task(
++                        task, clients, premium_by_session, account_locks, global_sem, preview_sem, scan_sem,
++                        start_after=start_after, drained_event=drained_event,
++                    )
++                finally:
++                    # Never deadlock the next priority task on an early return/error.
++                    if drained_event is not None:
++                        drained_event.set()
++
++            task_coros = [run_task(pos, task) for pos, task in enumerate(tasks)]
+             results = await asyncio.gather(*task_coros, return_exceptions=True)
+             hard_errors = 0
+             hard_error_ids: set[str] = set()
+@@ -3144,6 +3227,9 @@
+         global_sem: asyncio.Semaphore,
+         preview_sem: asyncio.Semaphore,
+         scan_sem: asyncio.Semaphore,
++        *,
++        start_after: asyncio.Event | None = None,
++        drained_event: asyncio.Event | None = None,
+     ) -> None:
+         tid = str(task.get("id", ""))
+         name = str(task.get("name", "Задание"))
+@@ -3338,17 +3424,26 @@
+             except OSError:
+                 return small_queue
+ 
++        def signal_drained_if_ready() -> None:
++            if drained_event is not None and small_queue.empty() and big_queue.empty():
++                drained_event.set()
++
+         async def next_job(session: str) -> tuple[int, Path] | None:
+             if health(session).get("disabled"):
+                 return None
+             if premium_by_session.get(session, False):
+                 try:
+-                    return big_queue.get_nowait()
++                    item = big_queue.get_nowait()
++                    signal_drained_if_ready()
++                    return item
+                 except asyncio.QueueEmpty:
+                     pass
+             try:
+-                return small_queue.get_nowait()
++                item = small_queue.get_nowait()
++                signal_drained_if_ready()
++                return item
+             except asyncio.QueueEmpty:
++                signal_drained_if_ready()
+                 return None
+ 
+         async def worker(session: str) -> None:
+@@ -3680,6 +3775,16 @@
+                     if not await self._sleep_stop(delay):
+                         return
+ 
++        if start_after is not None and not start_after.is_set():
++            self.app.ui_call(lambda: self._set_task_row(tid, status="Ожидает свободные аккаунты…", speed="—", eta="—"))
++            while not self.stop_event.is_set() and not start_after.is_set():
++                try:
++                    await asyncio.wait_for(start_after.wait(), timeout=0.25)
++                except asyncio.TimeoutError:
++                    pass
++            if self.stop_event.is_set():
++                return
++
+         max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, len(sessions) + 1 + FILE_PART_REQUEUE_LIMIT)
+         for _wave in range(max_waves):
+             if self.stop_event.is_set() or (small_queue.empty() and big_queue.empty()):
