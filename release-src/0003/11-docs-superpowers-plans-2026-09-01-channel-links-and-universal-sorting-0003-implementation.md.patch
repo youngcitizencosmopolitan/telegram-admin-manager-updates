@@ -1,0 +1,59 @@
+--- a/app/docs/superpowers/plans/2026-09-01-channel-links-and-universal-sorting-0003-implementation.md
++++ b/app/docs/superpowers/plans/2026-09-01-channel-links-and-universal-sorting-0003-implementation.md
+@@ -0,0 +1,56 @@
++# Channel Links and Universal Sorting 0003 Implementation Plan
++
++> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
++
++**Goal:** Release 0003 with private-channel invite links and persistent typed sorting in every table.
++
++**Architecture:** Add pure channel-link and table-sort helpers under `tam_core`, then integrate them into the main Tk UI, batch uploader and X planner. Channel link refresh reuses connections per account and stores only real links in state; sorting uses one reusable controller with persistence callbacks.
++
++**Tech Stack:** Python 3, tkinter/ttk, SQLite, Telethon 1.44.0, unittest, GitHub Actions.
++
++**Spec:** `docs/superpowers/specs/2026-09-01-channel-links-and-universal-sorting-0003-design.md`
++
++## Global Constraints
++- Base release is exactly `0002`; visible release version is `0003`.
++- No new Telegram write calls during ordinary channel inventory solely to manufacture links.
++- Explicit `Обновить ссылки` may create an invite only for an owner/admin with invite capability.
++- Preserve all 0002 persistence and upload behavior.
++- Tests are written and observed failing before production implementation.
++
++---
++
++### Task 1: Typed sorting core
++**Files:** Create `tam_core/table_sort.py`; test `tests/test_0003_sorting.py`.
++- [ ] Write failing tests for natural text, numbers, bytes/speed, percent, ETA and date/time keys.
++- [ ] Run the focused test and verify RED because module/functions do not exist.
++- [ ] Implement `natural_key`, `typed_sort_key` and `TreeviewSortController` with persistence callbacks and coalesced re-sort on inserts/updates.
++- [ ] Run focused tests and verify GREEN.
++
++### Task 2: Private invite-link selection
++**Files:** Create `tam_core/channel_links.py`; test `tests/test_0003_channel_links.py`.
++- [ ] Write failing tests that reject revoked/expired/exhausted invites and prefer permanent active links.
++- [ ] Verify RED.
++- [ ] Implement `pick_active_invite_link` and `relation_can_manage_invites`.
++- [ ] Verify GREEN.
++
++### Task 3: Main UI integration
++**Files:** Modify `telegram_admin_manager.py`; test `tests/test_0003_ui_contract.py`.
++- [ ] Write contract tests for version 0003, `Обновить ссылки`, link status behavior and shared sort registration.
++- [ ] Verify RED.
++- [ ] Add `Обновить ссылки`, private-link refresh routines, cached link metadata, `Обновлён` channel column and shared sort controllers for all main-app tables.
++- [ ] Verify focused tests and existing channel tests.
++
++### Task 4: Monitoring and X integration
++**Files:** Modify `batch_uploader.py`, `tam_x/ui.py`; tests `tests/test_0003_sorting_integration.py`.
++- [ ] Write failing source/integration tests showing queue/monitor/X tables use shared sorting and batch task/activity sort state is persisted.
++- [ ] Verify RED.
++- [ ] Register all remaining Treeviews; bridge X planner persistence through `PlannerStore.settings`; persist existing batch task/activity sorts.
++- [ ] Verify focused tests.
++
++### Task 5: Regression and release
++**Files:** release patch bundle + `release.json`.
++- [ ] Run `python -m compileall -q .` and full `python -m unittest discover -s tests -v`.
++- [ ] Run GUI smoke under virtual display when available.
++- [ ] Rebuild patches from pristine published 0002 and re-run full suite on rebuilt 0003.
++- [ ] Open candidate PR; merge only after candidate CI rebuild/tests/ZIP are green.
++- [ ] Verify production `v0003`, `update.json`, asset digest and display version.
