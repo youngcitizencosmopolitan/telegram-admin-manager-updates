@@ -1,11 +1,11 @@
 {
-  "version": "0004",
+  "version": "0005",
   "base_version": "0004",
-  "manifest_version": "4.3.8.0004",
-  "display_version": "0004",
+  "manifest_version": "4.3.8.0005",
+  "display_version": "0005",
   "patch_bundle_chunks": [
     "release-src/0005/patch-bundle-01.b64"
   ],
-  "patch_bundle_sha256": "ad948022b9ca4e5060a4c7716a82b0676b4a1cd894a1493aba9c02fe91e6969f",
-  "notes": "0005 exact patch-context probe"
+  "patch_bundle_sha256": "230876633f174e0e187b50fe29caf21710674aee1c1b0d1a5d5ff536d74b107f",
+  "notes": "0005: monitoring, recursive scanning and forum-topic routing are independent; recursive flat uploads include root and nested media in one target and deduplicate by local source path plus content so identical files from different folders can both upload."
 }
