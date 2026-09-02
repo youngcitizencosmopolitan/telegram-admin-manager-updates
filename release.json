@@ -6,6 +6,6 @@
   "patch_bundle_chunks": [
     "release-src/0005/patch-bundle-01.b64"
   ],
-  "patch_bundle_sha256": "d610c4f45147a6ffff27d6f57ea3a0dcf5ae4a91120a593c2110b6f22fa380b5",
+  "patch_bundle_sha256": "ec49030d0e057e3c22f65047e56f25f5b219883e4d3b0af681aea05ea27a23e6",
   "notes": "0005 source probe only"
 }
