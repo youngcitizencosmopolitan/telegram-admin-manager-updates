@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0004",
-  "display_version": "0004",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0004/TelegramAdminManager_v0004_update.zip",
-  "sha256": "1b53e5fafc79e61d0275ce06efd131eed3d9cebdb01b6deebc2efadfb9bb1eb1",
-  "notes": "Telegram Admin Manager 0004\n\nЗащита от дубликатов при параллельной загрузке:\n- Перед отправкой файл атомарно резервируется по связке канал/тема + fingerprint содержимого.\n- Даже если 10 или больше аккаунтов одновременно находят одинаковые копии в разных папках, отправку получает только один worker.\n- Остальные копии не отправляются параллельно: они откладываются до результата первой попытки, а после успешной отправки помечаются как дубликаты.\n- Если первая попытка штатно завершилась ошибкой или файл был возвращён в очередь, резервация освобождается и другая копия может стать следующей попыткой.\n- При аварийном закрытии программы незавершённая резервация сохраняется в state.db. После запуска такая копия блокируется консервативно, чтобы не отправить видео повторно, если Telegram уже успел принять его до сбоя.\n- Успешная запись истории и снятие резерва выполняются в одной транзакции SQLite.\n- Дедупликация остаётся раздельной по месту назначения: одинаковое видео разрешено по одному разу в разные каналы или разные темы.\n\nСохранены функции 0001–0003: monitoring pipeline, управление аккаунтами, preflight, статистика, управление каналами и закрытыми invite-ссылками, универсальная сортировка, Premium-маршрутизация, FloodWait cooldown, persistent «Ограничен Telegram», FilePartMissingError → хвост очереди, ETA, подписи, история, пользовательские данные и сессии.\n"
+  "version": "4.3.8.0005",
+  "display_version": "0005",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0005/TelegramAdminManager_v0005_update.zip",
+  "sha256": "7ff668a21f009fc51f5e4dd66ef308c4e3794793603f168677429b37135c2254",
+  "notes": "0005: monitoring, recursive scanning and forum-topic routing are independent; recursive flat uploads include root and nested media in one target and deduplicate by local source path plus content so identical files from different folders can both upload."
 }
