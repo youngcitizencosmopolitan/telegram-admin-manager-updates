@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0005",
-  "display_version": "0005",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0005/TelegramAdminManager_v0005_update.zip",
-  "sha256": "7ff668a21f009fc51f5e4dd66ef308c4e3794793603f168677429b37135c2254",
-  "notes": "0005: monitoring, recursive scanning and forum-topic routing are independent; recursive flat uploads include root and nested media in one target and deduplicate by local source path plus content so identical files from different folders can both upload."
+  "version": "4.3.8.0006",
+  "display_version": "0006",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0006/TelegramAdminManager_v0006_update.zip",
+  "sha256": "5c4ae620deca750cea08270fd252cf543d0a745d0ff9c2f298b65eb89828e99c",
+  "notes": "0006: account monitoring eligibility can be switched off and back on live without restarting monitoring; current uploads finish safely, queued files wait for enabled accounts, and real errors are highlighted more visibly in logs and activity tables."
 }
