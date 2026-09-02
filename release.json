@@ -1,11 +1,11 @@
 {
-  "version": "0005",
-  "base_version": "0004",
-  "manifest_version": "4.3.8.0005",
-  "display_version": "0005",
+  "version": "0006",
+  "base_version": "0005",
+  "manifest_version": "4.3.8.0006",
+  "display_version": "0006",
   "patch_bundle_chunks": [
-    "release-src/0005/patch-bundle-01.b64"
+    "release-src/0006/patch-bundle-01.b64"
   ],
-  "patch_bundle_sha256": "230876633f174e0e187b50fe29caf21710674aee1c1b0d1a5d5ff536d74b107f",
-  "notes": "0005: monitoring, recursive scanning and forum-topic routing are independent; recursive flat uploads include root and nested media in one target and deduplicate by local source path plus content so identical files from different folders can both upload."
+  "patch_bundle_sha256": "760e599c4a50829e5804ecbc0622f46b1f94e049f7e5c52ad97daa2ba860b740",
+  "notes": "0006: account monitoring eligibility can be switched off and back on live without restarting monitoring; current uploads finish safely, queued files wait for enabled accounts, and real errors are highlighted more visibly in logs and activity tables."
 }
