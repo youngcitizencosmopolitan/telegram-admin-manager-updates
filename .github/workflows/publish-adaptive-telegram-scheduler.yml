@@ -1,0 +1,150 @@
+name: Publish Adaptive Telegram Scheduler release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'adaptive-telegram-scheduler/release.json'
+      - '.github/workflows/publish-adaptive-telegram-scheduler.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'adaptive-telegram-scheduler/release.json'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct verified source package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $r = Get-Content 'adaptive-telegram-scheduler/release.json' -Raw | ConvertFrom-Json
+          if (-not $r.version -or -not $r.notes -or -not $r.source_sha256) { throw 'release.json requires version, notes, source_sha256' }
+          if (-not $r.source_chunks -or @($r.source_chunks).Count -eq 0) { throw 'release.json requires source_chunks' }
+          $b64 = ''
+          foreach ($chunk in @($r.source_chunks)) {
+            if (-not (Test-Path $chunk)) { throw "Missing source chunk: $chunk" }
+            $b64 += (Get-Content $chunk -Raw).Trim()
+          }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'adaptive-telegram-scheduler-source.zip'), [Convert]::FromBase64String($b64))
+          $actual = (Get-FileHash 'adaptive-telegram-scheduler-source.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne ([string]$r.source_sha256).ToLowerInvariant()) { throw "Source SHA mismatch: expected $($r.source_sha256), got $actual" }
+          New-Item -ItemType Directory -Force -Path 'build-src\adaptive-telegram-scheduler' | Out-Null
+          Expand-Archive 'adaptive-telegram-scheduler-source.zip' -DestinationPath 'build-src\adaptive-telegram-scheduler' -Force
+          "VERSION=$($r.version)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SOURCE_DIR=$((Resolve-Path 'build-src\adaptive-telegram-scheduler').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          Push-Location $env:SOURCE_DIR
+          try {
+            pip install -e ".[dev,windows,build]"
+          } finally {
+            Pop-Location
+          }
+
+      - name: Verify source and tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:SOURCE_DIR
+          try {
+            python -m compileall -q src windows_launcher.pyw
+            if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
+            python -m pytest -q
+            if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
+            $actualVersion = python -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])"
+            if ($actualVersion.Trim() -ne $env:VERSION) { throw "Project version mismatch: expected $env:VERSION, got $actualVersion" }
+            $moduleVersion = python -c "from adaptive_tg_bot.windows_update import APP_VERSION; print(APP_VERSION)"
+            if ($moduleVersion.Trim() -ne $env:VERSION) { throw "APP_VERSION mismatch: expected $env:VERSION, got $moduleVersion" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:SOURCE_DIR
+          try {
+            python -m PyInstaller --clean --noconfirm TelegramScheduler.spec
+            if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed' }
+            $source = 'dist\Telegram Scheduler.exe'
+            if (-not (Test-Path $source)) { throw "Built EXE missing: $source" }
+            $asset = "Telegram.Scheduler.v$env:VERSION.exe"
+            Copy-Item $source $asset -Force
+            $sha = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+            "ASSET_NAME=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "ASSET_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } finally {
+            Pop-Location
+          }
+
+      - name: Create or update GitHub Release
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $r = Get-Content 'adaptive-telegram-scheduler/release.json' -Raw | ConvertFrom-Json
+          $tag = "adaptive-scheduler-v$env:VERSION"
+          $asset = Join-Path $env:SOURCE_DIR $env:ASSET_NAME
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag $asset --repo $env:GITHUB_REPOSITORY --title "Telegram Scheduler v$env:VERSION" --notes ([string]$r.notes)
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed' }
+
+      - name: Publish update manifest last
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $r = Get-Content 'adaptive-telegram-scheduler/release.json' -Raw | ConvertFrom-Json
+          $manifest = [ordered]@{
+            version = $env:VERSION
+            package_url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/adaptive-scheduler-v$env:VERSION/$env:ASSET_NAME"
+            sha256 = $env:ASSET_SHA
+            notes = [string]$r.notes
+          }
+          ($manifest | ConvertTo-Json) + "`n" | Set-Content 'adaptive-telegram-scheduler/update.json' -Encoding utf8
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add adaptive-telegram-scheduler/update.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Publish Telegram Scheduler $env:VERSION"
+            git push
+          }
+
+      - name: Verify published release and manifest
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "adaptive-scheduler-v$env:VERSION"
+          $json = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets | ConvertFrom-Json
+          $names = @($json.assets | ForEach-Object { $_.name })
+          if ($names -notcontains $env:ASSET_NAME) { throw "Missing release asset $env:ASSET_NAME" }
+          $m = Get-Content 'adaptive-telegram-scheduler/update.json' -Raw | ConvertFrom-Json
+          if ($m.version -ne $env:VERSION -or $m.sha256 -ne $env:ASSET_SHA) { throw 'Published manifest verification failed' }
