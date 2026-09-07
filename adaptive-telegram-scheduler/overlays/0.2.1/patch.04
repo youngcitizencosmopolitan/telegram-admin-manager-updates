@@ -1,0 +1,117 @@
++async def test_resolve_shared_channel_requires_publish_rights_and_returns_title():
++    bot = _FakeBot(chat_type="channel", status="administrator", can_post_messages=True, title="News")
++
++    target = await resolve_shared_chat(bot, -100123, SharedChatKind.CHANNEL)
++
++    assert target.chat_id == -100123
++    assert target.title == "News"
++    assert target.kind is SharedChatKind.CHANNEL
++
++
++async def test_resolve_shared_channel_rejects_admin_without_publish_right():
++    bot = _FakeBot(chat_type="channel", status="administrator", can_post_messages=False)
++
++    with pytest.raises(ChatRegistrationError, match="публиковать"):
++        await resolve_shared_chat(bot, -100123, SharedChatKind.CHANNEL)
++
++
++async def test_resolve_shared_group_accepts_bot_member_and_rejects_left_status():
++    member_bot = _FakeBot(chat_type="supergroup", status="member")
++    target = await resolve_shared_chat(member_bot, -100123, SharedChatKind.GROUP)
++    assert target.kind is SharedChatKind.GROUP
++
++    left_bot = _FakeBot(chat_type="group", status="left")
++    with pytest.raises(ChatRegistrationError, match="не добавлен"):
++        await resolve_shared_chat(left_bot, -100123, SharedChatKind.GROUP)
++
++
++async def test_resolve_shared_chat_rejects_mismatched_chat_type():
++    bot = _FakeBot(chat_type="group", status="member")
++    with pytest.raises(ChatRegistrationError, match="не канал"):
++        await resolve_shared_chat(bot, -100123, SharedChatKind.CHANNEL)
++
++from adaptive_tg_bot.bot.channel_handlers import register_shared_target
++
++
++class _FakeRegistrationRepo:
++    def __init__(self, existing=None):
++        self.existing = existing
++        self.created = []
++
++    async def get_or_create_user(self, telegram_user_id):
++        return SimpleNamespace(id=42, telegram_user_id=telegram_user_id)
++
++    async def get_channel_by_telegram_chat_id(self, chat_id):
++        assert chat_id == -100123
++        return self.existing
++
++    async def create_channel_target(self, owner_user_id, telegram_chat_id, title):
++        channel = SimpleNamespace(id=7, owner_user_id=owner_user_id, telegram_chat_id=telegram_chat_id, title=title)
++        self.created.append(channel)
++        return channel
++
++
++async def test_register_shared_target_creates_new_target_once():
++    repo = _FakeRegistrationRepo()
++    target = SimpleNamespace(chat_id=-100123, title="News", kind=SharedChatKind.CHANNEL)
++
++    channel, created = await register_shared_target(repo, 555, target)
++
++    assert created is True
++    assert channel.id == 7
++    assert repo.created[0].owner_user_id == 42
++    assert repo.created[0].title == "News"
++
++
++async def test_register_shared_target_returns_existing_without_duplicate():
++    existing = SimpleNamespace(id=3, telegram_chat_id=-100123, title="Already")
++    repo = _FakeRegistrationRepo(existing=existing)
++    target = SimpleNamespace(chat_id=-100123, title="News", kind=SharedChatKind.CHANNEL)
++
++    channel, created = await register_shared_target(repo, 555, target)
++
++    assert created is False
++    assert channel is existing
++    assert repo.created == []
++
++from contextlib import asynccontextmanager
++
++from adaptive_tg_bot.bot import keyboards as keyboards_module
++from adaptive_tg_bot.bot.channel_handlers import handle_shared_chat_message
++
++
++class _FakeSession:
++    def __init__(self):
++        self.commits = 0
++
++    async def commit(self):
++        self.commits += 1
++
++
++class _FakeDB:
++    def __init__(self, session):
++        self._session = session
++
++    @asynccontextmanager
++    async def session(self):
++        yield self._session
++
++
++class _FakeMessage:
++    def __init__(self, *, request_id: int, user_id: int = 555):
++        self.chat_shared = SimpleNamespace(request_id=request_id, chat_id=-100123, title="Shared title")
++        self.from_user = SimpleNamespace(id=user_id)
++        self.answers = []
++
++    async def answer(self, text, **kwargs):
++        self.answers.append((text, kwargs))
++
++
++async def test_handle_shared_chat_message_registers_channel_and_restores_main_menu(monkeypatch):
++    session = _FakeSession()
++    repo = _FakeRegistrationRepo()
++    message = _FakeMessage(request_id=CHANNEL_CHAT_REQUEST_ID)
++    bot = _FakeBot(chat_type="channel", status="administrator", can_post_messages=True, title="News")
++    monkeypatch.setattr(keyboards_module, "main_menu_keyboard", lambda: "MAIN-MENU")
++
++    channel, created = await handle_shared_chat_message(
