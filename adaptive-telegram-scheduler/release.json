@@ -1,6 +1,6 @@
 {
-  "version": "0.2.0",
-  "notes": "0.2.0: Windows launcher gains automatic GitHub Releases updates, SHA-256 verification, background checks every 6 hours, a manual tray check, an auto-update toggle, self-replacement, health verification, rollback, and bad-version blocking. Telegram bot data, token, channels, rotations, and schedules remain in AppData and are not replaced during updates.",
+  "version": "0.2.1",
+  "notes": "0.2.1: native Telegram bottom-menu buttons “➕ Добавить канал” and “➕ Добавить группу”. Telegram opens the eligible chat picker directly; it can grant the bot channel publishing rights or add the bot to a group. The bot then validates and stores the selected chat automatically. The legacy /addchannel command remains available.",
   "source_sha256": "66f3f3cc513d220fbd2d99b04ac8b5c5fe164d06d4b598d8284bdcd2c16ead20",
   "source_chunks": [
     "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.00",
@@ -21,5 +21,7 @@
     "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12a1",
     "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12a2",
     "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12b"
-  ]
+  ],
+  "overlay_sha256": "de6b0baf855a67a8021dabff4e91a285bad7b15ef31d43ca99b34679c4a225bc",
+  "overlay_b64": "adaptive-telegram-scheduler/overlays/0.2.1/overlay.zip.b64"
 }
