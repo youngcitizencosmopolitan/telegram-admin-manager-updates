@@ -1,0 +1,123 @@
++        message, bot, _FakeDB(session), repo_factory=lambda _: repo
++    )
++
++    assert created is True
++    assert channel.id == 7
++    assert session.commits == 1
++    text, kwargs = message.answers[-1]
++    assert "✅ Канал добавлен: News" in text
++    assert "Внутренний ID: 7" in text
++    assert kwargs["reply_markup"] == "MAIN-MENU"
++
++
++async def test_handle_shared_chat_message_uses_group_label_and_does_not_duplicate(monkeypatch):
++    existing = SimpleNamespace(id=3, telegram_chat_id=-100123, title="Team")
++    repo = _FakeRegistrationRepo(existing=existing)
++    session = _FakeSession()
++    message = _FakeMessage(request_id=GROUP_CHAT_REQUEST_ID)
++    bot = _FakeBot(chat_type="supergroup", status="member", title="Team")
++    monkeypatch.setattr(keyboards_module, "main_menu_keyboard", lambda: "MAIN-MENU")
++
++    channel, created = await handle_shared_chat_message(
++        message, bot, _FakeDB(session), repo_factory=lambda _: repo
++    )
++
++    assert created is False
++    assert channel is existing
++    text, kwargs = message.answers[-1]
++    assert "Группа уже добавлена" in text
++    assert kwargs["reply_markup"] == "MAIN-MENU"
++
++
++def test_channel_router_wires_chat_shared_service_message(monkeypatch):
++    aiogram = types.ModuleType("aiogram")
++    filters = types.ModuleType("aiogram.filters")
++    aiogram_types = types.ModuleType("aiogram.types")
++
++    class _F:
++        chat_shared = object()
++
++    class _Router:
++        last = None
++
++        def __init__(self, name=None):
++            self.name = name
++            self.message_handlers = []
++            _Router.last = self
++
++        def message(self, *filters_):
++            def decorator(fn):
++                self.message_handlers.append((filters_, fn))
++                return fn
++            return decorator
++
++    class _Command:
++        def __init__(self, name):
++            self.name = name
++
++    aiogram.F = _F()
++    aiogram.Router = _Router
++    filters.Command = _Command
++    aiogram_types.Message = type("Message", (), {})
++
++    monkeypatch.setitem(sys.modules, "aiogram", aiogram)
++    monkeypatch.setitem(sys.modules, "aiogram.filters", filters)
++    monkeypatch.setitem(sys.modules, "aiogram.types", aiogram_types)
++
++    from adaptive_tg_bot.bot.channel_handlers import build_router
++
++    build_router()
++
++    names = [fn.__name__ for _, fn in _Router.last.message_handlers]
++    assert "shared_chat" in names
++
++
++from adaptive_tg_bot.bot.handlers import answer_with_main_menu
++
++
++async def test_answer_with_main_menu_uses_persistent_picker_keyboard(monkeypatch):
++    message = _FakeMessage(request_id=CHANNEL_CHAT_REQUEST_ID)
++    monkeypatch.setattr(keyboards_module, "main_menu_keyboard", lambda: "MAIN-MENU")
++
++    await answer_with_main_menu(message, "Ready")
++
++    assert message.answers[-1] == ("Ready", {"reply_markup": "MAIN-MENU"})
++
++
++def test_main_menu_keyboard_serializes_with_real_aiogram_when_installed():
++    pytest.importorskip("aiogram")
++
++    markup = main_menu_keyboard()
++    payload = markup.model_dump(exclude_none=True)
++
++    channel = payload["keyboard"][0][0]["request_chat"]
++    group = payload["keyboard"][0][1]["request_chat"]
++    assert channel["chat_is_channel"] is True
++    assert channel["bot_administrator_rights"]["can_post_messages"] is True
++    assert group["chat_is_channel"] is False
++    assert group["bot_is_member"] is True
++
++
++def test_root_router_builds_with_real_aiogram_when_installed():
++    pytest.importorskip("aiogram")
++    from adaptive_tg_bot.bot.router import build_root_router
++
++    root = build_root_router()
++    assert root.name == "root"
++
++async def test_handle_shared_chat_message_uses_feminine_created_group_label(monkeypatch):
++    session = _FakeSession()
++    repo = _FakeRegistrationRepo()
++    message = _FakeMessage(request_id=GROUP_CHAT_REQUEST_ID)
++    bot = _FakeBot(chat_type="supergroup", status="member", title="Team")
++    monkeypatch.setattr(keyboards_module, "main_menu_keyboard", lambda: "MAIN-MENU")
++
++    channel, created = await handle_shared_chat_message(
++        message, bot, _FakeDB(session), repo_factory=lambda _: repo
++    )
++
++    assert created is True
++    assert channel.id == 7
++    text, kwargs = message.answers[-1]
++    assert "✅ Группа добавлена: Team" in text
++    assert kwargs["reply_markup"] == "MAIN-MENU"
