@@ -1,0 +1,7 @@
+{
+  "version": "0.2.0",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/adaptive-scheduler-v0.2.0/Telegram.Scheduler.v0.2.0.exe",
+  "sha256": "2b0ef131c74958c3ee0f205e7a00afac9fe2eeae71380dce4b4b7a66a1eeb269",
+  "notes": "0.2.0: Windows launcher gains automatic GitHub Releases updates, SHA-256 verification, background checks every 6 hours, a manual tray check, an auto-update toggle, self-replacement, health verification, rollback, and bad-version blocking. Telegram bot data, token, channels, rotations, and schedules remain in AppData and are not replaced during updates."
+}
+
