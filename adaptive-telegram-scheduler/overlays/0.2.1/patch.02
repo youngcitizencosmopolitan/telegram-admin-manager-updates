@@ -1,0 +1,88 @@
++++ b/src/adaptive_tg_bot/bot/handlers.py
+@@ -23,11 +23,15 @@
+     return value
+ 
+ 
++async def answer_with_main_menu(message, text: str):
++    await message.answer(text, reply_markup=keyboards.main_menu_keyboard())
++
++
+ def build_router():
+     from aiogram import F, Router
+     from aiogram.filters import Command
+     from aiogram.fsm.context import FSMContext
+-    from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
++    from aiogram.types import CallbackQuery, Message
+ 
+     from adaptive_tg_bot.bot.states import get_upload_states
+ 
+@@ -48,16 +52,18 @@
+     async def start(message: Message, settings: Settings):
+         if await reject_if_unauthorized(message, settings):
+             return
+-        await message.answer(
++        await answer_with_main_menu(
++            message,
+             "Адаптивный планировщик готов.\n\n"
++            "Добавь канал или группу кнопками внизу — Telegram сам откроет список доступных чатов.\n\n"
+             "Основные команды:\n"
+-            "/addchannel — добавить канал\n"
+             "/newrotation — создать ротацию\n"
+             "/upload — начать пакетную загрузку\n"
+             "/schedule — ближайшее расписание\n"
+             "/done — закончить загрузку\n"
+             "/cancel — отменить загрузку\n"
+-            "/caption текст — автоподпись текущей пачки"
++            "/caption текст — автоподпись текущей пачки\n\n"
++            "Старый способ /addchannel тоже оставлен."
+         )
+ 
+     @router.message(Command("upload"))
+@@ -70,7 +76,7 @@
+             channels = await repo.list_channels(user.id)
+             await session.commit()
+         if not channels:
+-            await message.answer("Сначала добавь канал командой /addchannel.")
++            await answer_with_main_menu(message, "Сначала добавь канал или группу кнопкой внизу.")
+             return
+         await state.clear()
+         await state.set_state(states.choosing_channel)
+@@ -286,7 +292,7 @@
+                     await UploadService(repo).cancel(upload)
+                     await session.commit()
+         await state.clear()
+-        await message.answer("❌ Загрузка отменена.", reply_markup=ReplyKeyboardRemove())
++        await answer_with_main_menu(message, "❌ Загрузка отменена.")
+ 
+     @router.callback_query(states.awaiting_rotation_choice, F.data.startswith("rotchoice:"))
+     async def choose_rotation_strategy(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings):
+@@ -309,7 +315,7 @@
+                 await state.clear()
+                 await callback.message.answer(
+                     f"✅ Цикл увеличен до {days} дней. Создано будущих публикаций: {len(created)}.",
+-                    reply_markup=ReplyKeyboardRemove(),
++                    reply_markup=keyboards.main_menu_keyboard(),
+                 )
+             else:
+                 requirement = await service.frequency_requirements(rotation_id)
+@@ -319,7 +325,7 @@
+                     await state.clear()
+                     await callback.message.answer(
+                         f"✅ Частота увеличена без нового окна. Создано публикаций: {len(created)}.",
+-                        reply_markup=ReplyKeyboardRemove(),
++                        reply_markup=keyboards.main_menu_keyboard(),
+                     )
+                 else:
+                     await state.set_state(states.awaiting_slot)
+@@ -348,7 +354,7 @@
+         await state.clear()
+         await target_message.answer(
+             f"✅ Все окна добавлены. Расписание пересчитано: {len(created)} будущих публикаций.",
+-            reply_markup=ReplyKeyboardRemove(),
++            reply_markup=keyboards.main_menu_keyboard(),
+         )
+ 
+     @router.callback_query(states.awaiting_slot, F.data.startswith("slot:"))
+@@ -397,7 +403,7 @@
+         await state.clear()
+         await callback.message.answer(
