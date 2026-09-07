@@ -42,14 +42,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'build-src\adaptive-telegram-scheduler' | Out-Null
           Expand-Archive 'adaptive-telegram-scheduler-source.zip' -DestinationPath 'build-src\adaptive-telegram-scheduler' -Force
 
-          if ($r.overlay_b64) {
-            if (-not (Test-Path ([string]$r.overlay_b64))) { throw "Missing overlay base64: $($r.overlay_b64)" }
-            $overlayText = (Get-Content ([string]$r.overlay_b64) -Raw).Trim()
-            $overlayZip = Join-Path $PWD 'adaptive-telegram-scheduler-overlay.zip'
-            [IO.File]::WriteAllBytes($overlayZip, [Convert]::FromBase64String($overlayText))
-            $overlayActual = (Get-FileHash $overlayZip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($overlayActual -ne ([string]$r.overlay_sha256).ToLowerInvariant()) { throw "Overlay SHA mismatch: expected $($r.overlay_sha256), got $overlayActual" }
-            Expand-Archive $overlayZip -DestinationPath 'build-src\adaptive-telegram-scheduler' -Force
+          if ($r.patch_chunks) {
+            $patchText = ''
+            foreach ($chunk in @($r.patch_chunks)) {
+              if (-not (Test-Path $chunk)) { throw "Missing patch chunk: $chunk" }
+              $patchText += (Get-Content $chunk -Raw)
+            }
+            $patchPath = Join-Path $PWD 'adaptive-telegram-scheduler.patch'
+            [IO.File]::WriteAllText($patchPath, $patchText, [Text.UTF8Encoding]::new($false))
+            $patchActual = (Get-FileHash $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($patchActual -ne ([string]$r.patch_sha256).ToLowerInvariant()) { throw "Patch SHA mismatch: expected $($r.patch_sha256), got $patchActual" }
+            Push-Location 'build-src\adaptive-telegram-scheduler'
+            try {
+              & git apply --whitespace=nowarn $patchPath
+              if ($LASTEXITCODE -ne 0) { throw 'git apply failed' }
+            } finally {
+              Pop-Location
+            }
           }
 
           "VERSION=$($r.version)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
