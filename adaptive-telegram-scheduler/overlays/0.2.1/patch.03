@@ -1,0 +1,120 @@
+             f"✅ Одноразовая очередь пересчитана. Запланировано: {len(created)}.",
+-            reply_markup=ReplyKeyboardRemove(),
++            reply_markup=keyboards.main_menu_keyboard(),
+         )
+         await callback.answer()
+ 
+--- a/src/adaptive_tg_bot/db/repositories.py
++++ b/src/adaptive_tg_bot/db/repositories.py
+@@ -50,6 +50,26 @@
+             self.session.add(user)
+             await self.session.flush()
+         return user
++
++    async def get_channel_by_telegram_chat_id(self, telegram_chat_id: int) -> Channel | None:
++        return await self.session.scalar(
++            select(Channel).where(Channel.telegram_chat_id == telegram_chat_id)
++        )
++
++    async def create_channel_target(
++        self, owner_user_id: int, telegram_chat_id: int, title: str
++    ) -> Channel:
++        channel = Channel(
++            owner_user_id=owner_user_id,
++            telegram_chat_id=telegram_chat_id,
++            title=title,
++        )
++        self.session.add(channel)
++        await self.session.flush()
++        self.session.add(
++            OneTimeQueueSettings(channel_id=channel.id, planning_horizon_days=90)
++        )
++        return channel
+ 
+     async def list_channels(self, owner_user_id: int) -> list[Channel]:
+         result = await self.session.scalars(
+--- /dev/null
++++ b/tests/bot/test_chat_picker.py
+@@ -0,0 +1,322 @@
++from __future__ import annotations
++
++import sys
++import types
++
++import pytest
++
++from adaptive_tg_bot.bot.channel_handlers import SharedChatKind, shared_chat_kind
++from adaptive_tg_bot.bot.keyboards import CHANNEL_CHAT_REQUEST_ID, GROUP_CHAT_REQUEST_ID, main_menu_keyboard
++
++
++class _TelegramType:
++    def __init__(self, **kwargs):
++        for key, value in kwargs.items():
++            setattr(self, key, value)
++
++
++def _install_fake_aiogram_types(monkeypatch: pytest.MonkeyPatch) -> None:
++    module = types.ModuleType("aiogram.types")
++    for name in (
++        "KeyboardButton",
++        "ReplyKeyboardMarkup",
++        "KeyboardButtonRequestChat",
++        "ChatAdministratorRights",
++    ):
++        setattr(module, name, type(name, (_TelegramType,), {}))
++    monkeypatch.setitem(sys.modules, "aiogram.types", module)
++
++
++def test_main_menu_has_native_channel_and_group_picker_buttons(monkeypatch: pytest.MonkeyPatch):
++    _install_fake_aiogram_types(monkeypatch)
++
++    markup = main_menu_keyboard()
++
++    assert markup.resize_keyboard is True
++    assert len(markup.keyboard) == 1
++    channel_button, group_button = markup.keyboard[0]
++
++    assert channel_button.text == "➕ Добавить канал"
++    assert channel_button.request_chat.request_id == CHANNEL_CHAT_REQUEST_ID
++    assert channel_button.request_chat.chat_is_channel is True
++    assert channel_button.request_chat.request_title is True
++    assert channel_button.request_chat.request_username is True
++    assert channel_button.request_chat.bot_administrator_rights.can_post_messages is True
++
++    assert group_button.text == "➕ Добавить группу"
++    assert group_button.request_chat.request_id == GROUP_CHAT_REQUEST_ID
++    assert group_button.request_chat.chat_is_channel is False
++    assert group_button.request_chat.bot_is_member is True
++    assert group_button.request_chat.request_title is True
++    assert group_button.request_chat.request_username is True
++
++
++def test_shared_chat_request_id_maps_to_expected_target_kind():
++    assert shared_chat_kind(CHANNEL_CHAT_REQUEST_ID) is SharedChatKind.CHANNEL
++    assert shared_chat_kind(GROUP_CHAT_REQUEST_ID) is SharedChatKind.GROUP
++    with pytest.raises(ValueError, match="Unknown chat request id"):
++        shared_chat_kind(999_999)
++
++from types import SimpleNamespace
++
++from adaptive_tg_bot.bot.channel_handlers import ChatRegistrationError, resolve_shared_chat
++
++
++class _FakeBot:
++    def __init__(self, *, chat_type: str, status: str, can_post_messages: bool = False, title: str = "Target"):
++        self.chat = SimpleNamespace(id=-100123, type=chat_type, title=title)
++        self.me = SimpleNamespace(id=777)
++        self.member = SimpleNamespace(status=status, can_post_messages=can_post_messages)
++
++    async def get_chat(self, chat_id):
++        assert chat_id == -100123
++        return self.chat
++
++    async def get_me(self):
++        return self.me
++
++    async def get_chat_member(self, chat_id, user_id):
++        assert (chat_id, user_id) == (-100123, 777)
++        return self.member
++
++
