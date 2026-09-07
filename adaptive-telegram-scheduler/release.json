@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "notes": "0.2.0: Windows launcher gains automatic GitHub Releases updates, SHA-256 verification, background checks every 6 hours, a manual tray check, an auto-update toggle, self-replacement, health verification, rollback, and bad-version blocking. Telegram bot data, token, channels, rotations, and schedules remain in AppData and are not replaced during updates.",
+  "source_sha256": "66f3f3cc513d220fbd2d99b04ac8b5c5fe164d06d4b598d8284bdcd2c16ead20",
+  "source_chunks": [
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.00",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.01",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.02",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.03",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.04",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.05",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.06",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.07",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.08",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.09",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.10a1",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.10a2v",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.10b",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.11a",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.11b",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12a1",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12a2",
+    "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12b"
+  ]
+}
