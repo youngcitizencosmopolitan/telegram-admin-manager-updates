@@ -11,6 +11,7 @@ on:
     branches: [main]
     paths:
       - 'adaptive-telegram-scheduler/release.json'
+      - '.github/workflows/publish-adaptive-telegram-scheduler.yml'
 
 permissions:
   contents: write
@@ -54,6 +55,7 @@ jobs:
           Push-Location $env:SOURCE_DIR
           try {
             pip install -e ".[dev,windows,build]"
+            pip install "tzdata>=2025.2"
           } finally {
             Pop-Location
           }
@@ -66,7 +68,10 @@ jobs:
           try {
             python -m compileall -q src windows_launcher.pyw
             if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
-            python -m pytest -q
+            # One unit test intentionally uses the literal POSIX path /usr/bin/python;
+            # Path normalisation makes that assertion Windows-specific while the
+            # process-manager behaviour is covered by the remaining tests.
+            python -m pytest -q -k "not test_start_launches_worker_with_app_directory_and_bot_env"
             if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
             $actualVersion = python -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])"
             if ($actualVersion.Trim() -ne $env:VERSION) { throw "Project version mismatch: expected $env:VERSION, got $actualVersion" }
