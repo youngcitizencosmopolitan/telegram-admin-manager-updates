@@ -22,6 +22,13 @@
     "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12a2",
     "adaptive-telegram-scheduler/release-src/0.2.0/source.zip.b64.12b"
   ],
-  "overlay_sha256": "de6b0baf855a67a8021dabff4e91a285bad7b15ef31d43ca99b34679c4a225bc",
-  "overlay_b64": "adaptive-telegram-scheduler/overlays/0.2.1/overlay.zip.b64"
+  "patch_sha256": "7003b7117c4279589b10ac52ccc410c5e7115bfb97cbdcee2849b7f6c39070c7",
+  "patch_chunks": [
+    "adaptive-telegram-scheduler/overlays/0.2.1/patch.00",
+    "adaptive-telegram-scheduler/overlays/0.2.1/patch.01",
+    "adaptive-telegram-scheduler/overlays/0.2.1/patch.02",
+    "adaptive-telegram-scheduler/overlays/0.2.1/patch.03",
+    "adaptive-telegram-scheduler/overlays/0.2.1/patch.04",
+    "adaptive-telegram-scheduler/overlays/0.2.1/patch.05"
+  ]
 }
