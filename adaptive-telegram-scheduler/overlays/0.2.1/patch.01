@@ -1,0 +1,113 @@
++    raise ValueError(f"Unknown chat request id: {request_id}")
++
++
++
++
++@dataclass(frozen=True, slots=True)
++class SharedChatTarget:
++    chat_id: int
++    title: str
++    kind: SharedChatKind
++
++
++class ChatRegistrationError(ValueError):
++    pass
++
++
++async def resolve_shared_chat(bot, chat_id: int, kind: SharedChatKind) -> SharedChatTarget:
++    try:
++        chat = await bot.get_chat(chat_id)
++        me = await bot.get_me()
++        member = await bot.get_chat_member(chat.id, me.id)
++    except Exception as exc:
++        raise ChatRegistrationError(f"Не удалось проверить выбранный чат: {exc}") from exc
++
++    chat_type = str(getattr(chat, "type", "")).lower()
++    status = str(getattr(member, "status", "")).lower()
++
++    if kind is SharedChatKind.CHANNEL:
++        if chat_type != "channel":
++            raise ChatRegistrationError("Выбранный чат не канал.")
++        if "administrator" not in status and "creator" not in status:
++            raise ChatRegistrationError("Бот не является администратором канала.")
++        can_post = bool(getattr(member, "can_post_messages", False)) or "creator" in status
++        if not can_post:
++            raise ChatRegistrationError("У бота нет права публиковать сообщения в этом канале.")
++    else:
++        if chat_type not in {"group", "supergroup"}:
++            raise ChatRegistrationError("Выбранный чат не группа.")
++        if status in {"left", "kicked", "banned"} or not status:
++            raise ChatRegistrationError("Бот не добавлен в выбранную группу.")
++
++    title = getattr(chat, "title", None) or str(chat_id)
++    return SharedChatTarget(chat_id=int(chat.id), title=str(title), kind=kind)
++
++
++async def register_shared_target(repo, telegram_user_id: int, target: SharedChatTarget):
++    owner = await repo.get_or_create_user(telegram_user_id)
++    existing = await repo.get_channel_by_telegram_chat_id(target.chat_id)
++    if existing is not None:
++        return existing, False
++    channel = await repo.create_channel_target(
++        owner.id, target.chat_id, target.title
++    )
++    return channel, True
++
++
++async def handle_shared_chat_message(
++    message, bot, db: Database, *, repo_factory=Repository
++):
++    try:
++        kind = shared_chat_kind(int(message.chat_shared.request_id))
++        target = await resolve_shared_chat(bot, int(message.chat_shared.chat_id), kind)
++    except (ValueError, ChatRegistrationError) as exc:
++        await message.answer(
++            f"Не удалось добавить чат: {exc}",
++            reply_markup=keyboards.main_menu_keyboard(),
++        )
++        return None, False
++
++    async with db.session() as session:
++        repo = repo_factory(session)
++        channel, created = await register_shared_target(repo, message.from_user.id, target)
++        await session.commit()
++
++    label = "Канал" if kind is SharedChatKind.CHANNEL else "Группа"
++    if created:
++        verb = "добавлен" if kind is SharedChatKind.CHANNEL else "добавлена"
++        text = (
++            f"✅ {label} {verb}: {target.title}\n"
++            f"Внутренний ID: {channel.id}\n"
++            f"Создать ротацию: /newrotation {channel.id} Main"
++        )
++    else:
++        text = f"{label} уже добавлена" if kind is SharedChatKind.GROUP else f"{label} уже добавлен"
++        text += f": ID {channel.id} — {channel.title}"
++    await message.answer(text, reply_markup=keyboards.main_menu_keyboard())
++    return channel, created
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -47,7 +149,7 @@
+ 
+ 
+ def build_router():
+-    from aiogram import Router
++    from aiogram import F, Router
+     from aiogram.filters import Command
+     from aiogram.types import Message
+ 
+@@ -60,6 +162,12 @@
+             return True
+         await message.answer("Нет доступа.")
+         return False
++
++    @router.message(F.chat_shared)
++    async def shared_chat(message: Message, bot, db: Database, settings: Settings):
++        if not await guard(message, settings):
++            return
++        await handle_shared_chat_message(message, bot, db)
+ 
+     @router.message(Command("addchannel"))
+     async def add_channel(message: Message, bot, db: Database, settings: Settings):
+--- a/src/adaptive_tg_bot/bot/handlers.py
