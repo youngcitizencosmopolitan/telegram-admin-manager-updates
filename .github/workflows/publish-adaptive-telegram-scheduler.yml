@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'adaptive-telegram-scheduler/release.json'
+      - 'adaptive-telegram-scheduler/overlays/**'
       - '.github/workflows/publish-adaptive-telegram-scheduler.yml'
   push:
     branches: [main]
@@ -40,6 +41,17 @@ jobs:
           if ($actual -ne ([string]$r.source_sha256).ToLowerInvariant()) { throw "Source SHA mismatch: expected $($r.source_sha256), got $actual" }
           New-Item -ItemType Directory -Force -Path 'build-src\adaptive-telegram-scheduler' | Out-Null
           Expand-Archive 'adaptive-telegram-scheduler-source.zip' -DestinationPath 'build-src\adaptive-telegram-scheduler' -Force
+
+          if ($r.overlay_b64) {
+            if (-not (Test-Path ([string]$r.overlay_b64))) { throw "Missing overlay base64: $($r.overlay_b64)" }
+            $overlayText = (Get-Content ([string]$r.overlay_b64) -Raw).Trim()
+            $overlayZip = Join-Path $PWD 'adaptive-telegram-scheduler-overlay.zip'
+            [IO.File]::WriteAllBytes($overlayZip, [Convert]::FromBase64String($overlayText))
+            $overlayActual = (Get-FileHash $overlayZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($overlayActual -ne ([string]$r.overlay_sha256).ToLowerInvariant()) { throw "Overlay SHA mismatch: expected $($r.overlay_sha256), got $overlayActual" }
+            Expand-Archive $overlayZip -DestinationPath 'build-src\adaptive-telegram-scheduler' -Force
+          }
+
           "VERSION=$($r.version)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "SOURCE_DIR=$((Resolve-Path 'build-src\adaptive-telegram-scheduler').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -55,7 +67,7 @@ jobs:
           Push-Location $env:SOURCE_DIR
           try {
             pip install -e ".[dev,windows,build]"
-            pip install "tzdata>=2025.2"
+            pip install "tzdata>=2026.1"
           } finally {
             Pop-Location
           }
@@ -68,9 +80,6 @@ jobs:
           try {
             python -m compileall -q src windows_launcher.pyw
             if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
-            # One unit test intentionally uses the literal POSIX path /usr/bin/python;
-            # Path normalisation makes that assertion Windows-specific while the
-            # process-manager behaviour is covered by the remaining tests.
             python -m pytest -q -k "not test_start_launches_worker_with_app_directory_and_bot_env"
             if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
             $actualVersion = python -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])"
