@@ -1,11 +1,11 @@
 {
-  "version": "0006",
-  "base_version": "0005",
-  "manifest_version": "4.3.8.0006",
-  "display_version": "0006",
+  "version": "0007",
+  "base_version": "0006",
+  "manifest_version": "4.3.8.0007",
+  "display_version": "0007",
   "patch_bundle_chunks": [
-    "release-src/0006/patch-bundle-01.b64"
+    "release-src/0007/patch-bundle-01.b64"
   ],
-  "patch_bundle_sha256": "760e599c4a50829e5804ecbc0622f46b1f94e049f7e5c52ad97daa2ba860b740",
-  "notes": "0006: account monitoring eligibility can be switched off and back on live without restarting monitoring; current uploads finish safely, queued files wait for enabled accounts, and real errors are highlighted more visibly in logs and activity tables."
+  "patch_bundle_sha256": "5c8b10fd29b6ba4339e195af1a525f0d001baa61f3ebf7e43f9853560816459d",
+  "notes": "0007: forum topic discovery now paginates safely and fails closed on lookup errors; concurrent tasks cannot create the same topic twice; topic mappings are cached immediately; forum upload history is stable across Telegram topic ID changes so unchanged folders are not republished."
 }
