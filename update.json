@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0007",
-  "display_version": "0007",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0007/TelegramAdminManager_v0007_update.zip",
-  "sha256": "fbd4eeebabc86523c4b1403d73a77f48cb03f6a5dd1478441c0b9fd59cbe0785",
-  "notes": "0007: forum topic discovery now paginates safely and fails closed on lookup errors; concurrent tasks cannot create the same topic twice; topic mappings are cached immediately; forum upload history is stable across Telegram topic ID changes so unchanged folders are not republished."
+  "version": "4.3.8.0008",
+  "display_version": "0008",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0008/TelegramAdminManager_v0008_update.zip",
+  "sha256": "9db5038920c7023f4449e7f0c1316cb84bff426a06615ed5a89118fbf4812b47",
+  "notes": "0008: the unified Monitoring tab again shows a live remaining-upload summary with bytes left, file count, aggregate speed and ETA, updated from in-progress transfer bytes."
 }
