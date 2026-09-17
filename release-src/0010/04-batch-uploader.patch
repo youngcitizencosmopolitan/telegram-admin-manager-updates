@@ -1,0 +1,127 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -3683,15 +3923,10 @@
+                 key = f"{tid}:{path}"
+                 self.app.log(f"{name} → {path.name}: ⏭ больше 4 ГБ ({size / 1024**3:.2f} ГБ), пропускаю")
+                 self.app.ui_call(lambda k=key, p=path, z=size: self._activity_update(k, name, p, "—", z, 0.0, 0.0, "⏭ >4 ГБ"))
+-            elif size > FREE_FILE_LIMIT and not premium_sessions:
+-                state["processed_bytes"] += size
+-                state["processed_files"] += 1
+-                state["skipped"] += 1
+-                state["limit_skipped"] += 1
+-                key = f"{tid}:{path}"
+-                self.app.log(f"{name} → {path.name}: ⏭ >2 ГБ, но в этом задании нет Premium аккаунта")
+-                self.app.ui_call(lambda k=key, p=path, z=size: self._activity_update(k, name, p, "—", z, 0.0, 0.0, "⏭ нужен Premium"))
+             else:
++                # Keep 2–4 GB work pending even if no Premium account existed at
++                # the initial snapshot. A Premium account hot-added while the task
++                # is still active can immediately claim it from big_queue.
+                 pending.append((index, path))
+         self._emit_task_metrics(tid, force=True)
+ 
+@@ -3713,8 +3948,8 @@
+                 small_queue.put_nowait(item)
+ 
+         parallel_auto = bool(task.get("parallel_auto", True))
+-        task_parallel = len(sessions) if parallel_auto else max(1, min(20, int(task.get("parallel", 2) or 2)))
+-        effective_parallel = min(task_parallel, len(sessions))
++        task_parallel = 100 if parallel_auto else max(1, min(100, int(task.get("parallel", 2) or 2)))
++        effective_parallel = task_parallel if parallel_auto else min(task_parallel, len(sessions))
+         task_sem = asyncio.Semaphore(effective_parallel)
+         policy = self.app.safety_policy()
+         self.app.log(
+@@ -3738,6 +3973,45 @@
+ 
+         def signal_drained_if_ready() -> None:
+             _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
++
++        async def activate_hot_session(session: str) -> bool:
++            if session in resolved:
++                return True
++            pair = clients.get(session)
++            if pair is None or health(session).get("disabled"):
++                return False
++            account, client = pair
++            if not self._runtime_task_account_allowed(task, session):
++                return False
++            if not bool(task.get("use_all_accounts", True)) and session not in (task.get("account_sessions", []) or []):
++                return False
++            restriction_check = getattr(self.app, "account_is_restricted", None)
++            if callable(restriction_check) and restriction_check(session):
++                return False
++            try:
++                auto_admin = bool(task.get("auto_admin", True))
++                should_join = auto_admin or bool(task.get("join_if_needed", False))
++                entity = await self.app._resolve_or_join_target(client, task_target, should_join)
++                if auto_admin:
++                    hot_cached_admins = self.app.group_state_cache.fresh_admin_sessions(
++                        task_target, self._cache_ttl_hours()
++                    )
++                    if session not in hot_cached_admins and not await self._is_admin_for_target(client, entity):
++                        promoted = await self._hot_promote_session_for_task(
++                            task, session, entity, clients, account_locks, hot_admin_locks
++                        )
++                        if not promoted:
++                            self.app.group_state_cache.invalidate_admin(task_target, session)
++                            return False
++                    self.app.group_state_cache.mark_admins(
++                        task_target, {session}, title=str(getattr(entity, "title", "") or "")
++                    )
++                resolved[session] = entity
++                self.app.log(f"{name}: hot-add {account.display} подключён к текущему заданию")
++                return True
++            except Exception as exc:
++                self.app.log(f"{name}: hot-add {account.display} не открыл цель — {self.app._friendly_error(exc)}")
++                return False
+ 
+         async def next_job(session: str) -> tuple[int, Path] | None:
+             if health(session).get("disabled"):
+@@ -4189,16 +4463,42 @@
+         # gates the next monitoring task. Premium-only work may continue in parallel.
+         _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
+ 
+-        max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, len(sessions) + 1 + FILE_PART_REQUEUE_LIMIT)
++        max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, 101 + FILE_PART_REQUEUE_LIMIT)
+         for _wave in range(max_waves):
+             if self.stop_event.is_set() or (small_queue.empty() and big_queue.empty()):
+                 break
+-            healthy_sessions = [s for s in sessions if not health(s).get("disabled")]
+-            if not healthy_sessions:
++
++            worker_tasks: dict[str, asyncio.Task[Any]] = {}
++            started_sessions: set[str] = set()
++
++            async def start_available_workers() -> None:
++                account_map = {s: pair[0] for s, pair in clients.items()}
++                requested = set(self._effective_task_sessions(task, account_map))
++                for session in list(clients):
++                    if session in started_sessions or session not in requested or health(session).get("disabled"):
++                        continue
++                    if session not in resolved and not await activate_hot_session(session):
++                        continue
++                    started_sessions.add(session)
++                    worker_tasks[session] = asyncio.create_task(worker(session))
++
++            await start_available_workers()
++            if not worker_tasks:
+                 break
+-            workers = [asyncio.create_task(worker(session)) for session in healthy_sessions]
+-            if workers:
+-                await asyncio.gather(*workers)
++            while worker_tasks and not self.stop_event.is_set():
++                done, _pending_workers = await asyncio.wait(
++                    list(worker_tasks.values()), timeout=0.25, return_when=asyncio.FIRST_COMPLETED
++                )
++                if done:
++                    for finished in done:
++                        for session, task_obj in list(worker_tasks.items()):
++                            if task_obj is finished:
++                                worker_tasks.pop(session, None)
++                                break
++                if live_pool_changed is not None and live_pool_changed.is_set():
++                    live_pool_changed.clear()
++                await start_available_workers()
++
+             if file_part_deferred and not self.stop_event.is_set():
+                 deferred_now = list(file_part_deferred)
+                 file_part_deferred.clear()

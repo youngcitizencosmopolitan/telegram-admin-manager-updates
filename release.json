@@ -1,12 +1,15 @@
 {
-  "version": "0009",
-  "base_version": "0008",
-  "manifest_version": "4.3.8.0009",
-  "display_version": "0009",
+  "version": "0010",
+  "base_version": "0009",
+  "manifest_version": "4.3.8.0010",
+  "display_version": "0010",
   "patch_files": [
-    "release-src/0009/01-batch-uploader.patch",
-    "release-src/0009/02-tests.patch",
-    "release-src/0009/03-version.patch"
+    "release-src/0010/01-batch-uploader.patch",
+    "release-src/0010/02-batch-uploader.patch",
+    "release-src/0010/03-batch-uploader.patch",
+    "release-src/0010/04-batch-uploader.patch",
+    "release-src/0010/05-main-admin.patch",
+    "release-src/0010/06-tests.patch"
   ],
-  "notes": "0009: monitoring pipeline no longer lets Premium-only 2–4 GB work block later rules; once a rule's <=2 GB lane is claimed, free ordinary accounts can immediately continue with small files from following monitoring rules while Premium uploads keep running."
+  "notes": "0010: multi-rule monitoring batches now release regular accounts to following rules while Premium-only 2–4 GB tails continue; newly added eligible accounts are hot-connected to the active batch, auto-joined and promoted with maximum available admin rights through an existing live controller, and can take queued files without restarting monitoring."
 }

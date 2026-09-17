@@ -1,0 +1,65 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -3004,9 +3111,22 @@
+             self._running_account_total = len(clients)
+             self.app.ui_call(lambda: self.active_accounts_var.set(f"0 / {self._running_account_total}"))
+             account_locks = {s: asyncio.Lock() for s in clients}
++            hot_admin_locks: dict[str, asyncio.Lock] = {}
+             global_sem = asyncio.Semaphore(global_parallel)
+             preview_sem = asyncio.Semaphore(2)
+             scan_sem = asyncio.Semaphore(2)
++            live_pool_changed = asyncio.Event()
++
++            async def reconcile_live_accounts() -> None:
++                while not self.stop_event.is_set():
++                    added = await self._connect_hot_batch_accounts_once(
++                        tasks, clients, premium_by_session, account_locks, api_id, api_hash
++                    )
++                    if added:
++                        live_pool_changed.set()
++                    await asyncio.sleep(0.75)
++
++            reconciler_task = asyncio.create_task(reconcile_live_accounts())
+ 
+             premium_count = sum(1 for s in clients if premium_by_session.get(s, False))
+             self.app.log(
+@@ -3021,7 +3141,8 @@
+                 try:
+                     return await self._run_one_task(
+                         task, clients, premium_by_session, account_locks, global_sem, preview_sem, scan_sem,
+-                        start_after=start_after, drained_event=drained_event,
++                        start_after=start_after, drained_event=drained_event, live_pool_changed=live_pool_changed,
++                        hot_admin_locks=hot_admin_locks,
+                     )
+                 finally:
+                     # Never deadlock the next priority task on an early return/error.
+@@ -3030,6 +3151,11 @@
+ 
+             task_coros = [run_task(pos, task) for pos, task in enumerate(tasks)]
+             results = await asyncio.gather(*task_coros, return_exceptions=True)
++            reconciler_task.cancel()
++            try:
++                await reconciler_task
++            except asyncio.CancelledError:
++                pass
+             hard_errors = 0
+             hard_error_ids: set[str] = set()
+             for task, result in zip(tasks, results):
+@@ -3123,14 +3249,16 @@
+                 admin_delay = 0.35
+                 if policy["enabled"]:
+                     admin_delay = max(admin_delay, float(policy["admin_delay"]))
++                policy_key = self.app.maximum_admin_policy_key("")
+                 promoted, failed = await self.app._promote_one_target_async(
+                     target=target,
+                     selected=selected,
+                     controller=None,
+                     delay=admin_delay,
+-                    preset="full_no_add_admins",
++                    preset="full_add_admins",
+                     title="",
+                     join_before=True,
++                    policy_key=policy_key,
+                 )
+                 if failed:
+                     self.app.log(
