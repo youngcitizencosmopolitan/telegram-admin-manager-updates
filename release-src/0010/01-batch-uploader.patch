@@ -1,0 +1,147 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -107,6 +107,49 @@
+     """
+     if drained_event is not None and small_queue.empty():
+         drained_event.set()
++
++
++def _hot_add_candidate_sessions(
++    tasks: list[dict[str, Any]],
++    accounts_by_session: dict[str, Any],
++    live_sessions: set[str],
++    usage_allows: Any,
++    is_restricted: Any,
++) -> list[str]:
++    """Return newly available sessions requested by at least one active task."""
++    out: list[str] = []
++    for session in accounts_by_session:
++        if session in live_sessions:
++            continue
++        try:
++            if callable(is_restricted) and is_restricted(session):
++                continue
++        except Exception:
++            continue
++        for task in tasks:
++            requested = bool(task.get("use_all_accounts", True)) or session in (task.get("account_sessions", []) or [])
++            if not requested:
++                continue
++            capability = "monitoring" if bool(task.get("monitor_folder", False)) else "uploads"
++            try:
++                allowed = True if not callable(usage_allows) else bool(usage_allows(session, capability))
++            except Exception:
++                allowed = False
++            if allowed:
++                out.append(session)
++                break
++    return out
++
++
++def _should_use_monitor_pipeline(active_items: list[dict[str, Any]], task_count: int) -> bool:
++    """Use ordered regular-lane release for any multi-task monitoring batch.
++
++    Monitoring often groups several changed rules into one queue item. 0009 only
++    enabled the pipeline when multiple queue items were present, so a single
++    monitor item containing several tasks let their workers compete for the same
++    account locks and could starve later rules.
++    """
++    return int(task_count) > 1 and bool(active_items) and all(_is_monitor_queue_item(x) for x in active_items)
+ 
+ 
+ def _take_monitor_pipeline_wave(first: dict[str, Any], pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+@@ -2117,10 +2160,10 @@
+     def _effective_global_parallel(self, tasks: list[dict[str, Any]]) -> int:
+         accounts_by_session = {a.session: a for a in self.app.store.accounts()}
+         if self.global_parallel_auto_var.get():
+-            used_sessions: set[str] = set()
+-            for task in tasks:
+-                used_sessions.update(self._effective_task_sessions(task, accounts_by_session))
+-            value = max(1, len(used_sessions))
++            # Auto means "all currently eligible accounts", including accounts
++            # hot-added after the batch starts. One worker per session still
++            # prevents a single account from occupying multiple upload slots.
++            value = 100
+         else:
+             try:
+                 value = max(1, min(100, int(self.global_parallel_var.get())))
+@@ -2742,7 +2785,7 @@
+                     self._run_batch(
+                         tasks, global_parallel,
+                         notify=any(bool(x.get("notify", False)) for x in active_items),
+-                        pipeline=len(wave_items) > 1 and all(_is_monitor_queue_item(x) for x in active_items),
++                        pipeline=_should_use_monitor_pipeline(active_items, len(tasks)),
+                     )
+                 )
+                 hard_error_ids = result or set()
+@@ -2927,6 +2970,70 @@
+         return True
+ 
+     # ---------- async engine ----------
++    async def _connect_hot_batch_accounts_once(
++        self,
++        tasks: list[dict[str, Any]],
++        clients: dict[str, tuple[Any, Any]],
++        premium_by_session: dict[str, bool],
++        account_locks: dict[str, asyncio.Lock],
++        api_id: int,
++        api_hash: str,
++    ) -> list[str]:
++        """Connect accounts added while a batch is already running."""
++        accounts_by_session = {a.session: a for a in self.app.store.accounts()}
++        restriction_check = getattr(self.app, "account_is_restricted", None)
++        candidates = _hot_add_candidate_sessions(
++            tasks,
++            accounts_by_session,
++            set(clients),
++            getattr(self.app, "account_usage_allows", None),
++            restriction_check,
++        )
++        added: list[str] = []
++        for session in candidates:
++            if self.stop_event.is_set() or session in clients:
++                continue
++            account = accounts_by_session[session]
++            client = TelegramClient(
++                str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD
++            )
++            try:
++                await client.connect()
++                if not await client.is_user_authorized():
++                    raise RuntimeError("сессия не авторизована")
++                me = await client.get_me()
++                is_premium = bool(getattr(me, "premium", False))
++                clients[session] = (account, client)
++                account_locks[session] = asyncio.Lock()
++                large_ok = True
++                checker = getattr(self.app, "account_usage_allows", None)
++                if callable(checker):
++                    large_ok = bool(checker(session, "large_files"))
++                premium_by_session[session] = bool(is_premium and large_ok)
++                self.account_health[session] = {
++                    "state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": "", "disabled": False
++                }
++                added.append(session)
++                premium_text = "Premium" if is_premium else "обычный"
++                if is_premium and not large_ok:
++                    premium_text += " (2–4 ГБ отключены)"
++                self.app.log(f"Пакет: hot-add {account.display} подключён — {premium_text}")
++            except Exception as exc:
++                self.app.log(f"Пакет: hot-add {account.display} не подключён — {self.app._friendly_error(exc)}")
++                try:
++                    await client.disconnect()
++                except Exception:
++                    pass
++        if added:
++            self._running_account_total = len(clients)
++            if hasattr(self, "active_accounts_var"):
++                self.app.ui_call(lambda: self.active_accounts_var.set(f"0 / {self._running_account_total}"))
++            try:
++                self.app.ui_call(self.app.refresh_safety_health_table)
++            except Exception:
++                pass
++        return added
++
+     async def _run_batch(self, tasks: list[dict[str, Any]], global_parallel: int, notify: bool = True, pipeline: bool = False) -> set[str] | None:
+         api_id, api_hash = self.app._api_credentials()
+         try:
