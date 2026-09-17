@@ -1,11 +1,11 @@
 {
-  "version": "0007",
-  "base_version": "0006",
-  "manifest_version": "4.3.8.0007",
-  "display_version": "0007",
+  "version": "0008",
+  "base_version": "0007",
+  "manifest_version": "4.3.8.0008",
+  "display_version": "0008",
   "patch_bundle_chunks": [
-    "release-src/0007/patch-bundle-01.b64"
+    "release-src/0008/patch-bundle-01.b64"
   ],
-  "patch_bundle_sha256": "5c8b10fd29b6ba4339e195af1a525f0d001baa61f3ebf7e43f9853560816459d",
-  "notes": "0007: forum topic discovery now paginates safely and fails closed on lookup errors; concurrent tasks cannot create the same topic twice; topic mappings are cached immediately; forum upload history is stable across Telegram topic ID changes so unchanged folders are not republished."
+  "patch_bundle_sha256": "075f7225d204c4b96b61e51a16b5b68d6fcf568c3d881f099795f411f74b2171",
+  "notes": "0008: the unified Monitoring tab again shows a live remaining-upload summary with bytes left, file count, aggregate speed and ETA, updated from in-progress transfer bytes."
 }
