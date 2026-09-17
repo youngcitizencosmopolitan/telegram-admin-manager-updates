@@ -1,0 +1,139 @@
+--- a/app/tests/test_0001_monitor_pipeline.py
++++ b/app/tests/test_0001_monitor_pipeline.py
+@@ -38,7 +38,7 @@
+         self.assertIn("start_after", run_task)
+         self.assertIn("drained_event", run_task)
+         self.assertIn("_take_monitor_pipeline_wave", queue_worker)
+-        self.assertIn("pipeline=len(wave_items) > 1", queue_worker)
++        self.assertIn("pipeline=_should_use_monitor_pipeline(active_items, len(tasks))", queue_worker)
+ 
+ 
+ if __name__ == "__main__":
+--- a/app/tests/test_0009_monitor_pipeline_parallel.py
++++ b/app/tests/test_0009_monitor_pipeline_parallel.py
+@@ -39,11 +39,11 @@
+         self.assertIn("_signal_pipeline_next_task_if_regular_lane_drained", source)
+         self.assertNotIn("drained_event is not None and small_queue.empty() and big_queue.empty()", source)
+ 
+-    def test_version_is_0009(self):
++    def test_version_is_0009_or_newer(self):
+         text = Path("telegram_admin_manager.py").read_text(encoding="utf-8")
+         match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+         self.assertIsNotNone(match)
+-        self.assertEqual(match.group(1), "0009")
++        self.assertGreaterEqual(int(match.group(1)), 9)
+ 
+ 
+ if __name__ == "__main__":
+--- a/app/tests/test_0010a_monitor_multi_task_pipeline.py
++++ b/app/tests/test_0010a_monitor_multi_task_pipeline.py
+@@ -0,0 +1,21 @@
++import unittest
++
++import batch_uploader as bu
++
++
++class MonitorMultiTaskPipeline0010ATests(unittest.TestCase):
++    def test_single_monitor_queue_item_with_multiple_tasks_uses_pipeline(self):
++        active_items = [{"source": "Мониторинг", "task_ids": ["vip4", "vip5"]}]
++        self.assertTrue(bu._should_use_monitor_pipeline(active_items, task_count=2))
++
++    def test_single_monitor_task_does_not_need_pipeline(self):
++        active_items = [{"source": "Мониторинг", "task_ids": ["vip4"]}]
++        self.assertFalse(bu._should_use_monitor_pipeline(active_items, task_count=1))
++
++    def test_manual_batch_is_not_reclassified_as_monitor_pipeline(self):
++        active_items = [{"source": "Вручную", "task_ids": ["a", "b"]}]
++        self.assertFalse(bu._should_use_monitor_pipeline(active_items, task_count=2))
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- a/app/tests/test_0010_hot_add_account.py
++++ b/app/tests/test_0010_hot_add_account.py
+@@ -0,0 +1,85 @@
++import unittest
++
++import batch_uploader as bu
++
++
++class HotAddCandidate0010Tests(unittest.TestCase):
++    def test_use_all_monitor_task_adopts_new_allowed_account(self):
++        tasks = [{"use_all_accounts": True, "monitor_folder": True}]
++        accounts = {"old": object(), "new": object()}
++        allowed = lambda session, capability: capability == "monitoring" and session != "blocked"
++        restricted = lambda session: False
++
++        result = bu._hot_add_candidate_sessions(tasks, accounts, {"old"}, allowed, restricted)
++
++        self.assertEqual(result, ["new"])
++
++    def test_explicit_task_does_not_adopt_unrelated_new_account(self):
++        tasks = [{"use_all_accounts": False, "account_sessions": ["old"], "monitor_folder": True}]
++        accounts = {"old": object(), "new": object()}
++
++        result = bu._hot_add_candidate_sessions(tasks, accounts, {"old"}, lambda *_: True, lambda *_: False)
++
++        self.assertEqual(result, [])
++
++    def test_restricted_or_policy_disabled_account_is_not_hot_added(self):
++        tasks = [{"use_all_accounts": True, "monitor_folder": True}]
++        accounts = {"old": object(), "blocked": object(), "restricted": object()}
++        allowed = lambda session, capability: session != "blocked"
++        restricted = lambda session: session == "restricted"
++
++        result = bu._hot_add_candidate_sessions(tasks, accounts, {"old"}, allowed, restricted)
++
++        self.assertEqual(result, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
++
++class HotWorkerInjection0010Tests(unittest.TestCase):
++    def test_run_one_task_supervises_mutable_live_client_pool(self):
++        import inspect
++        source = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        self.assertIn("live_pool_changed", source)
++        self.assertIn("start_available_workers", source)
++        self.assertIn("list(clients)", source)
++
++    def test_auto_task_parallelism_keeps_capacity_for_hot_added_accounts(self):
++        import inspect
++        source = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        self.assertIn("task_parallel = 100 if parallel_auto", source)
++
++class HotAutoAdmin0010Tests(unittest.TestCase):
++    def test_initial_preflight_requests_maximum_rights_with_policy_key(self):
++        import inspect
++        source = inspect.getsource(bu.BatchUploaderPane._prepare_task_admins)
++        self.assertIn('preset="full_add_admins"', source)
++        self.assertIn('policy_key=policy_key', source)
++        self.assertIn('maximum_admin_policy_key', source)
++
++    def test_hot_promotion_reuses_live_controller_client(self):
++        import inspect
++        source = inspect.getsource(bu.BatchUploaderPane._hot_promote_session_for_task)
++        self.assertIn('self.app._set_admin_rights', source)
++        self.assertIn('account_locks[controller_session]', source)
++        self.assertNotIn('TelegramClient(', source)
++
++    def test_hot_activation_attempts_promotion_before_rejecting_non_admin(self):
++        import inspect
++        source = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        self.assertIn('_hot_promote_session_for_task', source)
++
++class HotPremium0010Tests(unittest.TestCase):
++    def test_big_files_are_not_skipped_just_because_no_premium_was_present_at_initial_snapshot(self):
++        import inspect
++        source = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        self.assertNotIn('size > FREE_FILE_LIMIT and not premium_sessions', source)
++        self.assertIn('big_queue.put_nowait(item)', source)
++
++    def test_version_is_0010(self):
++        import re
++        from pathlib import Path
++        text = Path('telegram_admin_manager.py').read_text(encoding='utf-8')
++        match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
++        self.assertIsNotNone(match)
++        self.assertEqual(match.group(1), '0010')
