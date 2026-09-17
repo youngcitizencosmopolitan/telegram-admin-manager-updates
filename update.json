@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0009",
-  "display_version": "0009",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0009/TelegramAdminManager_v0009_update.zip",
-  "sha256": "91ca8f2e9fdc065b5e1fe6ff7a3b3fdac2165997909b03d87f47135d8cb14278",
-  "notes": "0009: monitoring pipeline no longer lets Premium-only 2–4 GB work block later rules; once a rule's <=2 GB lane is claimed, free ordinary accounts can immediately continue with small files from following monitoring rules while Premium uploads keep running."
+  "version": "4.3.8.0010",
+  "display_version": "0010",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0010/TelegramAdminManager_v0010_update.zip",
+  "sha256": "02dad7fdd70a4c08127e55dc7c0c3f51c0a23286ca6b4b2ee2145317a6c6b971",
+  "notes": "0010: multi-rule monitoring batches now release regular accounts to following rules while Premium-only 2–4 GB tails continue; newly added eligible accounts are hot-connected to the active batch, auto-joined and promoted with maximum available admin rights through an existing live controller, and can take queued files without restarting monitoring."
 }
