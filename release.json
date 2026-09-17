@@ -1,11 +1,12 @@
 {
-  "version": "0008",
-  "base_version": "0007",
-  "manifest_version": "4.3.8.0008",
-  "display_version": "0008",
-  "patch_bundle_chunks": [
-    "release-src/0008/patch-bundle-01.b64"
+  "version": "0009",
+  "base_version": "0008",
+  "manifest_version": "4.3.8.0009",
+  "display_version": "0009",
+  "patch_files": [
+    "release-src/0009/01-batch-uploader.patch",
+    "release-src/0009/02-tests.patch",
+    "release-src/0009/03-version.patch"
   ],
-  "patch_bundle_sha256": "075f7225d204c4b96b61e51a16b5b68d6fcf568c3d881f099795f411f74b2171",
-  "notes": "0008: the unified Monitoring tab again shows a live remaining-upload summary with bytes left, file count, aggregate speed and ETA, updated from in-progress transfer bytes."
+  "notes": "0009: monitoring pipeline no longer lets Premium-only 2–4 GB work block later rules; once a rule's <=2 GB lane is claimed, free ordinary accounts can immediately continue with small files from following monitoring rules while Premium uploads keep running."
 }

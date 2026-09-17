@@ -1,0 +1,43 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -96,6 +96,19 @@
+ def _is_monitor_queue_item(item: dict[str, Any]) -> bool:
+     return str(item.get("source", "")).casefold().startswith("мониторинг")
+ 
++def _signal_pipeline_next_task_if_regular_lane_drained(
++    drained_event: asyncio.Event | None,
++    small_queue: asyncio.Queue[Any],
++) -> None:
++    """Release the next monitoring task once ordinary-account work is claimed.
++
++    Premium-only 2–4 GB files may still be queued or uploading; they must not
++    keep free regular accounts from moving on to later monitoring rules.
++    """
++    if drained_event is not None and small_queue.empty():
++        drained_event.set()
++
++
+ def _take_monitor_pipeline_wave(first: dict[str, Any], pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     """Take consecutive non-overlapping monitoring items while preserving queue order."""
+     wave = [first]
+@@ -3724,8 +3737,7 @@
+                 return small_queue
+ 
+         def signal_drained_if_ready() -> None:
+-            if drained_event is not None and small_queue.empty() and big_queue.empty():
+-                drained_event.set()
++            _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
+ 
+         async def next_job(session: str) -> tuple[int, Path] | None:
+             if health(session).get("disabled"):
+@@ -4173,6 +4185,10 @@
+             if self.stop_event.is_set():
+                 return
+ 
++        # Once this task itself is allowed to run, only its regular (<=2 GB) lane
++        # gates the next monitoring task. Premium-only work may continue in parallel.
++        _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
++
+         max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, len(sessions) + 1 + FILE_PART_REQUEUE_LIMIT)
+         for _wave in range(max_waves):
+             if self.stop_event.is_set() or (small_queue.empty() and big_queue.empty()):

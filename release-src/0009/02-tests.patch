@@ -1,0 +1,66 @@
+--- a/app/tests/test_0008_remaining_summary.py
++++ b/app/tests/test_0008_remaining_summary.py
+@@ -7,8 +7,8 @@
+ 
+ 
+ class RemainingUploadSummary0008Tests(unittest.TestCase):
+-    def test_version_is_0008(self):
+-        self.assertEqual(main_app.APP_VERSION, "0008")
++    def test_version_is_0008_or_newer(self):
++        self.assertGreaterEqual(int(main_app.APP_VERSION), 8)
+ 
+     def test_unified_monitor_shows_remaining_upload_summary_line(self):
+         source = inspect.getsource(BatchUploaderPane._build_unified_monitor_ui)
+--- /dev/null
++++ b/app/tests/test_0009_monitor_pipeline_parallel.py
+@@ -0,0 +1,50 @@
++import asyncio
++import inspect
++import re
++import unittest
++from pathlib import Path
++
++import batch_uploader as bu
++
++
++class MonitorPipelineParallel0009Tests(unittest.TestCase):
++    def test_next_monitor_task_releases_when_regular_lane_is_empty_even_with_premium_work_left(self):
++        async def scenario():
++            event = asyncio.Event()
++            small_queue = asyncio.Queue()
++            big_queue = asyncio.Queue()
++            big_queue.put_nowait((1, Path("premium-3gb.mp4")))
++
++            bu._signal_pipeline_next_task_if_regular_lane_drained(event, small_queue)
++
++            self.assertTrue(event.is_set())
++            self.assertFalse(big_queue.empty())
++
++        asyncio.run(scenario())
++
++    def test_next_monitor_task_waits_while_regular_files_are_still_pending(self):
++        async def scenario():
++            event = asyncio.Event()
++            small_queue = asyncio.Queue()
++            small_queue.put_nowait((1, Path("regular.mp4")))
++
++            bu._signal_pipeline_next_task_if_regular_lane_drained(event, small_queue)
++
++            self.assertFalse(event.is_set())
++
++        asyncio.run(scenario())
++
++    def test_run_one_task_uses_regular_lane_release_signal(self):
++        source = inspect.getsource(bu.BatchUploaderPane._run_one_task)
++        self.assertIn("_signal_pipeline_next_task_if_regular_lane_drained", source)
++        self.assertNotIn("drained_event is not None and small_queue.empty() and big_queue.empty()", source)
++
++    def test_version_is_0009(self):
++        text = Path("telegram_admin_manager.py").read_text(encoding="utf-8")
++        match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
++        self.assertIsNotNone(match)
++        self.assertEqual(match.group(1), "0009")
++
++
++if __name__ == "__main__":
++    unittest.main()
