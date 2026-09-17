@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0008",
-  "display_version": "0008",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0008/TelegramAdminManager_v0008_update.zip",
-  "sha256": "9db5038920c7023f4449e7f0c1316cb84bff426a06615ed5a89118fbf4812b47",
-  "notes": "0008: the unified Monitoring tab again shows a live remaining-upload summary with bytes left, file count, aggregate speed and ETA, updated from in-progress transfer bytes."
+  "version": "4.3.8.0009",
+  "display_version": "0009",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0009/TelegramAdminManager_v0009_update.zip",
+  "sha256": "91ca8f2e9fdc065b5e1fe6ff7a3b3fdac2165997909b03d87f47135d8cb14278",
+  "notes": "0009: monitoring pipeline no longer lets Premium-only 2–4 GB work block later rules; once a rule's <=2 GB lane is claimed, free ordinary accounts can immediately continue with small files from following monitoring rules while Premium uploads keep running."
 }
