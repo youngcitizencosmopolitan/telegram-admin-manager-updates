@@ -1,15 +1,13 @@
 {
-  "version": "0010",
-  "base_version": "0009",
-  "manifest_version": "4.3.8.0010",
-  "display_version": "0010",
+  "version": "0011",
+  "base_version": "0010",
+  "manifest_version": "4.3.8.0011",
+  "display_version": "0011",
   "patch_files": [
-    "release-src/0010/01-batch-uploader.patch",
-    "release-src/0010/02-batch-uploader.patch",
-    "release-src/0010/03-batch-uploader.patch",
-    "release-src/0010/04-batch-uploader.patch",
-    "release-src/0010/05-main-admin.patch",
-    "release-src/0010/06-tests.patch"
+    "release-src/0011/01-batch-uploader.patch",
+    "release-src/0011/02-version.patch",
+    "release-src/0011/03-test-compat.patch",
+    "release-src/0011/04-tests.patch"
   ],
-  "notes": "0010: multi-rule monitoring batches now release regular accounts to following rules while Premium-only 2–4 GB tails continue; newly added eligible accounts are hot-connected to the active batch, auto-joined and promoted with maximum available admin rights through an existing live controller, and can take queued files without restarting monitoring."
+  "notes": "0011: forum topic creation is duplicate-safe on large forums: creation-date pagination uses the correct offset date, exact-title lookup falls back to a full paginated scan before any create, and Unicode/whitespace-equivalent titles share one canonical route."
 }
