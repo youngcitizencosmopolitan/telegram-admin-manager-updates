@@ -1,13 +1,13 @@
 {
-  "version": "0011",
-  "base_version": "0010",
-  "manifest_version": "4.3.8.0011",
-  "display_version": "0011",
+  "version": "0012",
+  "base_version": "0011",
+  "manifest_version": "4.3.8.0012",
+  "display_version": "0012",
   "patch_files": [
-    "release-src/0011/01-batch-uploader.patch",
-    "release-src/0011/02-version.patch",
-    "release-src/0011/03-test-compat.patch",
-    "release-src/0011/04-tests.patch"
+    "release-src/0012/01-batch-uploader.patch",
+    "release-src/0012/02-version.patch",
+    "release-src/0012/03-test-compat.patch",
+    "release-src/0012/04-tests.patch"
   ],
-  "notes": "0011: forum topic creation is duplicate-safe on large forums: creation-date pagination uses the correct offset date, exact-title lookup falls back to a full paginated scan before any create, and Unicode/whitespace-equivalent titles share one canonical route."
+  "notes": "0012: prevents FilePartsInvalid upload failures by respecting Telegram multipart ceilings (4000 regular / 8000 Premium parts at 512 KiB), routing borderline files to Premium, and performing one clean 512 KiB multipart restart with a fresh upload id when Premium still receives FILE_PARTS_INVALID."
 }
