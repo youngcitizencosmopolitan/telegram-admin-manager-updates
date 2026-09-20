@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0010",
-  "display_version": "0010",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0010/TelegramAdminManager_v0010_update.zip",
-  "sha256": "02dad7fdd70a4c08127e55dc7c0c3f51c0a23286ca6b4b2ee2145317a6c6b971",
-  "notes": "0010: multi-rule monitoring batches now release regular accounts to following rules while Premium-only 2–4 GB tails continue; newly added eligible accounts are hot-connected to the active batch, auto-joined and promoted with maximum available admin rights through an existing live controller, and can take queued files without restarting monitoring."
+  "version": "4.3.8.0011",
+  "display_version": "0011",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0011/TelegramAdminManager_v0011_update.zip",
+  "sha256": "fb650927a7f462c4b76aea306c5740f31b5fcb2cbf1ad448577882920c16559e",
+  "notes": "0011: forum topic creation is duplicate-safe on large forums: creation-date pagination uses the correct offset date, exact-title lookup falls back to a full paginated scan before any create, and Unicode/whitespace-equivalent titles share one canonical route."
 }
