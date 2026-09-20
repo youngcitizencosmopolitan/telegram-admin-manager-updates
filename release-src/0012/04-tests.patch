@@ -1,0 +1,110 @@
+--- /dev/null
++++ b/app/tests/test_0012_file_parts_invalid.py
+@@ -0,0 +1,107 @@
++from __future__ import annotations
++
++import asyncio
++import unittest
++from pathlib import Path
++
++from batch_uploader import (
++    TELEGRAM_MAX_UPLOAD_PART_SIZE,
++    TELEGRAM_MAX_FILEPARTS_DEFAULT,
++    TELEGRAM_MAX_FILEPARTS_PREMIUM,
++    _is_file_parts_invalid_error,
++    _file_parts_invalid_action,
++    _telegram_upload_lane,
++    _send_file_with_safe_parts,
++)
++
++
++class TelegramMultipartLimitTests(unittest.TestCase):
++    def test_regular_lane_stops_at_default_filepart_capacity(self):
++        max_regular = TELEGRAM_MAX_UPLOAD_PART_SIZE * TELEGRAM_MAX_FILEPARTS_DEFAULT
++        self.assertEqual(_telegram_upload_lane(max_regular), "small")
++        self.assertEqual(_telegram_upload_lane(max_regular + 1), "premium")
++
++    def test_premium_lane_stops_at_premium_filepart_capacity(self):
++        max_premium = TELEGRAM_MAX_UPLOAD_PART_SIZE * TELEGRAM_MAX_FILEPARTS_PREMIUM
++        self.assertEqual(_telegram_upload_lane(max_premium), "premium")
++        self.assertEqual(_telegram_upload_lane(max_premium + 1), "too_large")
++
++    def test_file_parts_invalid_recovery_reroutes_regular_and_restarts_premium_once(self):
++        regular_size = TELEGRAM_MAX_UPLOAD_PART_SIZE * 100
++        self.assertEqual(
++            _file_parts_invalid_action(regular_size, premium=False, safe_retry_used=False),
++            "premium",
++        )
++        self.assertEqual(
++            _file_parts_invalid_action(regular_size, premium=True, safe_retry_used=False),
++            "retry_safe",
++        )
++        self.assertEqual(
++            _file_parts_invalid_action(regular_size, premium=True, safe_retry_used=True),
++            "fail",
++        )
++
++    def test_file_parts_invalid_error_is_detected_by_telethon_name(self):
++        FilePartsInvalidError = type("FilePartsInvalidError", (Exception,), {})
++        self.assertTrue(_is_file_parts_invalid_error(FilePartsInvalidError("bad parts")))
++        self.assertFalse(_is_file_parts_invalid_error(ValueError("bad parts")))
++
++
++class SafeMultipartRestartTests(unittest.IsolatedAsyncioTestCase):
++    async def test_safe_restart_uploads_with_fresh_512kb_parts_then_sends_handle(self):
++        class FakeClient:
++            def __init__(self):
++                self.upload_calls = []
++                self.send_calls = []
++                self.handle = object()
++
++            async def upload_file(self, file, **kwargs):
++                self.upload_calls.append((file, dict(kwargs)))
++                return self.handle
++
++            async def send_file(self, entity, file, **kwargs):
++                self.send_calls.append((entity, file, dict(kwargs)))
++                return "message"
++
++        client = FakeClient()
++        progress = lambda current, total: None
++        kwargs = {
++            "caption": "caption",
++            "progress_callback": progress,
++            "silent": True,
++            "supports_streaming": True,
++        }
++        path = Path("movie.mp4")
++        result = await _send_file_with_safe_parts(
++            client,
++            "target",
++            path,
++            123456789,
++            kwargs,
++        )
++
++        self.assertEqual(result, "message")
++        self.assertEqual(len(client.upload_calls), 1)
++        upload_file, upload_kwargs = client.upload_calls[0]
++        self.assertEqual(upload_file, str(path))
++        self.assertEqual(upload_kwargs["part_size_kb"], 512)
++        self.assertEqual(upload_kwargs["file_size"], 123456789)
++        self.assertIs(upload_kwargs["progress_callback"], progress)
++
++        self.assertEqual(len(client.send_calls), 1)
++        entity, uploaded_handle, send_kwargs = client.send_calls[0]
++        self.assertEqual(entity, "target")
++        self.assertIs(uploaded_handle, client.handle)
++        self.assertNotIn("progress_callback", send_kwargs)
++        self.assertEqual(send_kwargs["caption"], "caption")
++        self.assertTrue(send_kwargs["supports_streaming"])
++
++
++class VersionTests(unittest.TestCase):
++    def test_version_is_0012(self):
++        import telegram_admin_manager as main_app
++        self.assertEqual(main_app.APP_VERSION, "0012")
++
++
++if __name__ == "__main__":
++    unittest.main()
