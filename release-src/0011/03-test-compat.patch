@@ -1,0 +1,15 @@
+--- a/app/tests/test_0010_hot_add_account.py
++++ b/app/tests/test_0010_hot_add_account.py
+@@ -76,10 +76,10 @@
+         self.assertNotIn('size > FREE_FILE_LIMIT and not premium_sessions', source)
+         self.assertIn('big_queue.put_nowait(item)', source)
+ 
+-    def test_version_is_0010(self):
++    def test_version_is_0010_or_newer(self):
+         import re
+         from pathlib import Path
+         text = Path('telegram_admin_manager.py').read_text(encoding='utf-8')
+         match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+         self.assertIsNotNone(match)
+-        self.assertEqual(match.group(1), '0010')
++        self.assertGreaterEqual(int(match.group(1)), 10)

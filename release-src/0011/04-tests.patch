@@ -1,0 +1,227 @@
+--- /dev/null
++++ b/app/tests/test_0011_forum_topic_duplicate_guard.py
+@@ -0,0 +1,224 @@
++from __future__ import annotations
++
++import asyncio
++import unittest
++from datetime import datetime, timezone
++from types import SimpleNamespace
++
++from batch_uploader import BatchUploaderPane
++
++
++class _GetForumTopicsRequest:
++    def __init__(self, **kwargs):
++        self.kwargs = dict(kwargs)
++
++
++class _CreateForumTopicRequest:
++    def __init__(self, **kwargs):
++        self.kwargs = dict(kwargs)
++
++
++class _Topic:
++    def __init__(self, topic_id: int, title: str, top_message: int, created_ts: int):
++        self.id = topic_id
++        self.title = title
++        self.top_message = top_message
++        self.date = created_ts
++
++
++class _Message:
++    def __init__(self, message_id: int, date_ts: int):
++        self.id = message_id
++        self.date = datetime.fromtimestamp(date_ts, tz=timezone.utc)
++
++
++class _TopicsResult:
++    def __init__(self, topics, *, messages=None, order_by_create_date=False, count=None):
++        self.topics = list(topics)
++        self.messages = list(messages or [])
++        self.order_by_create_date = bool(order_by_create_date)
++        self.count = len(self.topics) if count is None else count
++
++
++class ForumTopicCreateDatePaginationTests(unittest.IsolatedAsyncioTestCase):
++    async def test_create_date_order_uses_topic_creation_date_for_next_page(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane._forum_request_class = lambda _name: (_GetForumTopicsRequest, "messages")
++        first = _Topic(700, "Recent", 9700, 1_700_000_100)
++        needed = _Topic(600, "Existing old topic", 9600, 1_700_000_000)
++        calls = []
++
++        async def client(request):
++            calls.append(dict(request.kwargs))
++            offset_topic = int(request.kwargs.get("offset_topic", 0) or 0)
++            if offset_topic == 0:
++                # Last-message date intentionally differs from the topic creation date.
++                return _TopicsResult(
++                    [first],
++                    messages=[_Message(first.top_message, 1_800_000_100)],
++                    order_by_create_date=True,
++                    count=2,
++                )
++            if (
++                offset_topic == first.id
++                and int(request.kwargs.get("offset_date", 0) or 0) == first.date
++            ):
++                return _TopicsResult(
++                    [needed],
++                    messages=[_Message(needed.top_message, 1_800_000_000)],
++                    order_by_create_date=True,
++                    count=2,
++                )
++            return _TopicsResult([], order_by_create_date=True, count=2)
++
++        topics = await pane._get_forum_topics(client, object())
++        self.assertEqual([t.title for t in topics], ["Recent", "Existing old topic"])
++        self.assertGreaterEqual(len(calls), 2)
++        self.assertEqual(calls[1]["offset_date"], first.date)
++
++
++class ForumTopicExactLookupTests(unittest.IsolatedAsyncioTestCase):
++    async def test_query_miss_falls_back_to_full_topic_scan(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        existing = _Topic(501, "Fansly - naughtyannalee (Video_pack)", 9001, 1_700_000_000)
++        calls = []
++
++        async def get_topics(_client, _entity, query=None):
++            calls.append(query)
++            if query is not None:
++                return []  # Telegram search can miss an old/exact topic.
++            return [existing]
++
++        pane._get_forum_topics = get_topics
++        found = await pane._find_forum_topic(
++            object(), object(), "Fansly - naughtyannalee (Video_pack)"
++        )
++        self.assertIs(found, existing)
++        self.assertEqual(calls, ["Fansly - naughtyannalee (Video_pack)", None])
++
++    async def test_title_matching_normalizes_unicode_and_whitespace(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        existing = _Topic(
++            502,
++            "Fansly\u00a0-\u00a0naughtyannalee   (Video_pack)",
++            9002,
++            1_700_000_000,
++        )
++
++        async def get_topics(_client, _entity, query=None):
++            return [existing] if query is None else []
++
++        pane._get_forum_topics = get_topics
++        found = await pane._find_forum_topic(
++            object(), object(), "Fansly - naughtyannalee (Video_pack)"
++        )
++        self.assertIs(found, existing)
++
++
++class _Cache:
++    def __init__(self):
++        self.saved = []
++
++    def fresh_topics(self, _target, _ttl):
++        return {}
++
++    def invalidate_topics(self, _target):
++        return None
++
++    def mark_topics(self, target, topic_map, **_kwargs):
++        self.saved.append((target, dict(topic_map)))
++
++
++class _App:
++    def __init__(self):
++        self.group_state_cache = _Cache()
++        self.logs = []
++
++    def log(self, text):
++        self.logs.append(str(text))
++
++    def _friendly_error(self, exc):
++        return str(exc)
++
++    def ui_call(self, fn):
++        fn()
++
++    def safety_policy(self):
++        return {"enabled": False, "admin_delay": 0.0}
++
++    def _target_key(self, _entity):
++        return "target:42"
++
++
++class ForumTopicCreationGuardTests(unittest.IsolatedAsyncioTestCase):
++    async def test_existing_topic_found_by_full_scan_is_never_created_again(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.app = _App()
++        pane.stop_event = SimpleNamespace(is_set=lambda: False)
++        pane._local_topic_titles = lambda _task: ["Fansly - naughtyannalee (Video_pack)"]
++        pane._cache_ttl_hours = lambda: 24.0
++        pane._forum_request_class = lambda name: (
++            (_CreateForumTopicRequest, "messages")
++            if name == "CreateForumTopicRequest"
++            else (_GetForumTopicsRequest, "messages")
++        )
++        pane._client_can_manage_topics = lambda *_args: asyncio.sleep(0, result=True)
++        pane._sleep_stop = lambda _seconds: asyncio.sleep(0, result=True)
++
++        existing = _Topic(
++            777,
++            "Fansly\u00a0-\u00a0naughtyannalee  (Video_pack)",
++            9777,
++            1_700_000_000,
++        )
++        full_reads = 0
++
++        async def get_topics(_client, _entity, query=None):
++            nonlocal full_reads
++            if query is not None:
++                return []
++            full_reads += 1
++            # Simulate a stale/incomplete first discovery; the pre-create safety
++            # lookup must do another full sweep and find the existing topic.
++            return [] if full_reads == 1 else [existing]
++
++        pane._get_forum_topics = get_topics
++
++        class _Client:
++            def __init__(self):
++                self.create_calls = 0
++
++            async def __call__(self, request):
++                if isinstance(request, _CreateForumTopicRequest):
++                    self.create_calls += 1
++                    return SimpleNamespace(topic_id=999)
++                raise AssertionError(type(request))
++
++        client = _Client()
++        entity = SimpleNamespace(forum=True, title="Forum")
++        task = {
++            "name": "Rule",
++            "target": "forum-target",
++            "forum_topics_from_subfolders": True,
++            "forum_auto_create_topics": True,
++        }
++        result = await pane._prepare_forum_topics(
++            task,
++            {"s1": (SimpleNamespace(), client)},
++            {"s1": entity},
++        )
++
++        self.assertEqual(client.create_calls, 0)
++        key = pane._forum_topic_title_key("Fansly - naughtyannalee (Video_pack)")
++        self.assertEqual(result[key], existing.id)
++
++
++class VersionTests(unittest.TestCase):
++    def test_version_is_0011(self):
++        import telegram_admin_manager as main_app
++
++        self.assertEqual(main_app.APP_VERSION, "0011")
++
++
++if __name__ == "__main__":
++    unittest.main()
