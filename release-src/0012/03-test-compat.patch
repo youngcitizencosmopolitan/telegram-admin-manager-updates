@@ -1,0 +1,15 @@
+--- a/app/tests/test_0011_forum_topic_duplicate_guard.py
++++ b/app/tests/test_0011_forum_topic_duplicate_guard.py
+@@ -214,10 +214,10 @@
+ 
+ 
+ class VersionTests(unittest.TestCase):
+-    def test_version_is_0011(self):
++    def test_version_is_0011_or_newer(self):
+         import telegram_admin_manager as main_app
+ 
+-        self.assertEqual(main_app.APP_VERSION, "0011")
++        self.assertGreaterEqual(int(main_app.APP_VERSION), 11)
+ 
+ 
+ if __name__ == "__main__":

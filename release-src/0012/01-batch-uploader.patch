@@ -1,0 +1,197 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -39,9 +39,70 @@
+ 
+ FILE_PART_REQUEUE_LIMIT = 2
+ 
++# Telegram limits the *number* of upload.saveBigFilePart chunks, not just the
++# advertised file size. With the largest legal/recommended 512 KiB chunk, the
++# current appConfig limits are 4000 parts for regular accounts and 8000 for
++# Premium. Keep routing inside those protocol ceilings so Telethon never asks
++# Telegram to accept an invalid file_total_parts value.
++TELEGRAM_MAX_UPLOAD_PART_SIZE = 512 * 1024
++TELEGRAM_MAX_FILEPARTS_DEFAULT = 4000
++TELEGRAM_MAX_FILEPARTS_PREMIUM = 8000
++TELEGRAM_DEFAULT_PARTS_LIMIT = TELEGRAM_MAX_UPLOAD_PART_SIZE * TELEGRAM_MAX_FILEPARTS_DEFAULT
++TELEGRAM_PREMIUM_PARTS_LIMIT = TELEGRAM_MAX_UPLOAD_PART_SIZE * TELEGRAM_MAX_FILEPARTS_PREMIUM
++
+ def _is_file_part_missing_error(exc: Exception) -> bool:
+     return exc.__class__.__name__ == "FilePartMissingError"
+ 
++def _is_file_parts_invalid_error(exc: Exception) -> bool:
++    return exc.__class__.__name__ == "FilePartsInvalidError"
++
++def _telegram_upload_lane(size: int) -> str:
++    """Return small/premium/too_large using Telegram multipart ceilings."""
++    value = max(0, int(size or 0))
++    premium_limit = min(PREMIUM_FILE_LIMIT, TELEGRAM_PREMIUM_PARTS_LIMIT)
++    regular_limit = min(FREE_FILE_LIMIT, TELEGRAM_DEFAULT_PARTS_LIMIT)
++    if value > premium_limit:
++        return "too_large"
++    if value > regular_limit:
++        return "premium"
++    return "small"
++
++def _file_parts_invalid_action(size: int, *, premium: bool, safe_retry_used: bool) -> str:
++    """Choose the safe recovery for FILE_PARTS_INVALID.
++
++    A regular account is rerouted to Premium because its server-side part limit
++    may be lower. A Premium account gets one full restart with fresh upload id
++    and fixed 512 KiB parts; repeating the same invalid request forever is not
++    useful.
++    """
++    if _telegram_upload_lane(size) == "too_large":
++        return "too_large"
++    if not premium:
++        return "premium"
++    if not safe_retry_used:
++        return "retry_safe"
++    return "fail"
++
++async def _send_file_with_safe_parts(
++    client: Any, entity: Any, path: Path, size: int, send_kwargs: dict[str, Any]
++) -> Any:
++    """Restart one upload from byte zero using fresh 512 KiB parts.
++
++    Telethon generates a fresh random upload file_id for every upload_file call.
++    We pass the returned InputFile handle to send_file so the main file is not
++    uploaded twice. Thumbnail/caption/topic options remain in send_kwargs.
++    """
++    progress_callback = send_kwargs.get("progress_callback")
++    uploaded = await client.upload_file(
++        str(path),
++        part_size_kb=512,
++        file_size=int(size),
++        progress_callback=progress_callback,
++    )
++    final_kwargs = dict(send_kwargs)
++    final_kwargs.pop("progress_callback", None)
++    return await client.send_file(entity, uploaded, **final_kwargs)
++
+ def _next_file_part_requeue_cycle(completed_cycles: int) -> int | None:
+     next_cycle = int(completed_cycles) + 1
+     return next_cycle if next_cycle <= FILE_PART_REQUEUE_LIMIT else None
+@@ -3957,14 +4018,17 @@
+                 state["processed_bytes"] += size
+                 state["processed_files"] += 1
+                 state["skipped"] += 1
+-            elif size > PREMIUM_FILE_LIMIT:
++            elif _telegram_upload_lane(size) == "too_large":
+                 state["processed_bytes"] += size
+                 state["processed_files"] += 1
+                 state["skipped"] += 1
+                 state["limit_skipped"] += 1
+                 key = f"{tid}:{path}"
+-                self.app.log(f"{name} → {path.name}: ⏭ больше 4 ГБ ({size / 1024**3:.2f} ГБ), пропускаю")
+-                self.app.ui_call(lambda k=key, p=path, z=size: self._activity_update(k, name, p, "—", z, 0.0, 0.0, "⏭ >4 ГБ"))
++                self.app.log(
++                    f"{name} → {path.name}: ⏭ превышает multipart-лимит Telegram Premium "
++                    f"({size / 1024**3:.2f} ГБ), пропускаю"
++                )
++                self.app.ui_call(lambda k=key, p=path, z=size: self._activity_update(k, name, p, "—", z, 0.0, 0.0, "⏭ лимит Telegram"))
+             else:
+                 # Keep 2–4 GB work pending even if no Premium account existed at
+                 # the initial snapshot. A Premium account hot-added while the task
+@@ -3984,7 +4048,7 @@
+         file_part_requeue_cycles: dict[str, int] = {}
+         for item in pending:
+             _idx, path = item
+-            if path.stat().st_size > FREE_FILE_LIMIT:
++            if _telegram_upload_lane(path.stat().st_size) == "premium":
+                 big_queue.put_nowait(item)
+             else:
+                 small_queue.put_nowait(item)
+@@ -4009,7 +4073,7 @@
+ 
+         def queue_for_path(path: Path) -> asyncio.Queue[tuple[int, Path]]:
+             try:
+-                return big_queue if path.stat().st_size > FREE_FILE_LIMIT else small_queue
++                return big_queue if _telegram_upload_lane(path.stat().st_size) == "premium" else small_queue
+             except OSError:
+                 return small_queue
+ 
+@@ -4103,14 +4167,15 @@
+                     self._emit_task_metrics(tid, force=True)
+                     continue
+ 
+-                if size > PREMIUM_FILE_LIMIT:
++                upload_lane = _telegram_upload_lane(size)
++                if upload_lane == "too_large":
+                     state["processed_bytes"] += size
+                     state["processed_files"] += 1
+                     state["skipped"] += 1
+                     state["limit_skipped"] += 1
+                     self._emit_task_metrics(tid, force=True)
+                     continue
+-                if size > FREE_FILE_LIMIT and not premium_by_session.get(session, False):
++                if upload_lane == "premium" and not premium_by_session.get(session, False):
+                     big_queue.put_nowait(item)
+                     return
+ 
+@@ -4241,6 +4306,7 @@
+                         self.app.log(f"{name}: {account.display} → {path.name}: начинаю")
+                         transfer_started = time.monotonic()
+                         transient_retry_count = 0
++                        safe_parts_retry_used = False
+                         max_transient_retries = int(policy.get("upload_retries", 3) or 0)
+                         retry_base_delay = float(policy.get("retry_base_delay", 5) or 5)
+                         while True:
+@@ -4279,7 +4345,10 @@
+                                         topic_id = topic_id_for_path(path)
+                                         if topic_id:
+                                             send_kwargs["reply_to"] = int(topic_id)
+-                                    message = await client.send_file(entity, str(path), **send_kwargs)
++                                    if safe_parts_retry_used:
++                                        message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs)
++                                    else:
++                                        message = await client.send_file(entity, str(path), **send_kwargs)
+                                 message_id = getattr(message, "id", None)
+                                 self.app.upload_history.record_completed(
+                                     path,
+@@ -4380,6 +4449,46 @@
+                                 if "Topic" in exc_name or "topic" in friendly.casefold() or "тема" in friendly.casefold():
+                                     self.app.group_state_cache.invalidate_topics(task_target)
+                                     self.app.ui_call(self.refresh_monitor_tab)
++                                if _is_file_parts_invalid_error(exc):
++                                    action = _file_parts_invalid_action(
++                                        size,
++                                        premium=bool(premium_by_session.get(session, False)),
++                                        safe_retry_used=safe_parts_retry_used,
++                                    )
++                                    if action == "premium":
++                                        release_reservation()
++                                        big_queue.put_nowait(item)
++                                        self.app.log(
++                                            f"{name}: {account.display} → {path.name}: Telegram отклонил число частей; "
++                                            "переношу файл в Premium-очередь."
++                                        )
++                                        self.app.ui_call(
++                                            lambda k=key, p=path, a=account_name:
++                                            self._activity_update(k, name, p, a, size, 0.0, 0.0, "↻ Нужен Premium")
++                                        )
++                                        self._emit_task_metrics(tid, force=True)
++                                        break
++                                    if action == "retry_safe":
++                                        safe_parts_retry_used = True
++                                        transfer.update({"current": 0, "speed": 0.0, "last_current": 0, "last_time": time.monotonic()})
++                                        state["active"][key] = transfer
++                                        self.app.log(
++                                            f"{name}: {account.display} → {path.name}: Telegram отклонил число частей; "
++                                            "перезапускаю файл с нуля с новым upload-id и частями 512 КБ (1/1)."
++                                        )
++                                        self.app.ui_call(
++                                            lambda k=key, p=path, a=account_name:
++                                            self._activity_update(k, name, p, a, size, 0.0, 0.0, "↻ multipart 512 КБ")
++                                        )
++                                        continue
++                                    if action == "too_large":
++                                        friendly = (
++                                            "Файл превышает multipart-лимит Telegram для Premium "
++                                            f"({TELEGRAM_MAX_FILEPARTS_PREMIUM} частей × 512 КБ): {friendly}"
++                                        )
++                                    else:
++                                        friendly = f"Telegram снова отклонил число частей после чистого перезапуска: {friendly}"
++
+                                 if _is_file_part_missing_error(exc):
+                                     path_key = str(path)
+                                     next_cycle = _next_file_part_requeue_cycle(file_part_requeue_cycles.get(path_key, 0))
