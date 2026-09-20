@@ -1,0 +1,197 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -7,6 +7,7 @@
+ import secrets
+ import threading
+ import time
++import unicodedata
+ import uuid
+ from pathlib import Path, PureWindowsPath
+ from typing import Any
+@@ -2113,9 +2114,10 @@
+             raw = title.encode("utf-8")
+             if len(raw) > 128:
+                 title = raw[:128].decode("utf-8", errors="ignore").rstrip()
+-            if title and title.casefold() not in {x.casefold() for x in titles}:
++            key = self._forum_topic_title_key(title)
++            if title and key not in {self._forum_topic_title_key(x) for x in titles}:
+                 titles.append(title)
+-        return sorted(titles, key=str.casefold)
++        return sorted(titles, key=self._forum_topic_title_key)
+ 
+     def _scan_monitor_snapshot(self, task: dict[str, Any]) -> tuple[str, set[str]]:
+         """Return metadata signature plus normalized relative media paths.
+@@ -3324,6 +3326,17 @@
+         except Exception:
+             return "Telethon не удалось определить"
+ 
++    @staticmethod
++    def _forum_topic_title_key(title: Any) -> str:
++        """Canonical key used only for forum-topic discovery/routing.
++
++        Telegram/local folder names may contain compatibility Unicode or visually
++        equivalent whitespace (for example NBSP vs a normal space). Those must
++        not be treated as distinct topics when deciding whether creation is safe.
++        """
++        text = unicodedata.normalize("NFKC", str(title or ""))
++        return " ".join(text.split()).casefold()
++
+     async def _get_forum_topics(self, client: Any, entity: Any, query: str | None = None) -> list[Any]:
+         request_cls, namespace = self._forum_request_class("GetForumTopicsRequest")
+         if request_cls is None:
+@@ -3379,21 +3392,31 @@
+             next_topic = int(getattr(last_topic, "id", 0) or 0)
+             next_id = int(getattr(last_topic, "top_message", 0) or 0)
+             next_date = 0
+-            for message in list(getattr(result, "messages", []) or []):
+-                if int(getattr(message, "id", 0) or 0) != next_id:
+-                    continue
+-                value = getattr(message, "date", 0)
+-                try:
+-                    next_date = int(value.timestamp()) if hasattr(value, "timestamp") else int(value or 0)
+-                except Exception:
+-                    next_date = 0
+-                break
+-            if not next_date:
++            if bool(getattr(result, "order_by_create_date", False)):
++                # messages.ForumTopics explicitly changes offset_date semantics
++                # in this mode: paginate by ForumTopic.date (creation date), not
++                # by the date of ForumTopic.top_message.
+                 value = getattr(last_topic, "date", 0)
+                 try:
+                     next_date = int(value.timestamp()) if hasattr(value, "timestamp") else int(value or 0)
+                 except Exception:
+                     next_date = 0
++            else:
++                for message in list(getattr(result, "messages", []) or []):
++                    if int(getattr(message, "id", 0) or 0) != next_id:
++                        continue
++                    value = getattr(message, "date", 0)
++                    try:
++                        next_date = int(value.timestamp()) if hasattr(value, "timestamp") else int(value or 0)
++                    except Exception:
++                        next_date = 0
++                    break
++                if not next_date:
++                    value = getattr(last_topic, "date", 0)
++                    try:
++                        next_date = int(value.timestamp()) if hasattr(value, "timestamp") else int(value or 0)
++                    except Exception:
++                        next_date = 0
+ 
+             next_offsets = (next_date, next_id, next_topic)
+             if next_topic <= 0 or next_offsets in seen_offsets:
+@@ -3406,13 +3429,27 @@
+         return all_topics
+ 
+     async def _find_forum_topic(self, client: Any, entity: Any, title: str) -> Any | None:
+-        wanted = title.strip().casefold()
++        """Find an existing topic fail-closed before any creation attempt.
++
++        Telegram's title search is only an optimization: an empty search result is
++        never proof that the topic does not exist. Always fall back to a complete
++        paginated scan before returning None.
++        """
++        wanted = self._forum_topic_title_key(title)
++        searched: list[Any] = []
+         try:
+-            topics = await self._get_forum_topics(client, entity, query=title)
++            searched = await self._get_forum_topics(client, entity, query=title)
+         except TypeError:
+-            topics = await self._get_forum_topics(client, entity, query=None)
++            # Older generated schemas may not accept q; the full scan below is
++            # authoritative and preserves compatibility.
++            searched = []
++        for topic in searched:
++            if self._forum_topic_title_key(getattr(topic, "title", "")) == wanted:
++                return topic
++
++        topics = await self._get_forum_topics(client, entity, query=None)
+         for topic in topics:
+-            if str(getattr(topic, "title", "")).strip().casefold() == wanted:
++            if self._forum_topic_title_key(getattr(topic, "title", "")) == wanted:
+                 return topic
+         return None
+ 
+@@ -3468,8 +3505,13 @@
+             )
+ 
+         target = str(task.get("target", ""))
+-        cached_topic_map = self.app.group_state_cache.fresh_topics(target, self._cache_ttl_hours())
+-        if cached_topic_map and all(title.casefold() in cached_topic_map for title in titles):
++        cached_raw = self.app.group_state_cache.fresh_topics(target, self._cache_ttl_hours())
++        cached_topic_map = {
++            self._forum_topic_title_key(title): int(topic_id)
++            for title, topic_id in dict(cached_raw or {}).items()
++            if self._forum_topic_title_key(title) and int(topic_id or 0)
++        }
++        if cached_topic_map and all(self._forum_topic_title_key(title) in cached_topic_map for title in titles):
+             self.app.log(
+                 f"{task.get('name', 'Задание')}: 🧠 кэш тем — все {len(titles)} локальных тем уже известны; "
+                 "повторный запрос списка тем пропускаю."
+@@ -3495,9 +3537,9 @@
+                 if title and topic_id:
+                     # Preserve the first server topic with this title. Existing duplicate
+                     # names must not make the route flip between topic IDs each poll.
+-                    topic_map.setdefault(title.casefold(), topic_id)
++                    topic_map.setdefault(self._forum_topic_title_key(title), topic_id)
+ 
+-            missing = [title for title in titles if title.casefold() not in topic_map]
++            missing = [title for title in titles if self._forum_topic_title_key(title) not in topic_map]
+             # Search exact existing topic before creating. A failed lookup is not
+             # equivalent to "missing": fail closed so a transient Telegram error
+             # cannot create a duplicate topic.
+@@ -3514,7 +3556,7 @@
+                 if found is not None:
+                     topic_id = int(getattr(found, "id", 0) or 0)
+                     if topic_id:
+-                        topic_map[title.casefold()] = topic_id
++                        topic_map[self._forum_topic_title_key(title)] = topic_id
+         else:
+             self.app.log(
+                 f"{task.get('name', 'Задание')}: {self._telethon_diagnostic()} не умеет читать темы; "
+@@ -3525,7 +3567,7 @@
+                 "Запусти repair_dependencies.bat."
+             )
+ 
+-        missing = [title for title in titles if title.casefold() not in topic_map]
++        missing = [title for title in titles if self._forum_topic_title_key(title) not in topic_map]
+         if not missing:
+             self.app.group_state_cache.mark_topics(
+                 target, topic_map, title=str(getattr(first_entity, "title", "") or ""), forum=True
+@@ -3571,7 +3613,7 @@
+         for idx, title in enumerate(missing, start=1):
+             if self.stop_event.is_set():
+                 break
+-            claim_key = f"{stable_target}\0{title.strip().casefold()}"
++            claim_key = f"{stable_target}\0{self._forum_topic_title_key(title)}"
+             await _acquire_topic_creation_claim(claim_key)
+             try:
+                 # Another task may have created this title while we waited for the
+@@ -3580,7 +3622,7 @@
+                 if found is not None:
+                     topic_id = int(getattr(found, "id", 0) or 0)
+                     if topic_id:
+-                        topic_map[title.casefold()] = topic_id
++                        topic_map[self._forum_topic_title_key(title)] = topic_id
+                         self.app.group_state_cache.mark_topics(
+                             target, topic_map, title=str(getattr(first_entity, "title", "") or ""), forum=True
+                         )
+@@ -3631,7 +3673,7 @@
+ 
+                 if not topic_id:
+                     raise RuntimeError("не удалось определить ID созданной темы")
+-                topic_map[title.casefold()] = int(topic_id)
++                topic_map[self._forum_topic_title_key(title)] = int(topic_id)
+                 # Persist each created topic immediately. If a later creation is
+                 # cancelled or the app closes, the successful title -> id mapping
+                 # is still available on the next monitoring cycle.
+@@ -3850,7 +3892,7 @@
+             title = self._topic_title_for_path(task, path)
+             if title is None:
+                 return None
+-            return topic_map.get(title.casefold())
++            return topic_map.get(self._forum_topic_title_key(title))
+ 
+         def history_key_for_path(path: Path) -> str:
+             if not forum_mode:
