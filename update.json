@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0011",
-  "display_version": "0011",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0011/TelegramAdminManager_v0011_update.zip",
-  "sha256": "fb650927a7f462c4b76aea306c5740f31b5fcb2cbf1ad448577882920c16559e",
-  "notes": "0011: forum topic creation is duplicate-safe on large forums: creation-date pagination uses the correct offset date, exact-title lookup falls back to a full paginated scan before any create, and Unicode/whitespace-equivalent titles share one canonical route."
+  "version": "4.3.8.0012",
+  "display_version": "0012",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0012/TelegramAdminManager_v0012_update.zip",
+  "sha256": "f4f0d16d9456e4846f62e5726679f5c3899e647a30d651d3c6e8d36cbf927725",
+  "notes": "0012: prevents FilePartsInvalid upload failures by respecting Telegram multipart ceilings (4000 regular / 8000 Premium parts at 512 KiB), routing borderline files to Premium, and performing one clean 512 KiB multipart restart with a fresh upload id when Premium still receives FILE_PARTS_INVALID."
 }
