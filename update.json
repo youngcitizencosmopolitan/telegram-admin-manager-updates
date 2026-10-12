@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0012",
-  "display_version": "0012",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0012/TelegramAdminManager_v0012_update.zip",
-  "sha256": "f4f0d16d9456e4846f62e5726679f5c3899e647a30d651d3c6e8d36cbf927725",
-  "notes": "0012: prevents FilePartsInvalid upload failures by respecting Telegram multipart ceilings (4000 regular / 8000 Premium parts at 512 KiB), routing borderline files to Premium, and performing one clean 512 KiB multipart restart with a fresh upload id when Premium still receives FILE_PARTS_INVALID."
+  "version": "4.3.8.0013",
+  "display_version": "0013",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0013/TelegramAdminManager_v0013_update.zip",
+  "sha256": "03bc05a67528bb9cacb1fba410ae49695d446eaa6858f43f3ca2efe814b5a6c3",
+  "notes": "0013: fixes stale New counts in folder monitoring. Counts clear after a scan without new files or successful batch completion; historical detections no longer appear as current arrivals after restart. Arrivals detected during an older batch remain protected. Includes five regression tests."
 }
