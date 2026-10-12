@@ -1,0 +1,14 @@
+--- a/app/tests/test_0012_file_parts_invalid.py
++++ b/app/tests/test_0012_file_parts_invalid.py
+@@ -98,9 +98,9 @@
+ 
+ 
+ class VersionTests(unittest.TestCase):
+-    def test_version_is_0012(self):
++    def test_version_is_0012_or_newer(self):
+         import telegram_admin_manager as main_app
+-        self.assertEqual(main_app.APP_VERSION, "0012")
++        self.assertGreaterEqual(int(main_app.APP_VERSION), 12)
+ 
+ 
+ if __name__ == "__main__":

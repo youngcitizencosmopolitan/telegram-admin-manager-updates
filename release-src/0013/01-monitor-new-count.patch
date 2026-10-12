@@ -1,0 +1,95 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -1049,7 +1049,7 @@
+                         self.app.group_display_name(str(rule.get("target", ""))) if hasattr(self.app, "group_display_name") else str(rule.get("target", "")),
+                         caption if caption else "—",
+                         f"{interval}с",
+-                        str(int(runtime.get("new_files", rule.get("monitor_last_new_count", 0)) or 0)) if int(runtime.get("new_files", rule.get("monitor_last_new_count", 0)) or 0) > 0 else "—",
++                        str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
+                         work_text,
+                         f"{progress:.0f}%" if work_text != "—" else "—",
+                         _fmt_speed(speed),
+@@ -1067,7 +1067,7 @@
+                         self.app.group_display_name(str(rule.get("target", ""))) if hasattr(self.app, "group_display_name") else str(rule.get("target", "")),
+                         f"{interval}с", self._clock(runtime.get("last_check") or rule.get("monitor_last_check", 0)), next_text,
+                         f"{known_admins}/{len(accounts)}" if accounts else "0/0", str(topics_count),
+-                        str(int(runtime.get("new_files", rule.get("monitor_last_new_count", 0)) or 0)) if int(runtime.get("new_files", rule.get("monitor_last_new_count", 0)) or 0) > 0 else "—",
++                        str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
+                         work_text, state_text,
+                     ),
+                 )
+@@ -2399,6 +2399,7 @@
+                 runtime.update({"last_check": wall_now, "next_check": wall_now + interval, "state": "Сканирование…"})
+                 self.app.ui_call(self.refresh_monitor_tab)
+                 signature, current_files = await asyncio.to_thread(self._scan_monitor_snapshot, task)
++                detected_at = time.time()
+ 
+                 # File arrival detection is independent from uploads. Persist the
+                 # observed path set immediately, even if another upload currently
+@@ -2412,7 +2413,7 @@
+                         previous_files = set()
+                         self.app.log(f"Мониторинг: не удалось прочитать индекс файлов {task.get('name', tid)} — {exc}")
+                     updated_rule, new_count, initialized = self._update_monitor_seen_state(
+-                        task, previous_files=previous_files, current_files=current_files, now=wall_now
++                        task, previous_files=previous_files, current_files=current_files, now=detected_at
+                     )
+                     try:
+                         if initialized or current_files != previous_files:
+@@ -2422,14 +2423,14 @@
+                             task = updated_rule
+                     except Exception as exc:
+                         self.app.log(f"Мониторинг: не удалось сохранить снимок файлов {task.get('name', tid)} — {exc}")
++                    # This column describes this scan, not the last historical
++                    # arrival event retained for the dashboard.
++                    runtime["new_files"] = int(new_count)
+                     if new_count > 0:
+-                        runtime["new_files"] = int(new_count)
+-                        runtime["last_detected"] = wall_now
++                        runtime["last_detected"] = detected_at
+                         self.app.log(
+                             f"Мониторинг: {task.get('name', 'Правило')} — найдено новых файлов: {new_count}."
+                         )
+-                    elif initialized:
+-                        runtime["new_files"] = 0
+ 
+                 old = self.monitor_last_signatures.get(tid)
+                 pending = self.monitor_pending_signatures.get(tid)
+@@ -2476,13 +2477,20 @@
+         self.refresh_monitor_tab()
+         self.app.log("Мониторинг папок остановлен. Очередь загрузок сохранена в текущем сеансе.")
+ 
+-    def _persist_monitor_signature(self, tid: str, signature: str) -> None:
++    def _persist_monitor_signature(
++        self, tid: str, signature: str, *, processed_before: float | None = None
++    ) -> None:
+         rule = self.app.monitor_rules.get(tid)
+         if not rule:
+             return
+         rule["monitor_signature"] = str(signature)
+         rule["monitor_last_success"] = time.time()
+         self.app.monitor_rules.put(rule)
++        runtime = self.monitor_runtime.get(tid, {})
++        cutoff = time.time() if processed_before is None else processed_before
++        # A completed older snapshot must not erase arrivals found during upload.
++        if float(runtime.get("last_detected", 0) or 0) <= cutoff:
++            runtime["new_files"] = 0
+ 
+     def _restore_persistent_queue(self) -> None:
+         """Restore waiting/running queue items from state.db after restart/crash.
+@@ -2843,6 +2851,7 @@
+             else:
+                 self.app.log(f"Очередь: ▶ {names}; параллельный лимит {global_parallel}.")
+             hard_error_ids: set[str] = set()
++            batch_started_at = time.time()
+             try:
+                 result = asyncio.run(
+                     self._run_batch(
+@@ -2883,7 +2892,7 @@
+                         success = tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0 and not was_stopped
+                         if success and tid in sigs:
+                             self.monitor_last_signatures[tid] = sigs[tid]
+-                            self._persist_monitor_signature(tid, sigs[tid])
++                            self._persist_monitor_signature(tid, sigs[tid], processed_before=batch_started_at)
+                             target = str(task.get("target", "")).strip()
+                             if target:
+                                 self.monitor_prepared_targets.add(target)

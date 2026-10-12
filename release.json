@@ -1,13 +1,13 @@
 {
-  "version": "0012",
-  "base_version": "0011",
-  "manifest_version": "4.3.8.0012",
-  "display_version": "0012",
+  "version": "0013",
+  "base_version": "0012",
+  "manifest_version": "4.3.8.0013",
+  "display_version": "0013",
   "patch_files": [
-    "release-src/0012/01-batch-uploader.patch",
-    "release-src/0012/02-version.patch",
-    "release-src/0012/03-test-compat.patch",
-    "release-src/0012/04-tests.patch"
+    "release-src/0013/01-monitor-new-count.patch",
+    "release-src/0013/02-version.patch",
+    "release-src/0013/03-test-compat.patch",
+    "release-src/0013/04-regression-tests.patch"
   ],
-  "notes": "0012: prevents FilePartsInvalid upload failures by respecting Telegram multipart ceilings (4000 regular / 8000 Premium parts at 512 KiB), routing borderline files to Premium, and performing one clean 512 KiB multipart restart with a fresh upload id when Premium still receives FILE_PARTS_INVALID."
+  "notes": "0013: fixes stale New counts in folder monitoring. Counts clear after a scan without new files or successful batch completion; historical detections no longer appear as current arrivals after restart. Arrivals detected during an older batch remain protected. Includes five regression tests."
 }

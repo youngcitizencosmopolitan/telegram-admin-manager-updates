@@ -1,0 +1,132 @@
+--- /dev/null
++++ b/app/tests/test_monitor_new_count.py
+@@ -0,0 +1,129 @@
++import asyncio
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from batch_uploader import BatchUploaderPane
++
++
++class Store:
++    def __init__(self, rule):
++        self.rule = dict(rule)
++
++    def get(self, tid):
++        return dict(self.rule)
++
++    def put(self, rule):
++        self.rule = dict(rule)
++
++    def seen_files(self, tid):
++        return {'old.mp4'}
++
++
++class Tree:
++    def __init__(self):
++        self.rows = {}
++
++    def get_children(self, parent):
++        return list(self.rows)
++
++    def delete(self, iid):
++        del self.rows[iid]
++
++    def insert(self, parent, position, *, iid, text, values):
++        self.rows[iid] = values
++
++
++class MonitorNewCountTests(unittest.TestCase):
++    def pane(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {'id': 'r1', 'name': 'VIP', 'monitor_folder': True,
++                'monitor_seen_initialized': True, 'monitor_last_new_count': 139,
++                'monitor_last_detection': 100.0}
++        pane.app = SimpleNamespace(monitor_rules=Store(rule), log=lambda text: None,
++                                   ui_call=lambda fn: fn())
++        pane.monitor_runtime = {'r1': {'new_files': 139, 'last_detected': 100.0}}
++        return pane
++
++    def test_successful_scan_without_arrivals_clears_stale_count(self):
++        pane = self.pane()
++        pane.monitor_stop_event = threading.Event()
++        pane.monitor_last_signatures = {'r1': 'sig'}
++        pane.monitor_pending_signatures = {}
++        pane.monitor_rules = lambda: [dict(pane.app.monitor_rules.rule)]
++        pane.refresh_monitor_tab = lambda: None
++        pane._scan_monitor_snapshot = lambda task: ('sig', {'old.mp4'})
++
++        async def finish_tick(seconds):
++            pane.monitor_stop_event.set()
++
++        with patch('batch_uploader.asyncio.sleep', finish_tick):
++            asyncio.run(pane._monitor_loop())
++        self.assertEqual(pane.monitor_runtime['r1']['new_files'], 0)
++        # Historical dashboard metadata is intentionally preserved.
++        self.assertEqual(pane.app.monitor_rules.rule['monitor_last_new_count'], 139)
++
++    def test_scan_spanning_batch_start_preserves_later_detection(self):
++        pane = self.pane()
++        pane.monitor_stop_event = threading.Event()
++        pane.monitor_last_signatures = {'r1': 'sig'}
++        pane.monitor_pending_signatures = {}
++        pane.monitor_rules = lambda: [dict(pane.app.monitor_rules.rule)]
++        pane.refresh_monitor_tab = lambda: None
++        pane._enqueue_batch = lambda *args, **kwargs: None
++        pane.app.monitor_rules.replace_seen_files = lambda *args: None
++        clock = [100.0]
++
++        def scan(task):
++            # The uploader freezes its list at 150 while scanning is in progress.
++            clock[0] = 200.0
++            return 'changed', {'old.mp4', 'later.mp4'}
++
++        pane._scan_monitor_snapshot = scan
++
++        async def finish_tick(seconds):
++            pane.monitor_stop_event.set()
++
++        with patch('batch_uploader.asyncio.sleep', finish_tick), patch('batch_uploader.time.time', lambda: clock[0]):
++            asyncio.run(pane._monitor_loop())
++            pane._persist_monitor_signature('r1', 'sig', processed_before=150.0)
++        self.assertEqual(pane.monitor_runtime['r1']['new_files'], 1)
++
++    def test_tables_do_not_show_historical_arrivals_after_restart(self):
++        for unified, new_column in ((True, 5), (False, 9)):
++            with self.subTest(unified=unified):
++                pane = self.pane()
++                pane.monitor_runtime = {}
++                pane.unified_monitor = unified
++                pane.monitor_tree = Tree()
++                pane._monitor_selected_tid = lambda: None
++                pane.monitor_rules = lambda: [pane.app.monitor_rules.rule]
++                pane._queued_task_ids = lambda: set()
++                pane.app.store = SimpleNamespace(accounts=lambda: [])
++                pane.app.group_state_cache = SimpleNamespace(entry=lambda target: {}, all_entries=lambda: [])
++                pane._live_task_lock = threading.Lock()
++                pane.live_tasks = {}
++                pane.task_states = {}
++                pane.monitor_active = False
++                pane.running = False
++                pane.monitor_summary_var = SimpleNamespace(set=lambda value: None)
++                pane.monitor_state_var = SimpleNamespace(set=lambda value: None)
++                pane.refresh_monitor_tab(force=True)
++                self.assertEqual(pane.monitor_tree.rows['r1'][new_column], '\u2014')
++
++    def test_successful_batch_clears_its_detection(self):
++        pane = self.pane()
++        pane._persist_monitor_signature('r1', 'sig', processed_before=150.0)
++        self.assertEqual(pane.monitor_runtime['r1']['new_files'], 0)
++        self.assertEqual(pane.app.monitor_rules.rule['monitor_last_new_count'], 139)
++
++    def test_finishing_older_batch_preserves_later_arrivals(self):
++        pane = self.pane()
++        pane.monitor_runtime['r1'] = {'new_files': 3, 'last_detected': 200.0}
++        pane._persist_monitor_signature('r1', 'sig', processed_before=150.0)
++        self.assertEqual(pane.monitor_runtime['r1']['new_files'], 3)
++
++
++if __name__ == '__main__':
++    unittest.main()
