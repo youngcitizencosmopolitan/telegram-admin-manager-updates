@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/app/tam_core/file_readiness.py
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,66 @@
 +from __future__ import annotations
 +
 +import asyncio
@@ -30,16 +30,28 @@
 +        self._observed: dict[Path, tuple[FileStamp, float]] = {}
 +        self._lock = threading.Lock()
 +
-+    def check(self, path: Path) -> FileStamp | None:
-+        stamp = read_stamp(path)
++    def observe(self, path: Path, stamp: FileStamp) -> float:
 +        now = self.clock()
 +        with self._lock:
 +            previous = self._observed.get(path)
 +            if previous is None or previous[0] != stamp:
 +                self._observed[path] = (stamp, now)
-+                since = now
-+            else:
-+                since = previous[1]
++                return now
++            return previous[1]
++
++    def observe_files(self, paths, stopped):
++        for path in paths:
++            if stopped():
++                raise PreparationStopped()
++            try:
++                self.observe(path, read_stamp(path))
++            except OSError:
++                continue  # The upload boundary will report a still-missing file.
++
++    def check(self, path: Path) -> FileStamp | None:
++        stamp = read_stamp(path)
++        since = self.observe(path, stamp)
++        now = self.clock()
 +        if stamp[0] <= 0 or now - since < self.quiet or has_active_writer(path):
 +            return None
 +        return stamp

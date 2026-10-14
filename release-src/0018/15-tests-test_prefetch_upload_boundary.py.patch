@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/app/tests/test_prefetch_upload_boundary.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,238 @@
 +import asyncio
 +import inspect
 +import tempfile
@@ -124,6 +124,29 @@
 +        self.stop.set()
 +        await asyncio.wait_for(running, 2)
 +        self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++
++    async def test_batch_observes_entire_pending_set_before_small_lookahead_windows(self):
++        for i in range(10):
++            self.file('%02d.mp4' % i, ('file-%d' % i).encode())
++        now = [0.0]
++        self.pool.readiness.clock = lambda: now[0]
++        self.pool.readiness.quiet = 3
++        observe = self.pool.observe_files
++
++        async def initial_observation(paths):
++            self.assertEqual(len(paths), 10)
++            await observe(paths)
++            now[0] = 3
++
++        self.pool.observe_files = initial_observation
++        running = asyncio.create_task(self.run_task())
++        try:
++            await asyncio.wait_for(running, 3)
++        finally:
++            if not running.done():
++                self.stop.set()
++                await asyncio.gather(running, return_exceptions=True)
++        self.assertEqual(len(self.sent), 10)
 +
 +    async def test_required_preview_failure_still_blocks_send(self):
 +        self.file()

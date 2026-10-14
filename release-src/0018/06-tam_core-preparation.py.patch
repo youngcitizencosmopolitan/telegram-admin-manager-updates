@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/app/tam_core/preparation.py
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,126 @@
 +from __future__ import annotations
 +
 +import asyncio
@@ -48,6 +48,9 @@
 +
 +    def stopped(self):
 +        return self.cancel.is_set() or self.stop_event.is_set()
++
++    async def observe_files(self, paths):
++        await asyncio.to_thread(self.readiness.observe_files, paths, self.stopped)
 +
 +    async def _watch_stop(self):
 +        while not self.cancel.is_set():

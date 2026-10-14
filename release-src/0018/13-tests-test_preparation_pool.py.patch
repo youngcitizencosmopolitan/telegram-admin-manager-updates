@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/app/tests/test_preparation_pool.py
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,171 @@
 +import asyncio
 +import tempfile
 +import threading
@@ -49,6 +49,20 @@
 +        prepared = await self.pool.take('a', factory)
 +        self.assertEqual(prepared.fingerprint, 'fingerprint')
 +        self.assertEqual(reads, [path])
++
++    async def test_quiet_window_is_shared_by_all_pending_files_not_restarted_per_window(self):
++        self.assertTrue(callable(getattr(self.pool, 'observe_files', None)),
++                        'Pending files need one shared initial stability observation')
++        now = [0.0]
++        self.pool.readiness.clock = lambda: now[0]
++        self.pool.readiness.quiet = 3
++        files = [self.file('%d.mp4' % i) for i in range(20)]
++        await self.pool.observe_files(files)
++        now[0] = 3
++        # A file outside the small prefetch window is already old enough when
++        # reached. Fast photo uploads must not pay another 3s for each window.
++        result = await asyncio.wait_for(self.pool.prepare_file(files[-1], lambda p: 'fp'), 1)
++        self.assertEqual(result.fingerprint, 'fp')
 +
 +    async def test_preparation_concurrency_and_speculative_queue_are_bounded(self):
 +        active = [0, 0]

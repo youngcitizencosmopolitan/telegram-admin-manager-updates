@@ -131,7 +131,23 @@
      ) -> None:
          tid = str(task.get("id", ""))
          name = str(task.get("name", "Задание"))
-@@ -4382,6 +4420,41 @@
+@@ -4281,6 +4319,15 @@
+             self.app.ui_call(lambda st=status: self._set_task_row(tid, status=st, progress="100%", speed="—", eta="0с"))
+             return
+ 
++        if preparation is not None:
++            try:
++                # Observe metadata for the whole pending set once. The quiet
++                # window then elapses together, including files beyond lookahead.
++                async with scan_sem:
++                    await preparation.observe_files([path for _, path in pending])
++            except PreparationStopped:
++                return
++
+         small_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         big_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         file_part_deferred: list[tuple[int, Path]] = []
+@@ -4382,6 +4429,41 @@
                  signal_drained=signal_drained_if_ready,
              )
  
@@ -173,7 +189,7 @@
          async def worker(session: str) -> None:
              account, client = clients[session]
              entity = resolved[session]
-@@ -4424,7 +4497,48 @@
+@@ -4424,7 +4506,48 @@
                      big_queue.put_nowait(item)
                      return
  
@@ -222,7 +238,7 @@
                      if health(session).get("disabled"):
                          queue_for_path(path).put_nowait(item)
                          return
-@@ -4445,11 +4559,14 @@
+@@ -4445,11 +4568,14 @@
                          self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "Проверка"))
  
                          try:
@@ -241,7 +257,7 @@
                          except Exception as exc:
                              state["processed_bytes"] += size
                              state["processed_files"] += 1
-@@ -4511,8 +4628,17 @@
+@@ -4511,8 +4637,17 @@
                              if preview_mode != "off":
                                  self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "Видео • превью"))
                                  try:
@@ -261,7 +277,7 @@
                                  except PreviewError as exc:
                                      if preview_mode == "required":
                                          state["processed_bytes"] += size
-@@ -4572,6 +4698,14 @@
+@@ -4572,6 +4707,14 @@
                                      state["active"].pop(key, None)
                                      return
                                  async with global_sem:
