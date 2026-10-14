@@ -1,0 +1,252 @@
+--- /dev/null
++++ b/app/tests/test_folder_events.py
+@@ -0,0 +1,249 @@
++import tempfile
++import time
++import importlib.util
++from unittest.mock import patch
++import unittest
++from pathlib import Path
++
++try:
++    from tam_core.folder_events import EventBuffer, FolderSnapshotIndex, WatchEvents
++except ImportError:
++    EventBuffer = FolderSnapshotIndex = None
++
++
++class FakeEvents:
++    healthy = True
++
++    def __init__(self, *args):
++        self.buffer = EventBuffer(limit=4)
++        self.closed = False
++
++    @property
++    def pending(self):
++        return self.buffer.pending
++
++    def notify(self, *args, **kwargs):
++        self.buffer.notify(*args, **kwargs)
++
++    def drain(self):
++        return self.buffer.drain()
++
++    def close(self):
++        self.closed = True
++
++
++class FolderEventTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(FolderSnapshotIndex, 'Incremental folder index is missing')
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.now = [0.0]
++        self.scans = 0
++
++        def scan(task):
++            self.scans += 1
++            iterator = self.root.rglob('*.mp4') if task.get('recursive', True) else self.root.glob('*.mp4')
++            files = list(iterator)
++            return files, sum(p.stat().st_size for p in files)
++
++        self.index = FolderSnapshotIndex({'folder': str(self.root), 'recursive': True}, scan,
++            lambda size: 'too_large' if size > 20 else 'small',
++            clock=lambda: self.now[0], event_factory=FakeEvents, quiet=3, reconcile=300)
++
++    def tearDown(self):
++        if hasattr(self, 'index'):
++            self.index.close()
++            self.tmp.cleanup()
++
++    def stable(self):
++        self.index.snapshot()
++        self.now[0] += 3
++        return self.index.snapshot()
++
++    def test_unchanged_poll_does_not_walk_tree(self):
++        (self.root / 'a.mp4').write_bytes(b'a')
++        first = self.stable()
++        self.assertEqual(first[1], {'a.mp4'})
++        self.assertEqual(self.index.snapshot(), first)
++        self.assertEqual(self.scans, 1)
++
++    def test_pending_file_is_not_reported_as_ready(self):
++        path = self.root / 'copy.mp4'
++        path.write_bytes(b'a')
++        self.assertEqual(self.index.snapshot(), ('pending', {'copy.mp4'}))
++        self.assertTrue(self.index.pending)
++        self.now[0] = 2
++        path.write_bytes(b'copying')
++        self.index.events.notify(path)
++        self.assertEqual(self.index.snapshot()[0], 'pending')
++        self.now[0] = 4
++        self.assertEqual(self.index.snapshot()[0], 'pending')
++        self.now[0] = 5
++        self.assertEqual(self.index.snapshot()[1], {'copy.mp4'})
++        self.assertFalse(self.index.pending)
++
++    def test_file_events_update_only_changed_paths(self):
++        path = self.root / 'a.mp4'
++        path.write_bytes(b'a')
++        old = self.stable()
++        second = self.root / 'b.mp4'
++        second.write_bytes(b'b')
++        self.index.events.notify(second, kind='created')
++        self.assertTrue(self.index.events.pending)
++        self.assertEqual(self.index.snapshot()[1], {'a.mp4', 'b.mp4'})
++        self.now[0] += 3
++        self.assertEqual(self.index.snapshot()[1], {'a.mp4', 'b.mp4'})
++        path.write_bytes(b'changed')
++        self.index.events.notify(path)
++        self.index.snapshot()
++        self.now[0] += 3
++        changed = self.index.snapshot()
++        self.assertNotEqual(changed[0], old[0])
++        second.unlink()
++        self.index.events.notify(second, kind='deleted')
++        self.assertEqual(self.index.snapshot()[1], {'a.mp4'})
++        self.assertEqual(self.scans, 1)
++
++    def test_move_updates_source_and_destination(self):
++        source = self.root / 'a.mp4'
++        source.write_bytes(b'a')
++        self.stable()
++        dest = self.root / 'renamed.mp4'
++        source.rename(dest)
++        self.index.events.notify(source, kind='moved', dest_path=dest)
++        self.index.snapshot()
++        self.now[0] += 3
++        self.assertEqual(self.index.snapshot()[1], {'renamed.mp4'})
++        self.assertEqual(self.scans, 1)
++
++    def test_full_reconciliation_finds_missed_events(self):
++        self.stable()
++        (self.root / 'missed.mp4').write_bytes(b'a')
++        self.now[0] = 300
++        self.assertEqual(self.index.snapshot()[0], 'pending')
++        self.now[0] = 303
++        self.assertEqual(self.index.snapshot()[1], {'missed.mp4'})
++        self.assertEqual(self.scans, 2)
++
++    def test_failed_watcher_falls_back_to_full_scans(self):
++        self.stable()
++        self.index.events.healthy = False
++        (self.root / 'fallback.mp4').write_bytes(b'a')
++        self.index.snapshot()
++        self.now[0] += 3
++        self.assertEqual(self.index.snapshot()[1], {'fallback.mp4'})
++        self.assertGreaterEqual(self.scans, 3)
++
++    def test_fallback_still_requests_periodic_reconciliation(self):
++        self.stable()
++        self.index.events.healthy = False
++        self.now[0] = 300
++        self.assertTrue(self.index.needs_poll)
++
++    def test_failed_full_reconciliation_is_retried_without_losing_force_flag(self):
++        self.stable()
++        self.index.events.notify(self.root / 'new', kind='created', is_directory=True)
++        with patch.object(self.index, 'scan', side_effect=OSError('transient folder error')):
++            self.assertEqual(self.index.snapshot()[0], 'error')
++        self.assertTrue(self.index.needs_poll)
++        before = self.scans
++        self.index.snapshot()
++        self.assertEqual(self.scans, before + 1)
++
++    def test_directory_topology_and_overflow_force_reconciliation(self):
++        self.stable()
++        folder = self.root / 'new'
++        folder.mkdir()
++        (folder / 'new.mp4').write_bytes(b'a')
++        self.index.events.notify(folder, kind='created', is_directory=True)
++        self.index.snapshot()
++        self.now[0] += 3
++        self.assertEqual(self.index.snapshot()[1], {'new/new.mp4'})
++        for i in range(6):
++            self.index.events.notify(self.root / ('%d.mp4' % i))
++        self.index.snapshot()
++        self.assertEqual(self.scans, 3)
++
++    def test_oversized_and_outside_files_are_ignored_until_eligible(self):
++        big = self.root / 'big.mp4'
++        big.write_bytes(b'x' * 21)
++        self.assertEqual(self.stable()[1], set())
++        big.write_bytes(b'now small')
++        self.index.events.notify(big)
++        self.index.events.notify(self.root.parent / 'outside.mp4')
++        self.index.snapshot()
++        self.now[0] += 3
++        self.assertEqual(self.index.snapshot()[1], {'big.mp4'})
++
++    def test_close_stops_observer_and_read_events_do_not_trigger_scans(self):
++        self.stable()
++        events = self.index.events
++        events.notify(self.root / 'a.mp4', kind='opened')
++        events.notify(self.root, kind='modified', is_directory=True)
++        self.assertFalse(events.pending)
++        self.index.close()
++        self.assertTrue(events.closed)
++
++    def test_root_disappearance_and_recreation_does_not_restore_old_files(self):
++        path = self.root / 'old.mp4'
++        path.write_bytes(b'old')
++        self.stable()
++        path.unlink()
++        self.root.rmdir()
++        self.assertEqual(self.index.snapshot(), ('missing', set()))
++        self.root.mkdir()
++        self.assertEqual(self.index.snapshot()[1], set())
++
++    def test_file_disappearing_during_incremental_refresh_does_not_stop_monitor(self):
++        from tam_core.folder_events import read_stamp as original
++        self.stable()
++        path = self.root / 'transient.mp4'
++        path.write_bytes(b'video')
++        self.index.events.notify(path, kind='created')
++
++        def stamp_then_delete(candidate):
++            stamp = original(candidate)
++            if candidate == path:
++                path.unlink()
++            return stamp
++
++        with patch('tam_core.folder_events.read_stamp', stamp_then_delete):
++            self.assertEqual(self.index.snapshot()[1], set())
++
++
++@unittest.skipUnless(importlib.util.find_spec('watchdog'), 'optional native watcher dependency')
++class NativeWatcherTests(unittest.TestCase):
++    def test_real_create_rename_delete_notifications_and_thread_cleanup(self):
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            events = WatchEvents(root, True)
++            self.assertTrue(events.healthy, events.error)
++            observer = events._observer
++            emitters = list(observer.emitters)
++
++            def expect(path):
++                deadline = time.monotonic() + 3
++                while time.monotonic() < deadline:
++                    paths, full = events.drain()
++                    if path in paths or full:
++                        return
++                    time.sleep(0.01)
++                self.fail('Native watcher missed ' + path.name)
++
++            try:
++                path = root / 'new.mp4'
++                path.write_bytes(b'video')
++                expect(path)
++                renamed = root / 'renamed.mp4'
++                path.rename(renamed)
++                expect(renamed)
++                renamed.unlink()
++                expect(renamed)
++            finally:
++                events.close()
++            self.assertFalse(observer.is_alive())
++            self.assertTrue(all(not emitter.is_alive() for emitter in emitters))
++
++
++if __name__ == '__main__':
++    unittest.main()

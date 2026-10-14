@@ -1,0 +1,7 @@
+--- a/app/requirements.txt
++++ b/app/requirements.txt
+@@ -4,3 +4,4 @@
+ hachoir==3.3.0
+ 
+ imageio-ffmpeg==0.6.0
++watchdog==6.0.0

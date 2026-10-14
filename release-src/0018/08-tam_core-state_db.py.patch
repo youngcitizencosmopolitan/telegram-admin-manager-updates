@@ -1,0 +1,40 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -759,27 +759,29 @@
+             )
+ 
+     def upload_completed_candidates(
+-        self, candidates: list[tuple[str, str, int, int, str]], forum_target_key: str | None = None
++        self, candidates: list[tuple[str, str, int, int, str, int]], forum_target_key: str | None = None
+     ) -> set[int]:
+         """Check one scan using indexed joins and a single connection, not one per file."""
+         if not candidates:
+             return set()
+         with self.session() as conn:
+-            conn.execute('CREATE TEMP TABLE candidates(target_key TEXT, path TEXT, size INTEGER, mtime_ns INTEGER, fingerprint TEXT)')
+-            conn.executemany('INSERT INTO candidates VALUES(?,?,?,?,?)', candidates)
++            conn.execute('CREATE TEMP TABLE candidates(target_key TEXT, path TEXT, size INTEGER, mtime_ns INTEGER, fingerprint TEXT, allow_exact INTEGER)')
++            conn.executemany('INSERT INTO candidates VALUES(?,?,?,?,?,?)', candidates)
+             result = {row[0] for row in conn.execute(
+                 'SELECT c.rowid-1 FROM candidates c WHERE '
+-                'EXISTS (SELECT 1 FROM uploads u WHERE u.target_key=c.target_key AND u.path=c.path '
+-                'AND u.size=c.size AND u.mtime_ns=c.mtime_ns) OR '
++                '(c.allow_exact AND EXISTS (SELECT 1 FROM uploads u WHERE u.target_key=c.target_key AND u.path=c.path '
++                'AND u.size=c.size AND u.mtime_ns=c.mtime_ns)) OR '
+                 "(c.fingerprint<>'' AND EXISTS (SELECT 1 FROM uploads u WHERE u.target_key=c.target_key AND u.fingerprint=c.fingerprint))"
+             )}
+             if forum_target_key is not None:
+                 prefix = f'{forum_target_key}#topic:'
+-                legacy = {(r[0], r[1], r[2]) for r in conn.execute(
+-                    'SELECT path,size,mtime_ns FROM uploads WHERE target_key>=? AND target_key<?',
++                legacy = {(r[0], r[1], r[2], r[3]) for r in conn.execute(
++                    'SELECT path,size,mtime_ns,fingerprint FROM uploads WHERE target_key>=? AND target_key<?',
+                     (prefix, prefix + '\uffff'),
+                 )}
+-                result.update(i for i, (_, path, size, mtime_ns, _) in enumerate(candidates) if (path, size, mtime_ns) in legacy)
++                legacy_exact = {(p, size, mtime) for p, size, mtime, _ in legacy}
++                result.update(i for i, (_, path, size, mtime, fp, allow_exact) in enumerate(candidates)
++                    if (allow_exact and (path, size, mtime) in legacy_exact) or (fp and (path, size, mtime, fp) in legacy))
+         return result
+ 
+     def upload_exact_completed(self, target_key: str, path: str, size: int, mtime_ns: int) -> bool:

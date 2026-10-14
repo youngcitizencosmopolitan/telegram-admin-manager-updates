@@ -1,0 +1,294 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -10,11 +10,15 @@
+ import time
+ import unicodedata
+ import uuid
++from collections import deque
+ from pathlib import Path, PureWindowsPath
+ from typing import Any
+ 
+ from video_preview import PreviewError, make_video_thumbnail
+-from tam_core.file_metadata import stat_identity
++from tam_core.file_metadata import has_active_writer, stat_identity
++from tam_core.folder_events import FolderSnapshotIndex
++from tam_core.preparation import PreparationPool
++from tam_core.file_readiness import PreparationStopped, read_stamp
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind as _media_kind
+ from tam_core.preflight import build_preflight_report, format_preflight_report
+ from tam_core.table_sort import TreeviewSortController
+@@ -2380,6 +2384,19 @@
+         return sorted(titles, key=self._forum_topic_title_key)
+ 
+     def _scan_monitor_snapshot(self, task: dict[str, Any]) -> tuple[str, set[str]]:
++        indexes = getattr(self, '_folder_indexes', None)
++        if indexes is not None:
++            tid = str(task.get('id', ''))
++            index = indexes.get(tid)
++            options = ('folder', 'recursive', 'send_videos', 'send_photos')
++            if index is None or any(index.task.get(k) != task.get(k) for k in options):
++                if index is not None:
++                    index.close()
++                index = indexes[tid] = FolderSnapshotIndex(task, self._scan_task_files, _telegram_upload_lane)
++            return index.snapshot()
++        return self._scan_monitor_snapshot_full(task)
++
++    def _scan_monitor_snapshot_full(self, task: dict[str, Any]) -> tuple[str, set[str]]:
+         """Return metadata signature plus normalized relative media paths.
+ 
+         The scan is metadata-only and runs on the monitoring event loop's worker
+@@ -2575,6 +2592,16 @@
+         self.app.log("Мониторинг: запрошена остановка. Очередь загрузок при этом не очищается.")
+ 
+     async def _monitor_loop(self) -> None:
++        indexes = self._folder_indexes = {}
++        try:
++            await self._monitor_loop_inner()
++        finally:
++            for index in list(indexes.values()):
++                await asyncio.to_thread(index.close)
++            if self._folder_indexes is indexes:
++                self._folder_indexes = None
++
++    async def _monitor_loop_inner(self) -> None:
+         next_due: dict[str, float] = {}
+         while not self.monitor_stop_event.is_set():
+             current = [
+@@ -2584,13 +2611,17 @@
+             if not current:
+                 self.app.log("Мониторинг: больше нет включённых правил; останавливаюсь.")
+                 return
++            current_ids = {str(t.get('id', '')) for t in current}
++            for tid in set(self._folder_indexes) - current_ids:
++                await asyncio.to_thread(self._folder_indexes.pop(tid).close)
+             now = time.monotonic()
+             due_changed: list[dict[str, Any]] = []
+             due_signatures: dict[str, str] = {}
+             for task in current:
+                 tid = str(task.get("id", ""))
+                 interval = max(15, min(3600, int(task.get("monitor_interval", 60) or 60)))
+-                if now < next_due.get(tid, 0.0):
++                index = self._folder_indexes.get(tid)
++                if now < next_due.get(tid, 0.0) and not (index and index.needs_poll):
+                     continue
+                 next_due[tid] = now + interval
+                 wall_now = time.time()
+@@ -2637,8 +2668,10 @@
+ 
+                 old = self.monitor_last_signatures.get(tid)
+                 pending = self.monitor_pending_signatures.get(tid)
+-                changed = signature != old and signature != pending
+-                if new_count > 0:
++                changed = signature not in {'missing', 'error', 'pending'} and signature != old and signature != pending
++                if signature == 'pending':
++                    runtime['state'] = 'Ожидает завершения копирования'
++                elif new_count > 0:
+                     runtime["state"] = f"Новых файлов: {new_count} → очередь" if changed else f"Новых файлов: {new_count}"
+                 elif signature == "missing":
+                     runtime["state"] = "Папка недоступна"
+@@ -3326,6 +3359,7 @@
+ 
+         clients: dict[str, tuple[Any, Any]] = {}
+         premium_by_session: dict[str, bool] = {}
++        preparation = None
+         policy = self.app.safety_policy()
+         self.account_health = {
+             session: {"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": "", "disabled": False}
+@@ -3388,8 +3422,9 @@
+             account_locks = {s: asyncio.Lock() for s in clients}
+             hot_admin_locks: dict[str, asyncio.Lock] = {}
+             global_sem = asyncio.Semaphore(global_parallel)
+-            preview_sem = asyncio.Semaphore(2)
+             scan_sem = asyncio.Semaphore(2)
++            preparation = PreparationPool(self.stop_event)
++            preview_sem = preparation.slots
+             live_pool_changed = asyncio.Event()
+ 
+             async def reconcile_live_accounts() -> None:
+@@ -3418,7 +3453,7 @@
+                     return await self._run_one_task(
+                         task, clients, premium_by_session, account_locks, global_sem, preview_sem, scan_sem,
+                         start_after=start_after, drained_event=drained_event, live_pool_changed=live_pool_changed,
+-                        hot_admin_locks=hot_admin_locks, premium_priority=premium_priority,
++                        hot_admin_locks=hot_admin_locks, premium_priority=premium_priority, preparation=preparation,
+                     )
+                 finally:
+                     if premium_priority is not None:
+@@ -3466,6 +3501,8 @@
+                     ))
+             return hard_error_ids
+         finally:
++            if preparation is not None:
++                await preparation.close()
+             for _account, client in clients.values():
+                 try:
+                     await client.disconnect()
+@@ -4098,6 +4135,7 @@
+         live_pool_changed: asyncio.Event | None = None,
+         hot_admin_locks: dict[str, asyncio.Lock] | None = None,
+         premium_priority: _PremiumWorkPriority | None = None,
++        preparation: PreparationPool | None = None,
+     ) -> None:
+         tid = str(task.get("id", ""))
+         name = str(task.get("name", "Задание"))
+@@ -4281,6 +4319,15 @@
+             self.app.ui_call(lambda st=status: self._set_task_row(tid, status=st, progress="100%", speed="—", eta="0с"))
+             return
+ 
++        if preparation is not None:
++            try:
++                # Observe metadata for the whole pending set once. The quiet
++                # window then elapses together, including files beyond lookahead.
++                async with scan_sem:
++                    await preparation.observe_files([path for _, path in pending])
++            except PreparationStopped:
++                return
++
+         small_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         big_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         file_part_deferred: list[tuple[int, Path]] = []
+@@ -4382,6 +4429,41 @@
+                 signal_drained=signal_drained_if_ready,
+             )
+ 
++        def preparation_key(path):
++            return tid, str(path), str(task.get('video_preview_mode', 'required'))
++
++        def preparation_factory(path):
++            cached_reader = getattr(self.app.upload_history, 'cached_fingerprint', None)
++            reader = (lambda p: cached_reader(p, self.app._quick_fingerprint)) if callable(cached_reader) else self.app._quick_fingerprint
++            thumbnail = None
++            if _media_kind(path) == 'video' and task.get('video_preview_mode', 'required') != 'off':
++                thumbnail = lambda p, cancel: make_video_thumbnail(p, self.preview_cache_dir, cancel=cancel)
++            check_duplicate = getattr(self.app.upload_history, 'fingerprint_completed', None)
++            duplicate = (lambda fp: check_duplicate(_dedup_fingerprint_for_upload(task, path, fp), history_key_for_path(path))) if callable(check_duplicate) else None
++            return lambda: preparation.prepare_file(path, reader, thumbnail, duplicate=duplicate)
++
++        lookahead = {'premium': deque(), 'small': deque()}
++        offered, consumed = {}, set()
++        if preparation is not None:
++            for _, path in pending:
++                lookahead['premium' if _telegram_upload_lane(path.stat().st_size) == 'premium' else 'small'].append(path)
++
++        def fill_preparation():
++            if preparation is None:
++                return
++            for lane, paths in lookahead.items():
++                while paths and sum(value == lane for value in offered.values()) < 2:
++                    path = paths[0]
++                    if path in consumed:
++                        paths.popleft()
++                        continue
++                    if not preparation.offer(preparation_key(path), preparation_factory(path)):
++                        break
++                    paths.popleft()
++                    offered[path] = lane
++
++        fill_preparation()
++
+         async def worker(session: str) -> None:
+             account, client = clients[session]
+             entity = resolved[session]
+@@ -4424,7 +4506,48 @@
+                     big_queue.put_nowait(item)
+                     return
+ 
++                prepared = None
++                if preparation is not None:
++                    consumed.add(path)
++                    fill_preparation()
++                    key = f'{tid}:{path}'
++                    self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(
++                        k, name, p, a, size, 0.0, 0.0, 'Подготовка / ожидание записи'))
++                    try:
++                        prepared = await preparation.take(preparation_key(path), preparation_factory(path))
++                    except PreparationStopped:
++                        queue_for_path(path).put_nowait(item)
++                        return
++                    except Exception as exc:
++                        state['processed_bytes'] += size
++                        state['processed_files'] += 1
++                        state['failed'] += 1
++                        self.app.record_upload_error(task=name, target=task_target, path=str(path),
++                            account=account.display, attempts=1, error=f'Ошибка подготовки: {exc}')
++                        self.app.log(f'{name}: {path.name}: ошибка подготовки — {exc}')
++                        self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(
++                            k, name, p, a, size, 0.0, 0.0, 'Ошибка подготовки'))
++                        self._emit_task_metrics(tid, force=True)
++                        continue
++                    finally:
++                        offered.pop(path, None)
++                        fill_preparation()
++                    size = int(prepared.stamp[0])
++                    upload_lane = _telegram_upload_lane(size)
++                    if upload_lane == 'too_large':
++                        state['processed_bytes'] += size
++                        state['processed_files'] += 1
++                        state['skipped'] += 1
++                        state['limit_skipped'] += 1
++                        continue
++                    if upload_lane == 'premium' and not premium_by_session.get(session, False):
++                        big_queue.put_nowait(item)
++                        return
++
+                 async with account_locks[session]:
++                    if prepared is not None and await asyncio.to_thread(read_stamp, path) != prepared.stamp:
++                        queue_for_path(path).put_nowait(item)
++                        continue
+                     if health(session).get("disabled"):
+                         queue_for_path(path).put_nowait(item)
+                         return
+@@ -4445,11 +4568,14 @@
+                         self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "Проверка"))
+ 
+                         try:
+-                            cached_reader = getattr(self.app.upload_history, 'cached_fingerprint', None)
+-                            if callable(cached_reader):
+-                                fingerprint = await asyncio.to_thread(cached_reader, path, self.app._quick_fingerprint)
++                            if prepared is not None:
++                                fingerprint = prepared.fingerprint
+                             else:
+-                                fingerprint = await asyncio.to_thread(self.app._quick_fingerprint, path)
++                                cached_reader = getattr(self.app.upload_history, 'cached_fingerprint', None)
++                                if callable(cached_reader):
++                                    fingerprint = await asyncio.to_thread(cached_reader, path, self.app._quick_fingerprint)
++                                else:
++                                    fingerprint = await asyncio.to_thread(self.app._quick_fingerprint, path)
+                         except Exception as exc:
+                             state["processed_bytes"] += size
+                             state["processed_files"] += 1
+@@ -4511,8 +4637,17 @@
+                             if preview_mode != "off":
+                                 self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "Видео • превью"))
+                                 try:
+-                                    async with preview_sem:
+-                                        thumb_path = await asyncio.to_thread(make_video_thumbnail, path, self.preview_cache_dir)
++                                    if prepared is not None and prepared.preview_error is not None:
++                                        raise prepared.preview_error
++                                    if prepared is not None and prepared.thumbnail is not None:
++                                        thumb_path = prepared.thumbnail
++                                    else:
++                                        async with preview_sem:
++                                            if preparation is not None:
++                                                thumb_path = await asyncio.to_thread(make_video_thumbnail, path, self.preview_cache_dir,
++                                                                                    cancel=preparation.cancel)
++                                            else:
++                                                thumb_path = await asyncio.to_thread(make_video_thumbnail, path, self.preview_cache_dir)
+                                 except PreviewError as exc:
+                                     if preview_mode == "required":
+                                         state["processed_bytes"] += size
+@@ -4572,6 +4707,14 @@
+                                     state["active"].pop(key, None)
+                                     return
+                                 async with global_sem:
++                                    if prepared is not None and (
++                                        await asyncio.to_thread(read_stamp, path) != prepared.stamp
++                                        or await asyncio.to_thread(has_active_writer, path)
++                                    ):
++                                        release_reservation()
++                                        state['active'].pop(key, None)
++                                        queue_for_path(path).put_nowait(item)
++                                        break
+                                     # A worker can wait here while another file is sending.
+                                     # Re-read account policy only after the slot is free: hot OFF
+                                     # stops the next send, while an already running send is untouched.

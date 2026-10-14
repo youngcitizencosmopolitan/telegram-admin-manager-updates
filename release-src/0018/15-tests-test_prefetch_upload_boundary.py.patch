@@ -1,0 +1,241 @@
+--- /dev/null
++++ b/app/tests/test_prefetch_upload_boundary.py
+@@ -0,0 +1,238 @@
++import asyncio
++import inspect
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from batch_uploader import BatchUploaderPane
++from tam_core.models import Account
++from tam_core.preparation import PreparationPool
++from tam_core.repositories import UploadHistory
++from video_preview import PreviewError
++
++
++class PrefetchUploadTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        self.assertIn('preparation', inspect.signature(BatchUploaderPane._run_one_task).parameters,
++                      'Upload workers do not consume prepared files')
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.history = UploadHistory(self.root / 'uploads.db')
++        self.sent, self.reads, self.errors = [], [], []
++        self.stop = threading.Event()
++        self.pool = PreparationPool(self.stop, quiet=0)
++        self.account_lock = asyncio.Lock()
++        self.pane = pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        noop = lambda *args, **kwargs: None
++
++        async def resolve(*args):
++            return SimpleNamespace(title='group')
++
++        async def gate(*args):
++            return True
++
++        self.rule = {'id': 'r1', 'name': 'prefetch', 'folder': str(self.root), 'target': '@group',
++                     'recursive': False, 'auto_admin': False, 'video_preview_mode': 'off'}
++        pane.app = SimpleNamespace(store=SimpleNamespace(data={'upload_tasks': []}, save=noop),
++            group_state_cache=SimpleNamespace(fresh_admin_sessions=lambda *args: set()),
++            upload_history=self.history, safety_policy=lambda: {'enabled': False},
++            account_usage_allows=lambda *args: True, _resolve_or_join_target=resolve,
++            _target_key=lambda entity: 'group', _quick_fingerprint=self.read,
++            ui_call=noop, log=noop, refresh_safety_health_table=noop,
++            record_upload_error=lambda **kw: self.errors.append(kw), _friendly_error=str,
++            _is_retryable_upload_error=lambda *args: False)
++        pane._effective_task_sessions = lambda *args: ['s1']
++        pane._cache_ttl_hours = lambda: 24
++        pane.account_health, pane.task_states = {}, {}
++        pane._live_task_lock = threading.RLock()
++        pane.live_tasks = {'r1': self.rule}
++        pane.dedup_run_token = 'test'
++        pane.stop_event = self.stop
++        pane._emit_dashboard = pane._emit_task_metrics = noop
++        pane._wait_gate = gate
++        pane.task_pause_events = {}
++        pane.preview_cache_dir = self.root / 'thumbs'
++        self.account = Account(session='s1', label='test', phone='', user_id=1)
++
++    async def asyncTearDown(self):
++        if hasattr(self, 'pool'):
++            await self.pool.close()
++            self.tmp.cleanup()
++
++    def read(self, path):
++        self.reads.append(path)
++        return path.read_bytes().hex()
++
++    def file(self, name='a.mp4', data=b'video'):
++        path = self.root / name
++        path.write_bytes(data)
++        return path
++
++    async def run_task(self, sender=None, semaphore=None):
++        owner = self
++
++        class Client:
++            async def send_file(self, entity, path, **kwargs):
++                owner.sent.append((path, kwargs))
++                if sender:
++                    await sender(Path(path))
++                return SimpleNamespace(id=len(owner.sent))
++
++        await self.pane._run_one_task(dict(self.rule), {'s1': (self.account, Client())}, {'s1': False},
++            {'s1': self.account_lock}, semaphore or asyncio.Semaphore(1), asyncio.Semaphore(2),
++            asyncio.Semaphore(2), preparation=self.pool)
++
++    async def test_next_file_is_prepared_during_first_upload_without_reserving_it(self):
++        first = self.file('a.mp4', b'first')
++        second = self.file('b.mp4', b'second')
++        uploading = threading.Event()
++        prepared_next = threading.Event()
++
++        def read(path):
++            if path == second:
++                if not uploading.wait(2):
++                    raise RuntimeError('First upload did not start')
++                prepared_next.set()
++            return path.read_bytes().hex()
++
++        self.pane.app._quick_fingerprint = read
++
++        async def sender(path):
++            if path == first:
++                uploading.set()
++                self.assertTrue(await asyncio.wait_for(asyncio.to_thread(prepared_next.wait), 2))
++                with self.history.db.session() as conn:
++                    self.assertEqual(conn.execute('SELECT COUNT(*) FROM upload_reservations').fetchone()[0], 1)
++
++        await asyncio.wait_for(self.run_task(sender), 5)
++        self.assertEqual([Path(p) for p, _ in self.sent], [first, second])
++        self.assertEqual(self.errors, [])
++
++    async def test_copy_wait_does_not_hold_account_and_can_be_stopped(self):
++        self.file()
++        self.pool.readiness.quiet = 60
++        running = asyncio.create_task(self.run_task())
++        await asyncio.sleep(0.1)
++        self.assertFalse(self.account_lock.locked())
++        self.assertEqual(self.sent, [])
++        self.stop.set()
++        await asyncio.wait_for(running, 2)
++        self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++
++    async def test_batch_observes_entire_pending_set_before_small_lookahead_windows(self):
++        for i in range(10):
++            self.file('%02d.mp4' % i, ('file-%d' % i).encode())
++        now = [0.0]
++        self.pool.readiness.clock = lambda: now[0]
++        self.pool.readiness.quiet = 3
++        observe = self.pool.observe_files
++
++        async def initial_observation(paths):
++            self.assertEqual(len(paths), 10)
++            await observe(paths)
++            now[0] = 3
++
++        self.pool.observe_files = initial_observation
++        running = asyncio.create_task(self.run_task())
++        try:
++            await asyncio.wait_for(running, 3)
++        finally:
++            if not running.done():
++                self.stop.set()
++                await asyncio.gather(running, return_exceptions=True)
++        self.assertEqual(len(self.sent), 10)
++
++    async def test_required_preview_failure_still_blocks_send(self):
++        self.file()
++        self.rule['video_preview_mode'] = 'required'
++        with patch('batch_uploader.make_video_thumbnail', side_effect=PreviewError('no frame')):
++            await self.run_task()
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.pane.task_states['r1']['failed'], 1)
++        with self.history.db.session() as conn:
++            self.assertEqual(conn.execute('SELECT COUNT(*) FROM upload_reservations').fetchone()[0], 0)
++
++    async def test_source_changed_while_waiting_for_upload_slot_is_prepared_again(self):
++        path = self.file()
++        waiting = asyncio.Event()
++
++        class Semaphore(asyncio.Semaphore):
++            async def __aenter__(self):
++                waiting.set()
++                return await super().__aenter__()
++
++        slot = Semaphore(0)
++        running = asyncio.create_task(self.run_task(semaphore=slot))
++        try:
++            await asyncio.wait_for(waiting.wait(), 2)
++            path.write_bytes(b'changed before send')
++            slot.release()
++            await asyncio.wait_for(running, 3)
++        finally:
++            if not running.done():
++                self.stop.set()
++                slot.release()
++                await asyncio.gather(running, return_exceptions=True)
++        self.assertEqual(len(self.sent), 1)
++        self.assertEqual(self.reads, [path, path])
++        self.assertTrue(self.history.fingerprint_completed(b'changed before send'.hex(), 'group'))
++        self.assertFalse(self.history.fingerprint_completed(b'video'.hex(), 'group'))
++
++    async def test_production_batch_shares_and_closes_pool_and_disconnects_client(self):
++        path = self.file()
++        pools, disconnected = [], []
++
++        async def noop(*args, **kwargs):
++            return []
++
++        class Client:
++            def __init__(self, *args, **kwargs):
++                pass
++
++            connect = noop
++
++            async def is_user_authorized(self):
++                return True
++
++            async def get_me(self):
++                return SimpleNamespace(premium=False)
++
++            async def disconnect(self):
++                disconnected.append(True)
++
++        async def task(*args, preparation, **kwargs):
++            pools.append(preparation)
++            preparation.readiness.quiet = 60
++            preparation.offer(('speculative', len(pools)), lambda: preparation.prepare_file(path, self.read))
++
++        self.pane.sessions_dir = self.root
++        self.pane.app._api_credentials = lambda: (1, 'test')
++        self.pane.app.store.accounts = lambda: [self.account]
++        self.pane._prepare_task_admins = noop
++        self.pane._connect_hot_batch_accounts_once = noop
++        self.pane._run_one_task = task
++        with patch('batch_uploader.TelegramClient', Client):
++            result = await self.pane._run_batch([self.rule, {**self.rule, 'id': 'r2'}], 1, notify=False)
++        self.assertEqual(result, set())
++        self.assertEqual(len(pools), 2)
++        self.assertIs(pools[0], pools[1])
++        self.assertTrue(pools[0].cancel.is_set())
++        self.assertFalse(pools[0]._running)
++        self.assertEqual(disconnected, [True])
++
++    async def test_stop_before_batch_pool_is_created_exits_cleanly(self):
++        async def noop(*args, **kwargs):
++            pass
++
++        self.pane.app._api_credentials = lambda: (1, 'test')
++        self.pane.app.store.accounts = lambda: [self.account]
++        self.pane._prepare_task_admins = noop
++        self.stop.set()
++        await self.pane._run_batch([self.rule], 1, notify=False)
++
++
++if __name__ == '__main__':
++    unittest.main()

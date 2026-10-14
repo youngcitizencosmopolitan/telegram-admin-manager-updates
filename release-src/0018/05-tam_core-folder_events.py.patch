@@ -1,0 +1,220 @@
+--- /dev/null
++++ b/app/tam_core/folder_events.py
+@@ -0,0 +1,217 @@
++"""Bounded filesystem notifications and metadata-only incremental snapshots."""
++from __future__ import annotations
++
++import hashlib
++import os
++import threading
++import time
++from pathlib import Path
++
++from .file_readiness import FileReadiness, read_stamp
++from .media import PHOTO_EXTENSIONS, VIDEO_EXTENSIONS
++
++
++class EventBuffer:
++    def __init__(self, limit: int = 4096):
++        self.limit = limit
++        self._paths: set[Path] = set()
++        self._full = False
++        self._lock = threading.Lock()
++
++    def notify(self, path, *, kind='modified', is_directory=False, dest_path=None):
++        if kind not in {'created', 'modified', 'deleted', 'moved'}:
++            return
++        if is_directory and kind == 'modified':
++            return
++        with self._lock:
++            if is_directory:
++                self._full = True
++            if not self._full:
++                self._paths.add(Path(path))
++                if dest_path:
++                    self._paths.add(Path(dest_path))
++                if len(self._paths) > self.limit:
++                    self._full = True
++            if self._full:
++                self._paths.clear()
++
++    @property
++    def pending(self):
++        with self._lock:
++            return self._full or bool(self._paths)
++
++    def drain(self):
++        with self._lock:
++            result = self._paths, self._full
++            self._paths, self._full = set(), False
++            return result
++
++
++class WatchEvents(EventBuffer):
++    def __init__(self, root: Path, recursive: bool):
++        super().__init__()
++        self._observer = None
++        self.error = ''
++        try:
++            from watchdog.events import FileSystemEventHandler
++            from watchdog.observers import Observer
++            buffer = self
++
++            class Handler(FileSystemEventHandler):
++                def on_any_event(self, event):
++                    buffer.notify(event.src_path, kind=event.event_type,
++                                  is_directory=event.is_directory, dest_path=getattr(event, 'dest_path', None))
++
++            self._observer = Observer()
++            self._observer.schedule(Handler(), str(root), recursive=recursive)
++            self._observer.start()
++        except Exception as exc:
++            self.error = str(exc)
++            self.close()
++
++    @property
++    def healthy(self):
++        observer = self._observer
++        return bool(observer and observer.is_alive() and all(e.is_alive() for e in observer.emitters))
++
++    def close(self):
++        observer, self._observer = self._observer, None
++        if observer is not None:
++            observer.stop()
++            if observer.ident is not None:
++                observer.join(timeout=2)
++
++
++class FolderSnapshotIndex:
++    def __init__(self, task, scan, lane, *, clock=time.monotonic, event_factory=WatchEvents,
++                 quiet=3.0, reconcile=300.0):
++        self.task = dict(task)
++        self.root = Path(os.path.abspath(task['folder']))
++        self.scan, self.lane = scan, lane
++        self.clock, self.event_factory = clock, event_factory
++        self.reconcile = reconcile
++        self.readiness = FileReadiness(quiet, clock)
++        self.events = None
++        self._entries = {}
++        self._ready = set()
++        self._last_full = None
++        self._directories = ()
++        self._cached = None
++        self._dirty = True
++        self.pending = False
++
++    @property
++    def needs_poll(self):
++        return (self._last_full is None or self.pending or bool(self.events and self.events.pending)
++                or self.clock() - self._last_full >= self.reconcile)
++
++    def _eligible(self, path):
++        try:
++            relative = path.relative_to(self.root)
++        except ValueError:
++            return False
++        if not self.task.get('recursive', True) and len(relative.parts) != 1:
++            return False
++        allowed = set()
++        if self.task.get('send_videos', True):
++            allowed.update(VIDEO_EXTENSIONS)
++        if self.task.get('send_photos', False):
++            allowed.update(PHOTO_EXTENSIONS)
++        return path.suffix.lower() in allowed
++
++    def _refresh(self, path):
++        path = Path(os.path.abspath(path))
++        previous = self._entries.get(path)
++        try:
++            stamp = read_stamp(path) if self._eligible(path) and path.is_file() else None
++            if stamp is not None and self.lane(stamp[0]) == 'too_large':
++                stamp = None
++        except OSError:
++            stamp = None
++        if stamp is None:
++            if previous is not None:
++                self._entries.pop(path, None)
++                self._ready.discard(path)
++                self.readiness.forget(path)
++                self._dirty = True
++        elif previous != stamp:
++            self._entries[path] = stamp
++            self._ready.discard(path)
++            self.readiness.forget(path)
++            self._dirty = True
++            # Start the quiet window at the first observation, not its mtime.
++            try:
++                self.readiness.check(path)
++            except FileNotFoundError:
++                self._entries.pop(path, None)
++                self.readiness.forget(path)
++            except OSError:
++                # A transient sharing/access failure leaves the file pending;
++                # it must not terminate unrelated monitoring rules.
++                pass
++
++    def snapshot(self):
++        if not self.root.is_dir():
++            self.close()
++            self._entries.clear()
++            self._ready.clear()
++            self._last_full = None
++            self.pending = False
++            self._dirty = True
++            self._cached = None
++            return 'missing', set()
++        if self.events is None:
++            self.events = self.event_factory(self.root, bool(self.task.get('recursive', True)))
++        paths, force_full = self.events.drain()
++        now = self.clock()
++        if self._last_full is None or force_full or not self.events.healthy or now - self._last_full >= self.reconcile:
++            try:
++                files, _ = self.scan(self.task)
++                current = {Path(os.path.abspath(p)) for p in files}
++                for path in current | set(self._entries):
++                    if path in current:
++                        self._refresh(path)
++                    else:
++                        self._entries.pop(path, None)
++                        self._ready.discard(path)
++                        self.readiness.forget(path)
++                        self._dirty = True
++                directories = tuple(sorted(p.name for p in self.root.iterdir() if p.is_dir()))
++                if directories != self._directories:
++                    self._directories, self._dirty = directories, True
++                self._last_full = now
++            except OSError:
++                self._last_full = None
++                return 'error', set()
++        else:
++            for path in paths:
++                self._refresh(path)
++        for path in set(self._entries) - self._ready:
++            try:
++                stamp = self.readiness.check(path)
++                if stamp is not None:
++                    if self._entries[path] != stamp:
++                        self._refresh(path)
++                    else:
++                        self._ready.add(path)
++                        self._dirty = True
++            except OSError:
++                self._refresh(path)
++        self.pending = len(self._ready) < len(self._entries)
++        relative_files = {p.relative_to(self.root).as_posix().casefold() for p in self._entries}
++        if not self._ready and self.pending:
++            return 'pending', relative_files
++        if self._dirty or self._cached is None:
++            digest = hashlib.blake2b(digest_size=16)
++            digest.update(repr(self._directories).encode('utf-8', 'surrogatepass'))
++            for path in sorted(self._ready, key=lambda p: str(p).lower()):
++                relative = path.relative_to(self.root).as_posix()
++                digest.update(repr((relative, self._entries[path])).encode('utf-8', 'surrogatepass'))
++            self._cached = digest.hexdigest(), relative_files
++            self._dirty = False
++        return self._cached[0], relative_files
++
++    def close(self):
++        if self.events is not None:
++            self.events.close()
++            self.events = None

@@ -1,0 +1,122 @@
+--- a/app/video_preview.py
++++ b/app/video_preview.py
+@@ -3,8 +3,13 @@
+ import hashlib
+ import shutil
+ import subprocess
++import threading
++import time
++import uuid
+ from collections import deque
+ from pathlib import Path
++
++from tam_core.file_metadata import change_token, stat_identity
+ 
+ try:
+     import imageio_ffmpeg
+@@ -19,6 +24,7 @@
+ 
+ MAX_THUMB_SIDE = 320
+ MAX_THUMB_BYTES = 195 * 1024
++_publish_lock = threading.Lock()
+ 
+ 
+ class PreviewError(RuntimeError):
+@@ -43,8 +49,35 @@
+ 
+ def _cache_key(video_path: Path) -> str:
+     stat = video_path.stat()
+-    raw = f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "surrogatepass")
++    raw = repr((str(video_path.resolve()), stat_identity(stat), change_token(video_path, stat))).encode("utf-8", "surrogatepass")
+     return hashlib.sha1(raw).hexdigest()
++
++
++def _run_preview_command(cmd, cancel=None, timeout=45):
++    kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
++                  encoding='utf-8', errors='replace', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
++    if cancel is None:
++        return subprocess.run(cmd, timeout=timeout, **kwargs)
++    if cancel.is_set():
++        raise PreviewError('Подготовка превью отменена')
++    child = subprocess.Popen(cmd, **kwargs)
++    deadline = time.monotonic() + timeout
++    try:
++        while True:
++            if cancel.is_set():
++                raise PreviewError('Подготовка превью отменена')
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise subprocess.TimeoutExpired(cmd, timeout)
++            try:
++                _, stderr = child.communicate(timeout=min(0.2, remaining))
++                return subprocess.CompletedProcess(cmd, child.returncode, stderr=stderr)
++            except subprocess.TimeoutExpired:
++                continue
++    finally:
++        if child.poll() is None:
++            child.kill()
++        child.communicate()
+ 
+ 
+ def _compress_jpeg(path: Path) -> None:
+@@ -68,7 +101,7 @@
+         raise PreviewError(f"не удалось обработать JPEG-превью: {exc}") from exc
+ 
+ 
+-def make_video_thumbnail(video_path: str | Path, cache_dir: str | Path) -> Path:
++def make_video_thumbnail(video_path: str | Path, cache_dir: str | Path, *, cancel=None) -> Path:
+     """Create/reuse a Telegram-compatible JPEG thumbnail for a video.
+ 
+     The result is <=320x320 and normally <200 KiB, suitable for Telethon's `thumb=`.
+@@ -91,7 +124,7 @@
+             pass
+ 
+     ffmpeg = _ffmpeg_executable()
+-    tmp = out.with_suffix(".tmp.jpg")
++    tmp = out.with_name(out.stem + '.' + uuid.uuid4().hex + '.tmp.jpg')
+     try:
+         if tmp.exists():
+             tmp.unlink()
+@@ -104,6 +137,9 @@
+     last_error = ""
+     color_error = ""
+     while attempts:
++        if cancel is not None and cancel.is_set():
++            tmp.unlink(missing_ok=True)
++            raise PreviewError('Подготовка превью отменена')
+         seek, metadata_filter = attempts.popleft()
+         cmd = [
+             ffmpeg,
+@@ -127,19 +163,21 @@
+             str(tmp),
+         ])
+         try:
+-            proc = subprocess.run(
+-                cmd,
+-                stdout=subprocess.DEVNULL,
+-                stderr=subprocess.PIPE,
+-                text=True,
+-                encoding="utf-8",
+-                errors="replace",
+-                timeout=45,
+-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+-            )
++            proc = _run_preview_command(cmd, cancel)
+             if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                 _compress_jpeg(tmp)
+-                tmp.replace(out)
++                if cancel is not None and cancel.is_set():
++                    raise PreviewError('Подготовка превью отменена')
++                # Windows can reject two concurrent replacements of the same
++                # destination. Reuse the first complete result and serialize
++                # only this short publish step, not FFmpeg or JPEG compression.
++                with _publish_lock:
++                    if cancel is not None and cancel.is_set():
++                        raise PreviewError('Подготовка превью отменена')
++                    if out.exists() and 0 < out.stat().st_size <= MAX_THUMB_BYTES:
++                        tmp.unlink(missing_ok=True)
++                    else:
++                        tmp.replace(out)
+                 return out
+             lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
+             last_error = "; ".join(lines[:3])[:1200] if lines else "FFmpeg не извлёк кадр"
