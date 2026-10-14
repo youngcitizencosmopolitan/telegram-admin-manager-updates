@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0017",
-  "display_version": "0017",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0017/TelegramAdminManager_v0017_update.zip",
-  "sha256": "8df9d152efff8d8fffa846c2c87424256c758ed1c65550e0cbab7acd6637ece4",
-  "notes": "0017: speeds up repeated monitoring scans with persistent file fingerprints and batched indexed upload-history checks. Unchanged known duplicates are skipped without reading media or flooding the activity UI. Oversized files are excluded before upload queues; Preflight can still report them and now runs in the background. Windows ChangeTime and file identity invalidate cached fingerprints after edits/replacement; files are revalidated around batch queries and at the skip boundary. Group/topic and recursive-flat deduplication policies, reservations and history clearing are preserved. Includes 22 regression tests; 2000 synthetic duplicate files checked with two database connections instead of 3999."
+  "version": "4.3.8.0018",
+  "display_version": "0018",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0018/TelegramAdminManager_v0018_update.zip",
+  "sha256": "03914969be845116dc94aee409d9f6ca9ef30ce722b401934c9507c98dbbc2c8",
+  "notes": "0018: prepares upcoming files while uploads continue, with two shared preparation operations and bounded speculative lookahead. Preparation never reserves uploads and known duplicates avoid thumbnail work. Monitoring uses watchdog filesystem notifications to update affected paths, with full reconciliation at startup, every five minutes, on topology/overflow and as a fallback. Files must remain unchanged for three seconds and have no active writer on Windows before preparation; mutations during hashing or before sending restart preparation. FFmpeg is cancellable and temporary thumbnails are unique. Observers and preparation jobs are cleaned up on stop. Premium routing, account selection, captions, required previews and deduplication policies are preserved. Includes lifecycle, mutation, native-watcher and concurrency regressions. The initial metadata observation covers the whole pending set, so fast small-file queues do not wait three seconds again for every lookahead window."
 }
