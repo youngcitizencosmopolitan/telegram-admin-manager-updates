@@ -1,0 +1,21 @@
+--- a/app/tests/test_file_index_performance.py
++++ b/app/tests/test_file_index_performance.py
+@@ -115,6 +115,18 @@
+         original.write_bytes(b'video')
+         self.record(original, 'content')
+         self.video.write_bytes(b'a changed file')
++        self.assertEqual(self.completed(), set())
++
++    def test_changed_content_with_restored_mtime_does_not_reuse_exact_history(self):
++        self.fingerprint(reader=lambda p: 'old-content')
++        self.record(self.video, 'old-content')
++        old = self.video.stat()
++        self.video.write_bytes(b'other')
++        os.utime(self.video, ns=(old.st_atime_ns, old.st_mtime_ns))
++        self.assertEqual(self.completed(), set())
++        # Reading the new version must not make the previous exact row valid
++        # again if the new upload subsequently fails.
++        self.fingerprint(reader=lambda p: 'new-content')
+         self.assertEqual(self.completed(), set())
+ 
+     def test_recursive_flat_mode_preserves_separate_source_items(self):

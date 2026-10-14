@@ -1,0 +1,76 @@
+--- /dev/null
++++ b/app/tests/test_preview_cancellation.py
+@@ -0,0 +1,73 @@
++import subprocess
++import sys
++import threading
++import tempfile
++import unittest
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import video_preview
++
++
++class PreviewCancellationTests(unittest.TestCase):
++    def test_concurrent_previews_do_not_share_temporary_output(self):
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            video = root / 'video.mp4'
++            video.write_bytes(b'video')
++            barrier = threading.Barrier(2)
++            outputs = []
++            published = []
++            original_replace = Path.replace
++
++            def publish(path, target):
++                published.append(target)
++                return original_replace(path, target)
++
++            def runner(cmd, **kwargs):
++                output = Path(cmd[-1])
++                outputs.append(output)
++                output.write_bytes(b'jpeg')
++                barrier.wait(timeout=2)
++                return SimpleNamespace(returncode=0, stderr='')
++
++            with patch.object(video_preview, '_ffmpeg_executable', return_value='ffmpeg'), \
++                 patch.object(video_preview.subprocess, 'run', runner), \
++                 patch.object(video_preview, '_compress_jpeg'), \
++                 patch.object(Path, 'replace', publish), ThreadPoolExecutor(2) as pool:
++                futures = [pool.submit(video_preview.make_video_thumbnail, video, root / 'cache') for _ in range(2)]
++                results = [future.result(timeout=3) for future in futures]
++            self.assertEqual(len(set(outputs)), 2)
++            self.assertEqual(len(published), 1)
++            self.assertEqual(results[0], results[1])
++            self.assertTrue(results[0].is_file())
++            self.assertEqual(list((root / 'cache').glob('*.tmp.jpg')), [])
++
++    def test_running_child_is_reaped_when_preparation_is_stopped(self):
++        runner = getattr(video_preview, '_run_preview_command', None)
++        self.assertTrue(callable(runner), 'Preview subprocess cancellation is missing')
++        cancel = threading.Event()
++        timer = threading.Timer(0.15, cancel.set)
++        processes = []
++        original = subprocess.Popen
++
++        def capture(*args, **kwargs):
++            child = original(*args, **kwargs)
++            processes.append(child)
++            return child
++
++        timer.start()
++        try:
++            with patch.object(video_preview.subprocess, 'Popen', capture):
++                with self.assertRaises(video_preview.PreviewError):
++                    runner([sys.executable, '-c', 'import time; time.sleep(30)'], cancel, timeout=3)
++        finally:
++            timer.cancel()
++        self.assertTrue(processes)
++        self.assertIsNotNone(processes[0].poll())
++
++
++if __name__ == '__main__':
++    unittest.main()

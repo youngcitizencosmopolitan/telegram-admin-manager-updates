@@ -1,0 +1,42 @@
+--- a/app/tests/test_monitor_new_count.py
++++ b/app/tests/test_monitor_new_count.py
+@@ -40,6 +40,39 @@
+ 
+ 
+ class MonitorNewCountTests(unittest.TestCase):
++    def test_observers_are_closed_even_when_monitor_loop_fails(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        closed = []
++
++        async def fail():
++            pane._folder_indexes['r1'] = SimpleNamespace(close=lambda: closed.append(True))
++            raise RuntimeError('synthetic monitor failure')
++
++        pane._monitor_loop_inner = fail
++        with self.assertRaisesRegex(RuntimeError, 'synthetic monitor failure'):
++            asyncio.run(pane._monitor_loop())
++        self.assertEqual(closed, [True])
++        self.assertIsNone(pane._folder_indexes)
++
++    def test_folder_option_change_replaces_observer(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane._folder_indexes = {}
++        created, closed = [], []
++
++        def create(task, *args):
++            index = SimpleNamespace(task=dict(task), snapshot=lambda: ('sig', set()),
++                                    close=lambda: closed.append(task['recursive']))
++            created.append(index)
++            return index
++
++        task = {'id': 'r1', 'folder': 'unused', 'recursive': True}
++        with patch('batch_uploader.FolderSnapshotIndex', create):
++            pane._scan_monitor_snapshot(task)
++            pane._scan_monitor_snapshot(task)
++            pane._scan_monitor_snapshot({**task, 'recursive': False})
++        self.assertEqual(len(created), 2)
++        self.assertEqual(closed, [True])
++
+     def pane(self):
+         pane = BatchUploaderPane.__new__(BatchUploaderPane)
+         rule = {'id': 'r1', 'name': 'VIP', 'monitor_folder': True,

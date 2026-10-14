@@ -1,0 +1,126 @@
+--- /dev/null
++++ b/app/tam_core/preparation.py
+@@ -0,0 +1,123 @@
++from __future__ import annotations
++
++import asyncio
++import threading
++from dataclasses import dataclass
++from pathlib import Path
++
++from video_preview import PreviewError
++from .file_readiness import FileReadiness, FileStamp, PreparationStopped, read_stamp
++from .file_metadata import has_active_writer
++
++
++@dataclass(frozen=True)
++class PreparedFile:
++    path: Path
++    stamp: FileStamp
++    fingerprint: str
++    thumbnail: Path | None = None
++    preview_error: PreviewError | None = None
++
++
++class PreparationPool:
++    """Batch-owned bounded lookahead; no Telegram calls or upload reservations."""
++    def __init__(self, stop_event, *, concurrency=2, limit=16, quiet=3.0):
++        self.stop_event = stop_event
++        self.cancel = threading.Event()
++        self.slots = asyncio.Semaphore(concurrency)
++        self.limit = limit
++        self.readiness = FileReadiness(quiet)
++        self._jobs = {}
++        self._running = set()
++        self._stopper = asyncio.create_task(self._watch_stop())
++
++    def _start(self, factory):
++        task = asyncio.create_task(factory())
++        self._running.add(task)
++
++        def finished(job):
++            self._running.discard(job)
++            if not job.cancelled():
++                job.exception()  # Observe speculative errors even if never consumed.
++
++        task.add_done_callback(finished)
++        return task
++
++    def stopped(self):
++        return self.cancel.is_set() or self.stop_event.is_set()
++
++    async def _watch_stop(self):
++        while not self.cancel.is_set():
++            if self.stop_event.is_set():
++                self.cancel.set()
++                return
++            await asyncio.sleep(0.1)
++
++    def offer(self, key, factory):
++        if self.stopped():
++            return False
++        if key in self._jobs:
++            return True
++        if len(self._jobs) >= self.limit:
++            return False
++        self._jobs[key] = self._start(factory)
++        return True
++
++    async def take(self, key, factory):
++        while not self.stopped():
++            job = self._jobs.get(key)
++            if job is None:
++                # A demanded file may bypass the speculative limit. Its actual
++                # disk/CPU work still obeys the same global semaphore.
++                job = self._jobs[key] = self._start(factory)
++            try:
++                prepared = await asyncio.shield(job)
++            finally:
++                if self._jobs.get(key) is job:
++                    self._jobs.pop(key, None)
++            if self.stopped():
++                raise PreparationStopped()
++            if await asyncio.to_thread(read_stamp, prepared.path) == prepared.stamp:
++                return prepared
++            self.readiness.forget(prepared.path)
++        raise PreparationStopped()
++
++    async def prepare_file(self, path, reader, thumbnail=None, *, duplicate=None):
++        while not self.stopped():
++            stamp = await self.readiness.wait(path, self.stopped)
++            async with self.slots:
++                if self.stopped():
++                    raise PreparationStopped()
++                if await asyncio.to_thread(read_stamp, path) != stamp:
++                    self.readiness.forget(path)
++                    continue
++                try:
++                    fingerprint = await asyncio.to_thread(reader, path)
++                except OSError:
++                    if await asyncio.to_thread(read_stamp, path) != stamp:
++                        self.readiness.forget(path)
++                        continue
++                    raise
++                known_duplicate = duplicate is not None and await asyncio.to_thread(duplicate, fingerprint)
++                thumb, error = None, None
++                if thumbnail is not None and not known_duplicate:
++                    try:
++                        thumb = await asyncio.to_thread(thumbnail, path, self.cancel)
++                    except PreviewError as exc:
++                        error = exc
++                if (await asyncio.to_thread(read_stamp, path) == stamp
++                        and not await asyncio.to_thread(has_active_writer, path)):
++                    if self.stopped():
++                        raise PreparationStopped()
++                    return PreparedFile(path, stamp, fingerprint, thumb, error)
++            self.readiness.forget(path)
++        raise PreparationStopped()
++
++    async def close(self):
++        self.cancel.set()
++        jobs = list(set(self._jobs.values()) | self._running)
++        if jobs:
++            await asyncio.gather(*jobs, return_exceptions=True)
++        self._jobs.clear()
++        self._stopper.cancel()
++        await asyncio.gather(self._stopper, return_exceptions=True)

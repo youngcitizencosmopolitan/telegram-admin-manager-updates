@@ -1,0 +1,26 @@
+--- a/app/tam_core/file_metadata.py
++++ b/app/tam_core/file_metadata.py
+@@ -48,3 +48,23 @@
+ 
+ def stat_identity(stat) -> tuple[int, ...]:
+     return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino)
++
++
++def has_active_writer(path: Path) -> bool:
++    if os.name != 'nt':
++        return False
++    name = str(path.resolve())
++    if not name.startswith('\\\\?\\'):
++        name = '\\\\?\\UNC\\' + name[2:] if name.startswith('\\\\') else '\\\\?\\' + name
++    # Excluding FILE_SHARE_WRITE detects existing writer handles without writing
++    # or keeping a lock on the source while it is being copied.
++    # FILE_READ_DATA participates in sharing checks; attribute-only handles do
++    # not reliably conflict with writers. No data is actually read here.
++    handle = _create(name, 0x81, 0x5, None, 3, 0, None)
++    if handle in (None, ctypes.c_void_p(-1).value):
++        error = ctypes.get_last_error()
++        if error in (32, 33):
++            return True
++        raise ctypes.WinError(error)
++    _close(handle)
++    return False

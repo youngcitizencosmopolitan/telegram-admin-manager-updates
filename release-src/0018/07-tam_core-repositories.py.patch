@@ -1,0 +1,13 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -110,7 +110,9 @@
+         for path, norm, st, signature in files:
+             row = cached.get(norm)
+             fingerprint = fingerprint_key_for_path(path, row[1]) if signature and row and row[0] == signature and row[1] else ''
+-            candidates.append((target_key_for_path(path), norm, st.st_size, st.st_mtime_ns, fingerprint))
++            # Once a source fingerprint is known, metadata-only legacy history
++            # must not override a different/invalidated content identity.
++            candidates.append((target_key_for_path(path), norm, st.st_size, st.st_mtime_ns, fingerprint, int(row is None)))
+         completed = self.db.upload_completed_candidates(candidates, forum_target_key)
+         result = {}
+         for i in completed:
