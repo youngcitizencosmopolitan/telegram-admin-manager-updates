@@ -1,12 +1,17 @@
 {
-  "version": "0014",
-  "base_version": "0013",
-  "manifest_version": "4.3.8.0014",
-  "display_version": "0014",
+  "version": "0015",
+  "base_version": "0014",
+  "manifest_version": "4.3.8.0015",
+  "display_version": "0015",
   "patch_files": [
-    "release-src/0014/01-premium-global-priority.patch",
-    "release-src/0014/02-version.patch",
-    "release-src/0014/03-premium-priority-tests.patch"
+    "release-src/0015/01-batch_uploader.py.patch",
+    "release-src/0015/02-telegram_admin_manager.py.patch",
+    "release-src/0015/03-tam_core-repositories.py.patch",
+    "release-src/0015/04-tam_core-state_db.py.patch",
+    "release-src/0015/05-tests-test_monitor_accounts_cache.py.patch",
+    "release-src/0015/06-tests-test_target_peer_rpc_cache.py.patch",
+    "release-src/0015/07-tests-test_monitor_new_count.py.patch",
+    "release-src/0015/08-tests-test_dashboard_monitoring_v429.py.patch"
   ],
-  "notes": "0014: Premium accounts prioritize large files across the current monitoring wave before taking ordinary files, including large files in later rules. Ordinary accounts keep their existing rule order. Preserves account selections, pause/stop, hot-add activation, upload history and multipart recovery. Includes twelve priority and worker integration tests."
+  "notes": "0015: adds a single explicit account picker for all existing monitoring rules, preserving active batches and preventing later accounts from joining those rules automatically. Persists successful target resolution and membership per account/auth session to avoid repeated invite/join checks across restarts; reuses exact-policy admin assignments and prepares only unknown accounts. Zero cache TTL means no expiry. Access errors invalidate only the affected account/target; manual cache reset remains available. Includes scan/edit race, failed-join and real Telethon serialization checks."
 }

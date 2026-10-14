@@ -1,0 +1,36 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -625,6 +625,33 @@
+                 (rule_id, int(position), json.dumps(payload, ensure_ascii=False), now),
+             )
+ 
++    def monitor_rule_update_fields(self, rule_id: str, fields: dict[str, Any]) -> dict[str, Any]:
++        with self.session() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            row = conn.execute("SELECT payload_json FROM monitor_rules WHERE id=?", (str(rule_id),)).fetchone()
++            if row is None:
++                return {}
++            payload = json.loads(row[0])
++            payload.update(fields)
++            conn.execute("UPDATE monitor_rules SET payload_json=?, updated_at=? WHERE id=?",
++                         (json.dumps(payload, ensure_ascii=False), time.time(), str(rule_id)))
++            return payload
++
++    def monitor_rules_set_accounts(self, sessions: list[str]) -> list[str]:
++        selected = list(dict.fromkeys(str(s).strip() for s in sessions if str(s).strip()))
++        if not selected:
++            raise ValueError("Choose at least one account")
++        changed: list[str] = []
++        with self.session() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            for row in conn.execute("SELECT id, payload_json FROM monitor_rules ORDER BY position, id").fetchall():
++                payload = json.loads(row["payload_json"])
++                payload.update(account_sessions=selected, use_all_accounts=False, monitor_accounts_override=True)
++                conn.execute("UPDATE monitor_rules SET payload_json=?, updated_at=? WHERE id=?",
++                             (json.dumps(payload, ensure_ascii=False), time.time(), row["id"]))
++                changed.append(str(row["id"]))
++        return changed
++
+     def monitor_rule_delete(self, rule_id: str) -> None:
+         with self.session() as conn:
+             conn.execute("DELETE FROM monitor_seen_files WHERE rule_id=?", (str(rule_id),))

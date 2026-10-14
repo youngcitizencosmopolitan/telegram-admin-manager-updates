@@ -1,0 +1,154 @@
+--- /dev/null
++++ b/app/tests/test_monitor_accounts_cache.py
+@@ -0,0 +1,151 @@
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++import threading
++import asyncio
++
++from batch_uploader import BatchUploaderPane
++from tam_core import ConfigStore, GroupStateCache, MonitorRuleStore
++
++
++class MonitorAccountSelectionTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.store = ConfigStore(Path(self.temp.name) / 'config.json')
++        self.store.data['accounts'] = [dict(session=s, user_id=n) for n, s in enumerate(('a', 'b', 'new'), 1)]
++        self.store.data['upload_tasks'] = [dict(id='r1', account_sessions=['manual'], use_all_accounts=False)]
++        self.store.save()
++        self.repo = MonitorRuleStore(self.store.db)
++        for rid, enabled in (('r1', True), ('r2', False)):
++            self.repo.put(dict(id=rid, monitor_folder=enabled, folder='folder', target='@group',
++                               use_all_accounts=True, monitor_signature='keep', monitor_last_new_count=9))
++            self.repo.replace_seen_files(rid, {'old.mp4'})
++
++    def test_bulk_selection_persists_and_keeps_rule_metadata(self):
++        self.assertTrue(hasattr(self.repo, 'set_accounts_for_all'))
++        self.assertEqual(set(self.repo.set_accounts_for_all(['b', 'a', 'b'])), {'r1', 'r2'})
++        reopened = MonitorRuleStore(ConfigStore(self.store.path).db)
++        for rule in reopened.all():
++            self.assertEqual(rule['account_sessions'], ['b', 'a'])
++            self.assertFalse(rule['use_all_accounts'])
++            self.assertTrue(rule['monitor_accounts_override'])
++            self.assertEqual(rule['monitor_signature'], 'keep')
++            self.assertEqual(reopened.seen_files(rule['id']), {'old.mp4'})
++        self.assertFalse(reopened.get('r2')['monitor_folder'])
++
++    def test_linked_task_edits_do_not_undo_monitor_only_account_selection(self):
++        self.assertTrue(hasattr(self.repo, 'set_accounts_for_all'))
++        self.repo.set_accounts_for_all(['b'])
++        self.repo.sync_from_task(dict(id='r1', folder='folder', target='@group', monitor_folder=True,
++                                      use_all_accounts=True, account_sessions=['new']))
++        self.assertEqual(self.repo.get('r1')['account_sessions'], ['b'])
++        self.assertFalse(self.repo.get('r1')['use_all_accounts'])
++        self.assertEqual(self.store.data['upload_tasks'][0]['account_sessions'], ['manual'])
++
++    def test_empty_selection_is_rejected_without_changing_rules(self):
++        self.assertTrue(hasattr(self.repo, 'set_accounts_for_all'))
++        before = self.repo.all()
++        with self.assertRaises(ValueError):
++            self.repo.set_accounts_for_all([])
++        self.assertEqual(self.repo.all(), before)
++
++    def test_bulk_selection_updates_waiting_monitor_snapshots_only(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        self.assertTrue(hasattr(pane, 'set_monitor_accounts_for_all'))
++        pane.app = SimpleNamespace(store=self.store, monitor_rules=self.repo, log=lambda *a: None)
++        pane._queue_lock = threading.Lock()
++        source = '\u041c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433'
++        pane.pending_batches = [dict(id='monitor', source=source, task_snapshots=[self.repo.get('r1')]),
++                                dict(id='manual', source='Manual', task_snapshots=[self.repo.get('r1')])]
++        pane._current_batch_snapshot = [dict(id='running', source=source, task_snapshots=[self.repo.get('r1')])]
++        pane.refresh_monitor_tab = lambda **kwargs: None
++        pane.set_monitor_accounts_for_all(['a'])
++        self.assertEqual(pane.pending_batches[0]['task_snapshots'][0]['account_sessions'], ['a'])
++        self.assertTrue(pane.pending_batches[1]['task_snapshots'][0]['use_all_accounts'])
++        self.assertTrue(pane._current_batch_snapshot[0]['task_snapshots'][0]['use_all_accounts'])
++
++
++class PersistentTargetCacheTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.path = Path(self.temp.name) / 'group_state_cache.json'
++        self.cache = GroupStateCache(self.path)
++
++    def test_zero_ttl_keeps_confirmed_rights_and_topics_until_reset(self):
++        self.cache.mark_admins('@g', {'a', 'b'}, anonymous=True)
++        self.cache.mark_topics('@g', {'topic': 12})
++        self.assertEqual(self.cache.fresh_admin_sessions('@g', 0), {'a', 'b'})
++        self.assertEqual(self.cache.fresh_topics('@g', 0), {'topic': 12})
++
++    def test_target_peer_is_persistent_and_bound_to_session_identity(self):
++        self.assertTrue(hasattr(self.cache, 'mark_target_peer'))
++        self.cache.mark_target_peer('@g', 'a', 'account-1:key-1', 'encoded-peer', member=True)
++        reopened = GroupStateCache(self.path)
++        self.assertEqual(reopened.target_peer('@g', 'a', 'account-1:key-1', require_member=True), 'encoded-peer')
++        self.assertIsNone(reopened.target_peer('@g', 'b', 'account-1:key-1'))
++        self.assertIsNone(reopened.target_peer('@g', 'a', 'account-2:key-1'))
++        self.assertIsNone(reopened.target_peer('@g', 'a', 'account-1:key-2'))
++
++    def test_accessible_public_group_is_not_proof_of_membership(self):
++        self.assertTrue(hasattr(self.cache, 'mark_target_peer'))
++        self.cache.mark_target_peer('@g', 'a', 'identity', 'peer', member=False)
++        self.assertIsNone(self.cache.target_peer('@g', 'a', 'identity', require_member=True))
++        self.assertEqual(self.cache.target_peer('@g', 'a', 'identity'), 'peer')
++
++    def test_permission_error_invalidates_only_affected_session(self):
++        self.assertTrue(hasattr(self.cache, 'mark_target_peer'))
++        self.cache.mark_admins('@g', {'a', 'b'}, policy_key='max', controller_session='a')
++        for session in ('a', 'b'):
++            self.cache.mark_target_peer('@g', session, session, 'peer', member=True)
++        self.cache.invalidate_admin('@g', 'a')
++        self.assertIsNone(self.cache.target_peer('@g', 'a', 'a'))
++        self.assertEqual(self.cache.target_peer('@g', 'b', 'b'), 'peer')
++        self.assertEqual(self.cache.fresh_admin_sessions('@g', 24), {'b'})
++        self.assertEqual(self.cache.admin_sessions_for_policy('@g', 'max'), {'b'})
++        self.assertIsNone(self.cache.cached_controller('@g', 0))
++
++
++class MonitorSelectionScanRaceTests(unittest.IsolatedAsyncioTestCase):
++    async def test_bulk_selection_survives_scan_already_in_progress(self):
++        with tempfile.TemporaryDirectory() as td:
++            store = ConfigStore(Path(td) / 'config.json')
++            repo = MonitorRuleStore(store.db)
++            repo.put(dict(id='r', monitor_folder=True, monitor_seen_initialized=True,
++                          use_all_accounts=True, folder=td, target='@g'))
++            entered, release = threading.Event(), threading.Event()
++            pane = BatchUploaderPane.__new__(BatchUploaderPane)
++            pane.app = SimpleNamespace(monitor_rules=repo, ui_call=lambda fn: fn(), log=lambda *a: None)
++            pane.monitor_rules = repo.all
++            pane.monitor_runtime, pane.monitor_last_signatures, pane.monitor_pending_signatures = {}, {}, {}
++            pane.monitor_stop_event = threading.Event()
++            pane.refresh_monitor_tab = lambda: None
++            queued = []
++            pane._enqueue_batch = lambda tasks, **kwargs: queued.extend(tasks)
++            def scan(rule):
++                entered.set()
++                if not release.wait(3):
++                    raise TimeoutError('Test scan was never released')
++                pane.monitor_stop_event.set()
++                return 'signature', {'new.mp4'}
++            pane._scan_monitor_snapshot = scan
++            running = asyncio.create_task(pane._monitor_loop())
++            try:
++                self.assertTrue(await asyncio.to_thread(entered.wait, 3))
++                repo.set_accounts_for_all(['chosen'])
++                release.set()
++                await asyncio.wait_for(running, 3)
++                self.assertEqual(repo.get('r')['account_sessions'], ['chosen'])
++                self.assertFalse(repo.get('r')['use_all_accounts'])
++                self.assertEqual(queued[0]['account_sessions'], ['chosen'])
++            finally:
++                release.set()
++                if not running.done():
++                    running.cancel()
++                await asyncio.gather(running, return_exceptions=True)
++
++
++if __name__ == '__main__':
++    unittest.main()

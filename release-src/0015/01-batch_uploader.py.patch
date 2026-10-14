@@ -1,0 +1,200 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -788,6 +788,7 @@
+         self.monitor_btn.pack(side="left", padx=(16, 5))
+         ttk.Button(top, text="Обновить список", command=self.refresh_monitor_tab).pack(side="left", padx=5)
+         ttk.Button(top, text="Preflight", command=self.run_preflight).pack(side="left", padx=5)
++        ttk.Button(top, text="Аккаунты для всех правил...", command=self.choose_monitor_accounts_for_all).pack(side="left", padx=5)
+         self.monitor_state_var = tk.StringVar(value="Остановлен")
+         ttk.Label(top, textvariable=self.monitor_state_var, font=("Segoe UI", 10, "bold")).pack(side="right")
+ 
+@@ -798,7 +799,7 @@
+         ttl = ttk.Spinbox(cache_bar, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
+         ttl.pack(side="left", padx=(6, 3))
+         ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+-        ttk.Label(cache_bar, text="ч. (0 = всегда проверять)").pack(side="left")
++        ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+         ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
+         ttk.Label(
+             cache_bar,
+@@ -865,6 +866,7 @@
+         self.monitor_btn.pack(side="left", padx=(16, 5))
+         ttk.Button(top, text="Обновить", command=lambda: self.refresh_monitor_tab(force=True)).pack(side="left", padx=5)
+         ttk.Button(top, text="Preflight", command=self.run_preflight).pack(side="left", padx=5)
++        ttk.Button(top, text="Аккаунты для всех правил...", command=self.choose_monitor_accounts_for_all).pack(side="left", padx=5)
+         self.monitor_state_var = tk.StringVar(value="Остановлен")
+         ttk.Label(top, textvariable=self.monitor_state_var, font=("Segoe UI", 10, "bold")).pack(side="right")
+ 
+@@ -882,7 +884,7 @@
+         ttl = ttk.Spinbox(cache_bar, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
+         ttl.pack(side="left", padx=(6, 3))
+         ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+-        ttk.Label(cache_bar, text="ч. (0 = всегда)").pack(side="left")
++        ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+         ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
+ 
+         body = tk.PanedWindow(p, orient="vertical", sashwidth=7, bg="#d8dee8", bd=0, relief="flat")
+@@ -1160,6 +1162,84 @@
+     def _save_monitor_rule(self, rule: dict[str, Any]) -> None:
+         self.app.monitor_rules.put(rule)
+         self.refresh_monitor_tab()
++
++    def set_monitor_accounts_for_all(self, sessions: list[str]) -> int:
++        known = {account.session for account in self.app.store.accounts()}
++        selected = list(dict.fromkeys(str(s) for s in sessions if str(s) in known))
++        if not selected:
++            raise ValueError("Выбери хотя бы один существующий аккаунт.")
++        rule_ids = set(self.app.monitor_rules.set_accounts_for_all(selected))
++        with self._queue_lock:
++            for item in self.pending_batches:
++                if not _is_monitor_queue_item(item):
++                    continue
++                for snapshot in item.get("task_snapshots", []) or []:
++                    if isinstance(snapshot, dict) and str(snapshot.get("id", "")) in rule_ids:
++                        snapshot.update(account_sessions=list(selected), use_all_accounts=False,
++                                        monitor_accounts_override=True)
++                try:
++                    self.app.store.db.queue_mark(str(item.get("id", "")), "waiting", item)
++                except Exception as exc:
++                    self.app.log(f"Мониторинг: не удалось обновить снимок очереди — {exc}")
++        self.app.log(f"Мониторинг: выбрано аккаунтов {len(selected)} для всех правил ({len(rule_ids)}). "
++                     "Текущая пачка завершится с прежним составом; следующие используют выбранный список.")
++        self.refresh_monitor_tab(force=True)
++        return len(rule_ids)
++
++    def choose_monitor_accounts_for_all(self) -> None:
++        accounts, rules = self.app.store.accounts(), self.monitor_rules()
++        if not accounts or not rules:
++            messagebox.showinfo("Telegram Admin Manager", "Сначала добавь аккаунты и правила мониторинга.", parent=self.app)
++            return
++        known = {a.session for a in accounts}
++        selected = set(known)
++        for rule in rules:
++            if not rule.get("use_all_accounts", True):
++                selected.intersection_update(rule.get("account_sessions", []) or [])
++        dlg = tk.Toplevel(self.app)
++        dlg.title("Аккаунты для всех правил мониторинга")
++        dlg.geometry("640x520")
++        dlg.minsize(540, 380)
++        dlg.transient(self.app)
++        body = ttk.Frame(dlg, padding=12)
++        body.pack(fill="both", expand=True)
++        ttk.Label(body, text=f"Один список аккаунтов для всех правил: {len(rules)}", font=("Segoe UI", 11, "bold")).pack(anchor="w")
++        ttk.Label(body, text="Список заменит участников существующих правил. Новые аккаунты автоматически не добавляются. "
++                  "Текущая пачка завершится с прежним составом.",
++                  wraplength=590).pack(anchor="w", pady=(6, 10))
++        area = ttk.Frame(body)
++        area.pack(fill="both", expand=True)
++        canvas = tk.Canvas(area, highlightthickness=0)
++        scroll = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
++        scroll.pack(side="right", fill="y")
++        canvas.pack(side="left", fill="both", expand=True)
++        canvas.configure(yscrollcommand=scroll.set)
++        checks = ttk.Frame(canvas)
++        window = canvas.create_window((0, 0), window=checks, anchor="nw")
++        checks.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
++        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
++        variables = {a.session: tk.BooleanVar(value=a.session in selected) for a in accounts}
++        for account in accounts:
++            usage = getattr(self.app, "account_usage_allows", None)
++            suffix = " — мониторинг запрещён в настройках аккаунта" if callable(usage) and not usage(account.session, "monitoring") else ""
++            ttk.Checkbutton(checks, text=account.display + suffix, variable=variables[account.session]).pack(anchor="w", pady=3)
++        buttons = ttk.Frame(body)
++        buttons.pack(fill="x", pady=(10, 0))
++        def select_all(value: bool) -> None:
++            for variable in variables.values():
++                variable.set(value)
++        def apply() -> None:
++            try:
++                self.set_monitor_accounts_for_all([s for s, variable in variables.items() if variable.get()])
++            except Exception as exc:
++                messagebox.showerror("Telegram Admin Manager", str(exc), parent=dlg)
++                return
++            dlg.destroy()
++        ttk.Button(buttons, text="Все", command=lambda: select_all(True)).pack(side="left")
++        ttk.Button(buttons, text="Ни одного", command=lambda: select_all(False)).pack(side="left", padx=5)
++        ttk.Button(buttons, text="Применить ко всем правилам", command=apply).pack(side="right")
++        ttk.Button(buttons, text="Отмена", command=dlg.destroy).pack(side="right", padx=5)
++        dlg.grab_set()
+ 
+     def _set_linked_task_monitor_flag(self, tid: str, enabled: bool) -> None:
+         tasks = self.tasks()
+@@ -2498,8 +2578,12 @@
+                         if initialized or current_files != previous_files:
+                             self.app.monitor_rules.replace_seen_files(tid, current_files)
+                         if updated_rule != task:
+-                            self.app.monitor_rules.put(updated_rule)
+-                            task = updated_rule
++                            fields = {key: updated_rule[key] for key in (
++                                "monitor_seen_initialized", "monitor_last_new_count", "monitor_last_detection"
++                            ) if key in updated_rule and updated_rule.get(key) != task.get(key)}
++                            # A scan may overlap an account/caption edit in the UI.
++                            # Commit detection fields only, then use the latest rule.
++                            task = self.app.monitor_rules.update_fields(tid, fields)
+                     except Exception as exc:
+                         self.app.log(f"Мониторинг: не удалось сохранить снимок файлов {task.get('name', tid)} — {exc}")
+                     # This column describes this scan, not the last historical
+@@ -2562,9 +2646,9 @@
+         rule = self.app.monitor_rules.get(tid)
+         if not rule:
+             return
+-        rule["monitor_signature"] = str(signature)
+-        rule["monitor_last_success"] = time.time()
+-        self.app.monitor_rules.put(rule)
++        self.app.monitor_rules.update_fields(tid, {
++            "monitor_signature": str(signature), "monitor_last_success": time.time(),
++        })
+         runtime = self.monitor_runtime.get(tid, {})
+         cutoff = time.time() if processed_before is None else processed_before
+         # A completed older snapshot must not erase arrivals found during upload.
+@@ -3386,9 +3470,15 @@
+                 continue
+             ttl = self._cache_ttl_hours()
+             require_anonymous = bool(self.app.store.data.get("admin_anonymous", True))
++            policy_key = self.app.maximum_admin_policy_key("")
+             cached_admins = self.app.group_state_cache.fresh_admin_sessions(
+                 target, ttl, require_anonymous=require_anonymous
+             )
++            # Successful assignments are an operation journal, not an expiring
++            # membership probe. Reapply only when the desired policy changes.
++            assignments = self.app.group_state_cache.entry(target).get("admin_assignments") or {}
++            policy_sessions = self.app.group_state_cache.admin_sessions_for_policy(target, policy_key)
++            cached_admins = (cached_admins - set(assignments)) | policy_sessions
+             required_sessions = {a.session for a in selected}
+             if required_sessions and required_sessions.issubset(cached_admins):
+                 self.app.log(
+@@ -3398,12 +3488,12 @@
+                 for tid in entry["task_ids"]:
+                     self.app.ui_call(lambda t=tid: self._set_task_row(t, status="🧠 Админы из кэша", speed="—", eta="—"))
+                 continue
++            selected = [account for account in selected if account.session not in cached_admins]
+             try:
+                 policy = self.app.safety_policy()
+                 admin_delay = 0.35
+                 if policy["enabled"]:
+                     admin_delay = max(admin_delay, float(policy["admin_delay"]))
+-                policy_key = self.app.maximum_admin_policy_key("")
+                 promoted, failed = await self.app._promote_one_target_async(
+                     target=target,
+                     selected=selected,
+@@ -4002,6 +4092,10 @@
+         if hot_admin_locks is None:
+             hot_admin_locks = {}
+         cached_admins = self.app.group_state_cache.fresh_admin_sessions(task_target, self._cache_ttl_hours())
++        cached_policy = getattr(self.app.group_state_cache, "admin_sessions_for_policy", None)
++        policy_key = getattr(self.app, "maximum_admin_policy_key", None)
++        if callable(cached_policy) and callable(policy_key):
++            cached_admins |= cached_policy(task_target, policy_key(""))
+         for session in sessions:
+             account, client = clients[session]
+             if self.account_health.get(session, {}).get("disabled"):
+@@ -4546,7 +4640,8 @@
+                                 exc_name = exc.__class__.__name__
+                                 if exc_name in {
+                                     "ChatAdminRequiredError", "ChatWriteForbiddenError", "UserBannedInChannelError",
+-                                    "ChannelPrivateError", "RightForbiddenError"
++                                    "ChannelPrivateError", "RightForbiddenError", "ChannelInvalidError",
++                                    "ChatIdInvalidError", "PeerIdInvalidError", "UserNotParticipantError",
+                                 }:
+                                     self.app.group_state_cache.invalidate_admin(task_target, session)
+                                     self.app.ui_call(self.refresh_monitor_tab)
