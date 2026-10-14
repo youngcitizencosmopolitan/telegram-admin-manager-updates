@@ -1,0 +1,155 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -18,6 +18,7 @@
+ from tam_core.file_metadata import has_active_writer, stat_identity
+ from tam_core.folder_events import FolderSnapshotIndex
+ from tam_core.preparation import PreparationPool
++from tam_core.repositories import HISTORY_CHECK_BATCH_SIZE
+ from tam_core.file_readiness import PreparationStopped, read_stamp
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind as _media_kind
+ from tam_core.preflight import build_preflight_report, format_preflight_report
+@@ -4253,66 +4254,90 @@
+             "До 2 ГБ — любой; 2–4 ГБ — только Premium; >4 ГБ — пропуск."
+         )
+ 
+-        completed_paths = None
+         batch_check = getattr(self.app.upload_history, 'completed_paths', None)
+-        if callable(batch_check):
+-            self.app.ui_call(lambda: self._set_task_row(tid, status="Проверка индекса…"))
+-            completed_paths = await asyncio.to_thread(
+-                batch_check, files, history_key_for_path,
+-                lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
+-                forum_target_key=str(target_key) if forum_mode else None,
+-            )
+-
+         pending: list[tuple[int, Path]] = []
+-        for index, path in enumerate(files, start=1):
+-            if index % 256 == 0:
+-                await asyncio.sleep(0)
++        last_history_update = 0.0
++        for offset in range(0, total_files, HISTORY_CHECK_BATCH_SIZE):
+             if self.stop_event.is_set():
+                 break
+-            try:
+-                current_stat = path.stat()
+-                size = current_stat.st_size
+-            except OSError:
+-                state["processed_files"] += 1
+-                state["failed"] += 1
+-                continue
+-            topic_title = self._topic_title_for_path(task, path) if forum_mode else None
+-            if forum_mode and topic_title is not None and topic_id_for_path(path) is None:
+-                state["processed_bytes"] += size
+-                state["processed_files"] += 1
+-                state["failed"] += 1
+-                key = f"{tid}:{path}"
+-                self.app.log(f"{name} → {path.name}: ❌ нет темы «{topic_title}» и создать её не удалось")
+-                self.app.record_upload_error(task=name, target=task_target, path=str(path), account="—", attempts=1, error=f"Нет темы: {topic_title}")
+-                self.app.ui_call(lambda k=key, p=path, z=size, tt=topic_title: self._activity_update(k, name, p, "—", z, 0.0, 0.0, f"❌ Нет темы: {tt}"))
+-            elif (completed_paths.get(path) == stat_identity(current_stat) if completed_paths is not None else (
+-                self.app.upload_history.exact_completed(path, history_key_for_path(path))
+-                or (
+-                    forum_mode
+-                    and hasattr(self.app.upload_history, "exact_completed_forum")
+-                    and self.app.upload_history.exact_completed_forum(path, str(target_key))
++            chunk = files[offset:offset + HISTORY_CHECK_BATCH_SIZE]
++            completed_paths = None
++            if callable(batch_check):
++                if offset == 0:
++                    self.app.ui_call(lambda: self._set_task_row(tid, status=f"Проверка кеша: 0/{total_files}"))
++                # Bound concurrent disk/SQLite scans across rules as well as the
++                # lifetime of each result map. No completed map for the full tree.
++                async with scan_sem:
++                    if self.stop_event.is_set():
++                        break
++                    completed_paths = await asyncio.to_thread(
++                        batch_check, chunk, history_key_for_path,
++                        lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
++                        forum_target_key=str(target_key) if forum_mode else None,
++                        stopped=self.stop_event.is_set,
++                    )
++            if self.stop_event.is_set():
++                break
++            for index, path in enumerate(chunk, start=offset + 1):
++                if index % 64 == 0:
++                    await asyncio.sleep(0)
++                if self.stop_event.is_set():
++                    break
++                try:
++                    current_stat = path.stat()
++                    size = current_stat.st_size
++                except OSError:
++                    state["processed_files"] += 1
++                    state["failed"] += 1
++                    continue
++                topic_title = self._topic_title_for_path(task, path) if forum_mode else None
++                if forum_mode and topic_title is not None and topic_id_for_path(path) is None:
++                    state["processed_bytes"] += size
++                    state["processed_files"] += 1
++                    state["failed"] += 1
++                    key = f"{tid}:{path}"
++                    self.app.log(f"{name} → {path.name}: ❌ нет темы «{topic_title}» и создать её не удалось")
++                    self.app.record_upload_error(task=name, target=task_target, path=str(path), account="—", attempts=1, error=f"Нет темы: {topic_title}")
++                    self.app.ui_call(lambda k=key, p=path, z=size, tt=topic_title: self._activity_update(k, name, p, "—", z, 0.0, 0.0, f"❌ Нет темы: {tt}"))
++                elif (completed_paths.get(path) == stat_identity(current_stat) if completed_paths is not None else (
++                    self.app.upload_history.exact_completed(path, history_key_for_path(path))
++                    or (
++                        forum_mode
++                        and hasattr(self.app.upload_history, "exact_completed_forum")
++                        and self.app.upload_history.exact_completed_forum(path, str(target_key))
++                    )
++                )):
++                    state["processed_bytes"] += size
++                    state["processed_files"] += 1
++                    state["skipped"] += 1
++                elif _telegram_upload_lane(size) == "too_large":
++                    state["processed_bytes"] += size
++                    state["processed_files"] += 1
++                    state["skipped"] += 1
++                    state["limit_skipped"] += 1
++                    key = f"{tid}:{path}"
++                    self.app.log(
++                        f"{name} → {path.name}: ⏭ превышает multipart-лимит Telegram Premium "
++                        f"({size / 1024**3:.2f} ГБ), пропускаю"
++                    )
++                    self.app.ui_call(lambda k=key, p=path, z=size: self._activity_update(k, name, p, "—", z, 0.0, 0.0, "⏭ лимит Telegram"))
++                else:
++                    # Preserve original ordinals and Premium hot-add behavior.
++                    pending.append((index, path))
++            completed_paths = None
++            checked = min(offset + len(chunk), total_files)
++            now = time.monotonic()
++            if not self.stop_event.is_set() and (checked == total_files or now - last_history_update >= 0.5):
++                last_history_update = now
++                self.app.ui_call(
++                    lambda n=checked: self._set_task_row(tid, status=f"Проверка кеша: {n}/{total_files}")
+                 )
+-            )):
+-                state["processed_bytes"] += size
+-                state["processed_files"] += 1
+-                state["skipped"] += 1
+-            elif _telegram_upload_lane(size) == "too_large":
+-                state["processed_bytes"] += size
+-                state["processed_files"] += 1
+-                state["skipped"] += 1
+-                state["limit_skipped"] += 1
+-                key = f"{tid}:{path}"
+-                self.app.log(
+-                    f"{name} → {path.name}: ⏭ превышает multipart-лимит Telegram Premium "
+-                    f"({size / 1024**3:.2f} ГБ), пропускаю"
+-                )
+-                self.app.ui_call(lambda k=key, p=path, z=size: self._activity_update(k, name, p, "—", z, 0.0, 0.0, "⏭ лимит Telegram"))
+-            else:
+-                # Keep 2–4 GB work pending even if no Premium account existed at
+-                # the initial snapshot. A Premium account hot-added while the task
+-                # is still active can immediately claim it from big_queue.
+-                pending.append((index, path))
++            await asyncio.sleep(0)
+         self._emit_task_metrics(tid, force=True)
++
++        if self.stop_event.is_set():
++            self.app.ui_call(lambda: self._set_task_row(tid, status="Остановлено", speed="—", eta="—"))
++            return
+ 
+         if not pending:
+             status = "✅ Нечего загружать" if state["limit_skipped"] else "✅ Уже загружено"

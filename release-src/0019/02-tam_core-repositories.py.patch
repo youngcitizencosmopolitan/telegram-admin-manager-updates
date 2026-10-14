@@ -1,0 +1,106 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -3,13 +3,16 @@
+ import json
+ import threading
+ import time
++from itertools import islice
+ from pathlib import Path
+-from typing import Any
++from typing import Any, Iterable
+ 
+ from .defaults import DEFAULT_CONFIG
+ from .models import Account
+ from .state_db import StateDatabase
+ from .file_metadata import change_token, stat_identity
++
++HISTORY_CHECK_BATCH_SIZE = 2000
+ 
+ 
+ class ConfigStore:
+@@ -95,35 +98,57 @@
+             self.db.file_fingerprint_put(norm, signature, fingerprint)
+         return fingerprint
+ 
+-    def completed_paths(self, paths: list[Path], target_key_for_path, fingerprint_key_for_path,
+-                        *, forum_target_key: str | None = None) -> dict[Path, tuple[int, ...]]:
+-        """Metadata-only warm scan. Never turn reservations into successful uploads."""
+-        files = []
+-        for path in paths:
+-            try:
+-                norm, st, signature = self._file_signature(path)
+-                files.append((path, norm, st, signature))
+-            except OSError:
++    def completed_paths(self, paths: Iterable[Path], target_key_for_path, fingerprint_key_for_path,
++                        *, forum_target_key: str | None = None, stopped=None) -> dict[Path, tuple[int, ...]]:
++        """Metadata-only scan with bounded query buffers; cancellation discards results.
++
++        The return value grows with matches. Callers processing large queues should
++        consume one HISTORY_CHECK_BATCH_SIZE slice at a time, as the uploader does.
++        Reservations never count as successful uploads.
++        """
++        stopped = stopped or (lambda: False)
++        source = iter(paths)
++        result = {}
++        while not stopped():
++            chunk = list(islice(source, HISTORY_CHECK_BATCH_SIZE))
++            if not chunk:
++                return result
++            files = []
++            for path in chunk:
++                if stopped():
++                    return {}
++                try:
++                    norm, st, signature = self._file_signature(path)
++                    files.append((path, norm, st, signature))
++                except OSError:
++                    continue
++            if stopped():
++                return {}
++            if not files:
+                 continue
+-        cached = self.db.file_fingerprints_get([item[1] for item in files])
+-        candidates = []
+-        for path, norm, st, signature in files:
+-            row = cached.get(norm)
+-            fingerprint = fingerprint_key_for_path(path, row[1]) if signature and row and row[0] == signature and row[1] else ''
+-            # Once a source fingerprint is known, metadata-only legacy history
+-            # must not override a different/invalidated content identity.
+-            candidates.append((target_key_for_path(path), norm, st.st_size, st.st_mtime_ns, fingerprint, int(row is None)))
+-        completed = self.db.upload_completed_candidates(candidates, forum_target_key)
+-        result = {}
+-        for i in completed:
+-            path, norm, st, signature = files[i]
+-            try:
+-                current_norm, current_st, current_signature = self._file_signature(path)
+-                if (current_norm, stat_identity(current_st), current_signature) == (norm, stat_identity(st), signature):
+-                    result[path] = stat_identity(current_st)
+-            except OSError:
+-                continue
+-        return result
++            cached = self.db.file_fingerprints_get([item[1] for item in files])
++            candidates = []
++            for path, norm, st, signature in files:
++                if stopped():
++                    return {}
++                row = cached.get(norm)
++                fingerprint = fingerprint_key_for_path(path, row[1]) if signature and row and row[0] == signature and row[1] else ''
++                # Known content identity takes precedence over legacy exact rows.
++                candidates.append((target_key_for_path(path), norm, st.st_size, st.st_mtime_ns, fingerprint, int(row is None)))
++            if stopped():
++                return {}
++            completed = self.db.upload_completed_candidates(candidates, forum_target_key)
++            for i in completed:
++                if stopped():
++                    return {}
++                path, norm, st, signature = files[i]
++                try:
++                    current_norm, current_st, current_signature = self._file_signature(path)
++                    if (current_norm, stat_identity(current_st), current_signature) == (norm, stat_identity(st), signature):
++                        result[path] = stat_identity(current_st)
++                except OSError:
++                    continue
++        return {}
+ 
+     def exact_completed(self, path: Path, target_key: str) -> bool:
+         try:
