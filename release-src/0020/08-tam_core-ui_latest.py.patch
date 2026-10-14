@@ -1,0 +1,39 @@
+--- /dev/null
++++ b/app/tam_core/ui_latest.py
+@@ -0,0 +1,36 @@
++"""Thread-safe latest repaint per key, drained only by the Tk thread."""
++import threading
++import time
++from itertools import islice
++
++
++class UiLatest:
++    def __init__(self, *, clock=time.monotonic, interval=0.5, limit=80):
++        self.clock, self.interval, self.limit = clock, interval, limit
++        self._next = 0.0
++        self._callbacks = {}
++        self._field_values = {}
++        self._lock = threading.Lock()
++
++    def put(self, key, callback):
++        with self._lock:
++            self._field_values.pop(key, None)
++            self._callbacks[key] = callback
++
++    def put_fields(self, key, fields, callback):
++        with self._lock:
++            pending = self._field_values.setdefault(key, {})
++            pending.update(fields)
++            self._callbacks[key] = lambda: callback(**pending)
++
++    def drain(self):
++        now = self.clock()
++        with self._lock:
++            if now < self._next:
++                return []
++            self._next = now + self.interval
++            keys = list(islice(self._callbacks, self.limit))
++            callbacks = [self._callbacks.pop(key) for key in keys]
++            for key in keys:
++                self._field_values.pop(key, None)
++            return callbacks

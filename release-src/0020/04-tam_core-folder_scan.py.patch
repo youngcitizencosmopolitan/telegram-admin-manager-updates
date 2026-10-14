@@ -1,0 +1,64 @@
+--- /dev/null
++++ b/app/tam_core/folder_scan.py
+@@ -0,0 +1,61 @@
++"""Resumable metadata discovery; directory handles belong to the walker."""
++import os
++from collections import deque
++from pathlib import Path
++
++from .media import PHOTO_EXTENSIONS, VIDEO_EXTENSIONS
++
++
++class FolderWalker:
++    def __init__(self, task):
++        self.root = Path(os.path.abspath(task['folder']))
++        self.recursive = bool(task.get('recursive', True))
++        self.allowed = set(VIDEO_EXTENSIONS if task.get('send_videos', True) else ())
++        if task.get('send_photos', False):
++            self.allowed.update(PHOTO_EXTENSIONS)
++        self._todo = deque([self.root])
++        self._iterator = None
++        self._directory = None
++        self.directories = set()
++        self.closed = False
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        if self.closed:
++            raise StopIteration
++        if self._iterator is None:
++            if not self._todo:
++                self.close()
++                raise StopIteration
++            self._directory = self._todo.popleft()
++            try:
++                self._iterator = os.scandir(self._directory)
++            except FileNotFoundError:
++                return None
++        try:
++            entry = next(self._iterator)
++        except StopIteration:
++            self._iterator.close()
++            self._iterator = None
++            return None
++        try:
++            if entry.is_dir(follow_symlinks=False):
++                if self._directory == self.root:
++                    self.directories.add(entry.name)
++                if self.recursive:
++                    self._todo.append(Path(entry.path))
++                return None
++            if Path(entry.name).suffix.lower() in self.allowed and entry.is_file():
++                return Path(entry.path)
++        except FileNotFoundError:
++            pass
++        return None
++
++    def close(self):
++        self.closed = True
++        if self._iterator is not None:
++            self._iterator.close()
++            self._iterator = None
++        self._todo.clear()

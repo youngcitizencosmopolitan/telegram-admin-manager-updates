@@ -1,0 +1,12 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -560,6 +560,9 @@
+     def reset_seen_files(self, rule_id: str) -> None:
+         self.db.monitor_seen_replace(rule_id, [])
+ 
++    def apply_seen_delta(self, rule_id: str, added, removed) -> None:
++        self.db.monitor_seen_delta(rule_id, added, removed)
++
+     def delete(self, rule_id: str) -> None:
+         self.db.monitor_rule_delete(rule_id)
+ 

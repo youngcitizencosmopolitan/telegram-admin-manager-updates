@@ -1,14 +1,22 @@
 {
-  "version": "0019",
-  "base_version": "0018",
-  "manifest_version": "4.3.8.0019",
-  "display_version": "0019",
+  "version": "0020",
+  "base_version": "0019",
+  "manifest_version": "4.3.8.0020",
+  "display_version": "0020",
   "patch_files": [
-    "release-src/0019/01-batch_uploader.py.patch",
-    "release-src/0019/02-tam_core-repositories.py.patch",
-    "release-src/0019/03-tam_core-state_db.py.patch",
-    "release-src/0019/04-telegram_admin_manager.py.patch",
-    "release-src/0019/05-tests-test_bounded_history.py.patch"
+    "release-src/0020/01-batch_uploader.py.patch",
+    "release-src/0020/02-telegram_admin_manager.py.patch",
+    "release-src/0020/03-tam_core-folder_events.py.patch",
+    "release-src/0020/04-tam_core-folder_scan.py.patch",
+    "release-src/0020/05-tam_core-monitor_delta.py.patch",
+    "release-src/0020/06-tam_core-repositories.py.patch",
+    "release-src/0020/07-tam_core-state_db.py.patch",
+    "release-src/0020/08-tam_core-ui_latest.py.patch",
+    "release-src/0020/09-tests-test_incremental_monitor.py.patch",
+    "release-src/0020/10-tests-test_monitor_delta_upload.py.patch",
+    "release-src/0020/11-tests-test_prefetch_upload_boundary.py.patch",
+    "release-src/0020/12-tests-test_ui_latest.py.patch",
+    "release-src/0020/13-tests-test_v434_queue_recovery.py.patch"
   ],
-  "notes": "0019: checks upload history in batches of at most 2000 files and releases each result map before the next batch. Warm checks use metadata and cached fingerprints without reading video content. History checks share the existing two-scan limit across rules, support stop checks during metadata work and between batches, and show aggregate throttled progress. Stopping during a check no longer reports all files uploaded. Legacy forum history now uses indexed source lookups instead of loading all topic records; schema 12 adds a covering index while preserving history. Target/topic, content-change and reservation guards remain intact. Includes eight regression tests and synthetic 100000-file cache measurements."
+  "notes": "0020: monitoring queues changed files after the initial full baseline, with epoch/identity validation and successful-batch cutoff acknowledgments that preserve failed work and later arrivals. Unchanged polls reuse membership and do not reread the full seen-file table; SQLite receives only membership additions/deletions. Directory reconciliation and notification bursts run in bounded steps, with staggered periodic checks, watcher-failure fallback and directory-handle cleanup. Manual, restored/stale and incompatible selections retain complete scans. GUI progress is coalesced per row/component every 500 ms; partial task fields merge and final activity values are frozen. Live numbered captions resolve full-catalog numbering from cached path references. Existing upload-history, preview, source mutation, topic, account and Premium policies remain. Includes 31 new regression tests; 330 tests pass locally with application dependencies."
 }

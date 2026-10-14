@@ -1,0 +1,93 @@
+--- /dev/null
++++ b/app/tests/test_ui_latest.py
+@@ -0,0 +1,90 @@
++import queue
++import threading
++import unittest
++from types import SimpleNamespace
++
++from batch_uploader import BatchUploaderPane
++from telegram_admin_manager import TelegramAdminManager
++
++try:
++    from tam_core.ui_latest import UiLatest
++except ImportError:
++    UiLatest = None
++
++
++class LatestPaintTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(UiLatest, 'Keyed UI repaint buffering is missing')
++        self.now = [0.0]
++        self.buffer = UiLatest(clock=lambda: self.now[0], interval=0.5, limit=2)
++
++    def test_progress_burst_paints_latest_value_once(self):
++        painted = []
++        for i in range(1000):
++            self.buffer.put('row', lambda value=i: painted.append(value))
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(painted, [999])
++        self.buffer.put('row', lambda: painted.append(1000))
++        self.assertEqual(self.buffer.drain(), [])
++        self.now[0] = 0.5
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(painted, [999, 1000])
++
++    def test_drain_budget_keeps_other_rows_for_next_paint(self):
++        painted = []
++        for key in ('a', 'b', 'c'):
++            self.buffer.put(key, lambda k=key: painted.append(k))
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(painted, ['a', 'b'])
++        self.now[0] = 0.5
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(painted, ['a', 'b', 'c'])
++
++    def test_terminal_status_replaces_progress_from_many_threads(self):
++        painted = []
++        def worker():
++            for _ in range(100): self.buffer.put('row', lambda: painted.append('uploading'))
++        workers = [threading.Thread(target=worker) for _ in range(8)]
++        for worker_thread in workers: worker_thread.start()
++        for worker_thread in workers: worker_thread.join()
++        self.buffer.put('row', lambda: painted.append('sent'))
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(painted, ['sent'])
++
++    def test_tk_drain_keeps_functional_callbacks_and_paints_latest_rows(self):
++        calls = []
++        fifo = queue.Queue()
++        fifo.put(lambda: calls.append('queue mutation'))
++        fifo.put(lambda: calls.append('dialog'))
++        self.buffer.put('row', lambda: calls.append('sent'))
++        app = SimpleNamespace(_closed=False, _ui_queue=fifo, _ui_latest=self.buffer,
++            after=lambda *a: None, _write_log=lambda error: self.fail(error),
++            _drain_ui_queue=lambda: None)
++        TelegramAdminManager._drain_ui_queue(app)
++        self.assertEqual(calls, ['queue mutation', 'dialog', 'sent'])
++
++    def test_batch_component_uses_same_key_for_progress_and_terminal(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.app = SimpleNamespace(ui_latest=self.buffer.put,
++            ui_call=lambda fn: self.fail('Progress went to functional FIFO'))
++        self.assertTrue(callable(getattr(pane, '_ui_latest', None)), 'Batch paints are not coalesced')
++        painted = []
++        pane._ui_latest(('activity', 'file'), lambda: painted.append('uploading'))
++        pane._ui_latest(('activity', 'file'), lambda: painted.append('sent'))
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(painted, ['sent'])
++
++    def test_partial_task_paints_merge_counts_with_final_status(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.app = SimpleNamespace(ui_latest=self.buffer.put,
++            ui_latest_fields=getattr(self.buffer, 'put_fields', None), ui_call=lambda fn: fn())
++        row = {'files': 99, 'size': 'old', 'status': 'old'}
++        pane._set_task_row = lambda tid, **fields: row.update(fields)
++        pane._queue_task_row('r1', files=1, size='3 B', status='Connecting')
++        pane._queue_task_row('r1', status='Done', progress='100%')
++        for callback in self.buffer.drain(): callback()
++        self.assertEqual(row, {'files': 1, 'size': '3 B', 'status': 'Done', 'progress': '100%'})
++
++
++if __name__ == '__main__':
++    unittest.main()

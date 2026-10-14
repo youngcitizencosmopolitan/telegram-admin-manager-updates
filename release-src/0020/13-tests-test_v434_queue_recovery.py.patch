@@ -1,0 +1,11 @@
+--- a/app/tests/test_v434_queue_recovery.py
++++ b/app/tests/test_v434_queue_recovery.py
+@@ -56,7 +56,7 @@
+         pane = BatchUploaderPane.__new__(BatchUploaderPane)
+         pane.app = SimpleNamespace(
+             store=SimpleNamespace(data={"upload_tasks": [], "queue_restore_pending": True}, db=db),
+-            monitor_rules=MonitorRuleStore(db), log=Mock(),
++            monitor_rules=MonitorRuleStore(db), log=Mock(), ui_call=lambda fn: fn(),
+         )
+         pane._queue_lock = threading.Lock()
+         pane.pending_batches = []
