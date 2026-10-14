@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/app/tests/test_monitor_accounts_cache.py
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,151 @@
 +import tempfile
 +import unittest
 +from pathlib import Path
@@ -100,7 +100,7 @@
 +
 +    def test_permission_error_invalidates_only_affected_session(self):
 +        self.assertTrue(hasattr(self.cache, 'mark_target_peer'))
-+        self.cache.mark_admins('@g', {'a', 'b'}, policy_key='max')
++        self.cache.mark_admins('@g', {'a', 'b'}, policy_key='max', controller_session='a')
 +        for session in ('a', 'b'):
 +            self.cache.mark_target_peer('@g', session, session, 'peer', member=True)
 +        self.cache.invalidate_admin('@g', 'a')
@@ -108,6 +108,7 @@
 +        self.assertEqual(self.cache.target_peer('@g', 'b', 'b'), 'peer')
 +        self.assertEqual(self.cache.fresh_admin_sessions('@g', 24), {'b'})
 +        self.assertEqual(self.cache.admin_sessions_for_policy('@g', 'max'), {'b'})
++        self.assertIsNone(self.cache.cached_controller('@g', 0))
 +
 +
 +class MonitorSelectionScanRaceTests(unittest.IsolatedAsyncioTestCase):

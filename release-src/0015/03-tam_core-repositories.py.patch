@@ -40,13 +40,15 @@
  
      def fresh_admin_sessions(
          self, target: str, max_age_hours: float, *, require_anonymous: bool = False
-@@ -385,12 +405,16 @@
+@@ -385,12 +405,18 @@
              if session:
                  e["admin_sessions"] = [x for x in (e.get("admin_sessions") or []) if str(x) != str(session)]
                  assignments.pop(str(session), None)
 +                peers = dict(e.get("target_peers") or {})
 +                peers.pop(str(session), None)
 +                e["target_peers"] = peers
++                if str(e.get("controller_session", "")) == str(session):
++                    e["controller_session"] = ""
              else:
                  e["admin_sessions"] = []
                  e["controller_session"] = ""
@@ -58,7 +60,7 @@
              self._store_entry(target, e)
  
      def invalidate_topics(self, target: str) -> None:
-@@ -440,6 +464,12 @@
+@@ -440,6 +466,12 @@
  
      def put(self, rule: dict[str, Any]) -> None:
          self.db.monitor_rule_put(dict(rule))
@@ -71,7 +73,7 @@
  
      def seen_files(self, rule_id: str) -> set[str]:
          return self.db.monitor_seen_files(rule_id)
-@@ -471,6 +501,10 @@
+@@ -471,6 +503,10 @@
          updated = dict(task)
          updated["id"] = tid
          updated["monitor_folder"] = wants_monitor
