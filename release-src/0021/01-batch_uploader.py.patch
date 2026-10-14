@@ -1,0 +1,288 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -122,7 +122,9 @@
+         return "send"
+     if value == "in_progress":
+         return "defer"
+-    if value in {"completed", "stale"}:
++    if value == "stale":
++        return "blocked"
++    if value == "completed":
+         return "skip"
+     raise ValueError(f"Unknown dedup claim status: {status!r}")
+ 
+@@ -459,6 +461,8 @@
+         self.monitor_stop_event = threading.Event()
+         self.monitor_last_signatures: dict[str, str] = {}
+         self.monitor_pending_signatures: dict[str, str] = {}
++        self.monitor_blocked_signatures: dict[str, tuple[str, int]] = {}
++        self.monitor_recovery_versions: dict[str, int] = {}
+         self.monitor_prepared_targets: set[str] = set()
+         self.monitor_runtime: dict[str, dict[str, Any]] = {}
+         # Visible upload queue. One queue item may contain several tasks; those
+@@ -810,6 +814,7 @@
+         ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+         ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+         ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
++        ttk.Button(cache_bar, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
+         ttk.Label(
+             cache_bar,
+             text="Кэш обновляется после успешного автоадмина и синхронизации тем; ошибки прав автоматически его инвалидируют.",
+@@ -1146,6 +1151,13 @@
+                 if int(task_state.get("processed_files", 0) or 0) and not self.running:
+                     progress = 100.0
+ 
++            blocked_count = int(task_state.get('blocked', 0) or 0)
++            if blocked_count:
++                state_text = f'Неподтверждённые отправки: {blocked_count}'
++                if not active:
++                    if work_text == 'Выполняется':
++                        active_count -= 1
++                    work_text = f'Нужен повтор: {blocked_count}'
+             caption = str(rule.get("caption", ""))
+             if self.unified_monitor:
+                 self.monitor_tree.insert(
+@@ -1158,7 +1170,7 @@
+                         f"{interval}с",
+                         str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
+                         work_text,
+-                        f"{progress:.0f}%" if work_text != "—" else "—",
++                        f"{progress:.0f}%" if work_text != "—" and not blocked_count else "—",
+                         _fmt_speed(speed),
+                         _fmt_eta(eta_seconds) if work_text == "Выполняется" else ("0с" if progress >= 100.0 and work_text == "—" else "—"),
+                         state_text,
+@@ -1536,6 +1548,73 @@
+         self.monitor_prepared_targets.discard(target)
+         self.app.log(f"Кэш группы сброшен: {target}. При следующем запуске права и темы будут проверены заново.")
+         self.refresh_monitor_tab()
++
++    def retry_unfinished_uploads(self) -> None:
++        tid = self._monitor_selected_tid()
++        rule = self.app.monitor_rules.get(tid) if tid else None
++        if not rule or getattr(self, '_reservation_recovery_active', False):
++            return
++        entry = self.app.group_state_cache.entry(str(rule.get('target', '')))
++        peer = entry.get('peer_id')
++        if not isinstance(peer, int) or peer >= 0:
++            messagebox.showinfo('Незавершённые отправки', 'Не удалось определить группу из кеша. Обнови данные группы и повтори.', parent=self.app)
++            return
++        target_key = ('Channel:' + str(abs(peer) - 1000000000000) if peer < -1000000000000
++                      else 'Chat:' + str(abs(peer)))
++        self._reservation_recovery_active = True
++        def read():
++            try:
++                rows = self.app.upload_history.stale_reservations(Path(rule['folder']), target_key, self.dedup_run_token)
++                self.app.ui_call(lambda: self._confirm_unfinished_recovery(rule, rows))
++            except Exception as exc:
++                self.app.ui_call(lambda e=str(exc): self._unfinished_recovery_error(e))
++        threading.Thread(target=read, daemon=True).start()
++
++    def _unfinished_recovery_error(self, error: str) -> None:
++        self._reservation_recovery_active = False
++        messagebox.showerror('Незавершённые отправки', error, parent=self.app)
++
++    def _confirm_unfinished_recovery(self, rule, rows) -> None:
++        current = self.app.monitor_rules.get(str(rule.get('id', '')))
++        if not current or monitor_identity(current) != monitor_identity(rule):
++            self._reservation_recovery_active = False
++            messagebox.showinfo('Незавершённые отправки', 'Правило изменилось. Выбери его и повтори проверку.', parent=self.app)
++            return
++        if not rows:
++            self._reservation_recovery_active = False
++            messagebox.showinfo('Незавершённые отправки', 'Для выбранной группы и папки резервов прошлых запусков нет.', parent=self.app)
++            return
++        approved = messagebox.askyesno('Повторить незавершённые отправки?',
++            f"Правило: {rule.get('name', '')}\nРезервов прошлых запусков: {len(rows)}.\n\n"
++            'Для этих файлов успешная отправка не подтверждена. Если Telegram принял файл перед сбоем, повтор может создать дубль.\n\n'
++            'Разрешить повтор? История подтверждённых загрузок и текущие отправки сохранятся.', parent=self.app)
++        if not approved:
++            self._reservation_recovery_active = False
++            return
++        def release():
++            try:
++                count = self.app.upload_history.release_stale_reservations(rows, self.dedup_run_token)
++                self.app.ui_call(lambda: self._finish_unfinished_recovery(rule, count))
++            except Exception as exc:
++                self.app.ui_call(lambda e=str(exc): self._unfinished_recovery_error(e))
++        threading.Thread(target=release, daemon=True).start()
++
++    def _finish_unfinished_recovery(self, rule, count: int) -> None:
++        self._reservation_recovery_active = False
++        tid = str(rule.get('id', ''))
++        current = self.app.monitor_rules.get(tid)
++        if count and current and monitor_identity(current) == monitor_identity(rule):
++            if not hasattr(self, 'monitor_recovery_versions'):
++                self.monitor_recovery_versions = {}
++            self.monitor_recovery_versions[tid] = self.monitor_recovery_versions.get(tid, 0) + 1
++            getattr(self, 'monitor_blocked_signatures', {}).pop(tid, None)
++            self.monitor_last_signatures.pop(tid, None)
++            self.monitor_pending_signatures.pop(tid, None)
++            occupied = tid in self._queued_task_ids()
++            self._enqueue_batch([self._monitor_task_for_queue(current)], source='Мониторинг: повтор незавершённых', notify=False, dedupe=False)
++            detail = 'Повтор добавлен следом за текущим пакетом; текущая отправка продолжается.' if occupied else 'Правило добавлено в очередь повторной проверки.'
++            self.app.log(f"{current.get('name', 'Правило')}: снято старых резервов {count}. {detail}")
++        messagebox.showinfo('Незавершённые отправки', f'Снято старых резервов: {count}.\nИстория подтверждённых загрузок сохранена.', parent=self.app)
+ 
+     def remove_selected_monitor_rule(self) -> None:
+         tid = self._monitor_selected_tid()
+@@ -2693,8 +2772,11 @@
+                         and index._full_required and signature not in {'missing', 'error', 'pending', 'scanning'}):
+                     index.ack_work(index.work_snapshot()['cutoff'])
+                 has_work = bool(index is not None and getattr(index, 'has_work', False))
++                blocked = getattr(self, 'monitor_blocked_signatures', {}).get(tid)
++                recovery_version = getattr(self, 'monitor_recovery_versions', {}).get(tid, 0)
+                 changed = (signature not in {'missing', 'error', 'pending', 'scanning'}
+-                           and (signature != old or has_work) and signature != pending)
++                           and (signature != old or has_work) and signature != pending
++                           and blocked != (signature, recovery_version))
+                 if signature == 'scanning':
+                     runtime['state'] = 'Сверка папки…'
+                 elif signature == 'pending':
+@@ -2726,9 +2808,7 @@
+                         tasks, source="Мониторинг", notify=False, monitor_signatures=sigs, dedupe=True
+                     )
+                 )
+-                self.app.log(
+-                    f"Мониторинг: обнаружены изменения в {len(due_changed)} задании(ях) — добавлено в очередь."
+-                )
++                # Actual queue acceptance is logged by _enqueue_batch on the UI thread.
+ 
+             reconciling = any(getattr(index, 'busy', False) for index in self._folder_indexes.values())
+             for _ in range(1 if reconciling else 10):
+@@ -2852,11 +2932,8 @@
+         if dedupe:
+             dropped = [tid for tid in ids if tid in existing]
+             keep = [(tid, t) for tid, t in zip(ids, tasks) if tid not in existing]
+-            if source == "Мониторинг":
+-                # A manual/current run already covers this task. Do not freeze the
+-                # monitor signature; after that run the monitor may re-check once.
+-                for tid in dropped:
+-                    self.monitor_pending_signatures.pop(tid, None)
++            # Keep the submitted signature while another run covers the rule.
++            # Completion/removal clears it, allowing a later dirty revision once.
+             if not keep:
+                 if source != "Мониторинг":
+                     self.app.log("Очередь: выбранные задания уже выполняются или ожидают запуска.")
+@@ -3127,6 +3204,8 @@
+             else:
+                 self.app.log(f"Очередь: ▶ {names}; параллельный лимит {global_parallel}.")
+             hard_error_ids: set[str] = set()
++            recovery_versions = {str(t.get('id', '')): getattr(self, 'monitor_recovery_versions', {}).get(str(t.get('id', '')), 0)
++                                 for t in tasks}
+             batch_started_at = time.time()
+             try:
+                 result = asyncio.run(
+@@ -3147,6 +3226,7 @@
+                 tids = item_task_ids.get(qid, [])
+                 failed = any(
+                     tid in hard_error_ids or int(self.task_states.get(tid, {}).get("failed", 0) or 0) > 0
++                    or int(self.task_states.get(tid, {}).get('blocked', 0) or 0) > 0
+                     for tid in tids
+                 )
+                 status = "Завершено с ошибками" if failed else ("Остановлено — можно продолжить" if was_stopped else "Готово")
+@@ -3165,8 +3245,15 @@
+                     for tid in tids:
+                         task = task_by_id.get(tid, {})
+                         state = self.task_states.get(tid, {})
+-                        success = tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0 and not was_stopped
++                        blocked_count = int(state.get('blocked', 0) or 0)
++                        if blocked_count and tid in sigs:
++                            if not hasattr(self, 'monitor_blocked_signatures'):
++                                self.monitor_blocked_signatures = {}
++                            self.monitor_blocked_signatures[tid] = (sigs[tid], recovery_versions.get(tid, 0))
++                        success = (tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0
++                                   and not blocked_count and not was_stopped)
+                         if success and tid in sigs:
++                            getattr(self, 'monitor_blocked_signatures', {}).pop(tid, None)
+                             self._ack_monitor_work(task)
+                             self.monitor_last_signatures[tid] = sigs[tid]
+                             self._persist_monitor_signature(tid, sigs[tid], processed_before=batch_started_at)
+@@ -3175,7 +3262,8 @@
+                                 self.monitor_prepared_targets.add(target)
+                             runtime = self.monitor_runtime.setdefault(tid, {})
+                             runtime["state"] = "✅ Синхронизировано"
+-                        self.monitor_pending_signatures.pop(tid, None)
++                for tid in tids:
++                    self.monitor_pending_signatures.pop(tid, None)
+             if any((x.get("monitor_signatures", {}) or {}) for x in active_items):
+                 self._ui_latest(('monitor',), self.refresh_monitor_tab)
+ 
+@@ -3527,9 +3615,10 @@
+                 total_skipped = sum(int(s.get("skipped", 0)) for s in self.task_states.values())
+                 total_limit_skipped = sum(int(s.get("limit_skipped", 0)) for s in self.task_states.values())
+                 total_failed = sum(int(s.get("failed", 0)) for s in self.task_states.values()) + hard_errors
++                total_blocked = sum(int(s.get('blocked', 0)) for s in self.task_states.values())
+                 self.app.log(
+                     f"Пакет завершён: отправлено {total_success}, пропущено {total_skipped} "
+-                    f"(по лимиту {total_limit_skipped}), ошибок {total_failed}"
++                    f"(по лимиту {total_limit_skipped}), ошибок {total_failed}, неподтверждённых резервов {total_blocked}"
+                 )
+                 if notify:
+                     self.app.ui_call(lambda: messagebox.showinfo(
+@@ -3537,7 +3626,7 @@
+                         f"Пакет завершён.\n\nОтправлено: {total_success}\n"
+                         f"Пропущено всего: {total_skipped}\n"
+                         f"Из них по лимиту размера/Premium: {total_limit_skipped}\n"
+-                        f"Ошибки: {total_failed}",
++                        f"Ошибки: {total_failed}\nТребуют проверки резервов: {total_blocked}",
+                         parent=self.app,
+                     ))
+             return hard_error_ids
+@@ -4281,6 +4370,7 @@
+             "skipped": 0,
+             "limit_skipped": 0,
+             "failed": 0,
++            "blocked": 0,
+             "active": {},
+             "started": time.monotonic(),
+         }
+@@ -4656,6 +4746,12 @@
+                             path,
+                         )
+                         claim_action = _dedup_claim_disposition(claim_status)
++                        if claim_action == 'blocked':
++                            state['blocked'] += 1
++                            self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0,
++                                                        '⚠ Незавершённая отправка прошлого запуска')
++                            self._emit_task_metrics(tid, force=True)
++                            continue
+                         if claim_action == "skip":
+                             state["processed_bytes"] += size
+                             state["processed_files"] += 1
+@@ -5126,13 +5222,16 @@
+             self._queue_task_row(tid, status='Остановлено', speed='—', eta='—')
+         else:
+             self._emit_task_metrics(tid, force=True)
+-            if state["failed"]:
++            if state.get('blocked', 0):
++                status = f"⚠ Нужен повтор: резервов {state['blocked']}"
++            elif state["failed"]:
+                 status = f"Готово, ошибок {state['failed']}"
+             elif state.get("limit_skipped", 0):
+                 status = f"✅ Готово, лимит: {state['limit_skipped']}"
+             else:
+                 status = "✅ Готово"
+-            self._queue_task_row(tid, status=status, progress='100%', speed='—', eta='0с')
++            progress = '—' if state.get('blocked') else '100%'
++            self._queue_task_row(tid, status=status, progress=progress, speed='—', eta='—' if state.get('blocked') else '0с')
+ 
+     @staticmethod
+     def _render_caption(template: str, path: Path, index: int, total: int, task_name: str) -> str | None:
+@@ -5178,7 +5277,7 @@
+         pct = (done_bytes / total * 100.0) if total else 100.0
+         remaining = max(0, total - done_bytes)
+         eta = remaining / speed if speed > 1024 else None
+-        self._queue_task_row(tid, status='Загрузка', progress=f'{pct:.1f}%', speed=_fmt_speed(speed), eta=_fmt_eta(eta))
++        self._queue_task_row(tid, status='Загрузка', progress='—' if state.get('blocked') else f'{pct:.1f}%', speed=_fmt_speed(speed), eta=_fmt_eta(eta))
+         if self.unified_monitor and hasattr(self, "monitor_tree"):
+             self._ui_latest(('monitor',), lambda: self.refresh_monitor_tab(force=True))
+         self._emit_dashboard(force=force)
+@@ -5273,7 +5372,7 @@
+         iid = self.activity_rows.get(key)
+         values = (task_name, account, _fmt_bytes(size), f"{pct:.1f}%", _fmt_speed(speed), status)
+         low_status = status.lower()
+-        if "❌" in status or "🛑" in status or "ошиб" in low_status or "отключ" in low_status:
++        if "❌" in status or "🛑" in status or "ошиб" in low_status or "отключ" in low_status or 'незаверш' in low_status:
+             tags = ("error",)
+         elif "✅" in status or "отправлено" in low_status or "дубликат" in low_status:
+             tags = ("success",)

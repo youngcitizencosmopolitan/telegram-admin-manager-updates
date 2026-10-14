@@ -1,0 +1,8 @@
+--- a/app/tests/test_v0004_dedup_reservations.py
++++ b/app/tests/test_v0004_dedup_reservations.py
+@@ -207,4 +207,4 @@
+         self.assertEqual(_dedup_claim_disposition("reserved"), "send")
+         self.assertEqual(_dedup_claim_disposition("in_progress"), "defer")
+         self.assertEqual(_dedup_claim_disposition("completed"), "skip")
+-        self.assertEqual(_dedup_claim_disposition("stale"), "skip")
++        self.assertEqual(_dedup_claim_disposition("stale"), "blocked")

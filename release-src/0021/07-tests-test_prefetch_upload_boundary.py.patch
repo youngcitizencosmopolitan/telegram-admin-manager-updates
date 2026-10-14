@@ -1,0 +1,36 @@
+--- a/app/tests/test_prefetch_upload_boundary.py
++++ b/app/tests/test_prefetch_upload_boundary.py
+@@ -184,6 +184,33 @@
+         await asyncio.wait_for(running, 2)
+         self.assertEqual(self.pane.task_states['r1']['failed'], 0)
+ 
++    async def test_old_reservation_is_visible_as_unfinished_without_false_success(self):
++        path = self.file('unfinished.mp4', b'video')
++        self.history.claim_fingerprint(b'video'.hex(), 'group', path, 'previous-run', 'previous-claim')
++        rows = []
++        self.pane.app.ui_call = lambda fn: fn()
++        self.pane._set_task_row = lambda *a, **kw: rows.append(kw)
++        self.pane._activity_update = lambda *a, **kw: None
++        await self.run_task()
++        state = self.pane.task_states['r1']
++        self.assertEqual(self.sent, [])
++        self.assertEqual(state.get('blocked', 0), 1)
++        self.assertEqual(state['skipped'], 0)
++        self.assertEqual(state['processed_files'], 0)
++        self.assertFalse(any(r.get('progress') == '100%' for r in rows))
++
++    async def test_small_blocked_tail_cannot_round_to_100_percent(self):
++        complete = self.file('complete.mp4', b'x' * 10000)
++        self.history.record_completed(complete, 'group', 'known', self.account, 1)
++        path = self.file('unfinished.mp4', b'v')
++        self.history.claim_fingerprint(b'v'.hex(), 'group', path, 'previous-run', 'old')
++        rows = []
++        self.pane.app.ui_call = lambda fn: fn()
++        self.pane._set_task_row = lambda *a, **kw: rows.append(kw)
++        self.pane._activity_update = lambda *a, **kw: None
++        await self.run_task()
++        self.assertFalse(str(rows[-1].get('progress', '')).startswith('100'))
++
+     async def test_batch_observes_entire_pending_set_before_small_lookahead_windows(self):
+         for i in range(10):
+             self.file('%02d.mp4' % i, ('file-%d' % i).encode())

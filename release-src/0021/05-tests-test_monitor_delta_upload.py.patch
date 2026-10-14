@@ -1,0 +1,57 @@
+--- a/app/tests/test_monitor_delta_upload.py
++++ b/app/tests/test_monitor_delta_upload.py
+@@ -73,7 +73,7 @@
+         self.pane._ack_monitor_work(wrong)
+         self.assertTrue(self.index.has_work)
+ 
+-    def run_queue(self, failed=False, later=False):
++    def run_queue(self, failed=False, later=False, source='Мониторинг', blocked=False):
+         from tam_core.repositories import MonitorRuleStore
+         from tam_core.state_db import StateDatabase
+         db = StateDatabase(self.root / 'state.db')
+@@ -85,8 +85,8 @@
+             monitor_rules=repo, ui_call=noop, log=noop)
+         pane._queue_lock = threading.Lock()
+         pane._live_task_lock = threading.RLock()
+-        pane.pending_batches = [{'id': 'q1', 'task_ids': ['r1'], 'source': 'Мониторинг',
+-            'task_snapshots': [self.task], 'monitor_signatures': {'r1': 'queued-sig'}}]
++        pane.pending_batches = [{'id': 'q1', 'task_ids': ['r1'], 'source': source,
++            'task_snapshots': [self.task], 'monitor_signatures': {'r1': 'queued-sig'} if source == 'Мониторинг' else {}}]
+         pane.queue_halt_requested = False
+         pane.live_tasks = {}
+         pane.stop_event = threading.Event()
+@@ -97,7 +97,7 @@
+ 
+         async def batch(tasks, *args, **kwargs):
+             captured.extend(tasks)
+-            pane.task_states = {'r1': {'failed': int(failed)}}
++            pane.task_states = {'r1': {'failed': int(failed), 'blocked': int(blocked)}}
+             if later:
+                 path = self.root / 'later.mp4'
+                 path.write_bytes(b'later')
+@@ -107,7 +107,8 @@
+ 
+         pane._run_batch = batch
+         pane._queue_worker()
+-        self.assertEqual(captured[0]['_monitor_delta']['files'], ['new.mp4'])
++        if source == 'Мониторинг':
++            self.assertEqual(captured[0]['_monitor_delta']['files'], ['new.mp4'])
+ 
+     def test_real_dispatch_acknowledges_successful_delta(self):
+         self.run_queue()
+@@ -121,6 +122,15 @@
+         self.run_queue(later=True)
+         self.assertEqual(self.index.work_snapshot()['files'], ['later.mp4'])
+ 
++    def test_manual_completion_releases_held_monitor_signature(self):
++        self.run_queue(source='Вручную')
++        self.assertEqual(self.pane.monitor_pending_signatures, {})
++
++    def test_blocked_work_is_not_acknowledged_as_successful(self):
++        self.run_queue(blocked=True)
++        self.assertTrue(self.index.has_work)
++        self.assertEqual(self.pane.monitor_blocked_signatures['r1'], ('queued-sig', 0))
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
