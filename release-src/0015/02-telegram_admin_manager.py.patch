@@ -1,0 +1,101 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import base64
+ import hashlib
+ import inspect
+ import json
+@@ -53,6 +54,7 @@
+     from telethon.tl import functions as tl_functions, types as tl_types
+     from telethon.tl.functions.channels import JoinChannelRequest
+     from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
++    from telethon.extensions.binaryreader import BinaryReader
+ except ImportError:
+     TelegramClient = None
+     errors = None
+@@ -62,12 +64,13 @@
+     ImportChatInviteRequest = None
+     tl_functions = None
+     tl_types = None
++    BinaryReader = None
+ 
+ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0014"
++APP_VERSION = "0015"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -5753,7 +5756,57 @@
+             return None
+         return None
+ 
++    def _target_cache_scope(self, client: Any) -> tuple[str, str] | None:
++        store = self.__dict__.get("store")
++        accounts = getattr(store, "accounts", None)
++        session = getattr(client, "session", None)
++        filename = getattr(session, "filename", None)
++        auth_key = getattr(getattr(session, "auth_key", None), "key", None)
++        if not callable(accounts) or not filename or not isinstance(auth_key, bytes) or not auth_key:
++            return None
++        name = Path(str(filename)).name.removesuffix(".session")
++        for account in accounts():
++            if str(account.session).removesuffix(".session") == name:
++                identity = f"{int(account.user_id)}:{hashlib.sha256(auth_key).hexdigest()}"
++                return str(account.session), identity
++        return None
++
+     async def _resolve_or_join_target(self, client: Any, target: str, should_join: bool) -> Any:
++        target = target.strip()
++        cache = self.__dict__.get("group_state_cache")
++        scope = self._target_cache_scope(client) if BinaryReader is not None else None
++        if scope is not None and cache is not None:
++            session, identity = scope
++            encoded = cache.target_peer(target, session, identity, require_member=should_join)
++            if encoded:
++                try:
++                    with BinaryReader(base64.b64decode(encoded, validate=True)) as reader:
++                        entity = reader.tgread_object()
++                    if isinstance(entity, (tl_types.Channel, tl_types.Chat)):
++                        return entity
++                except Exception:
++                    # Schema changes or corrupt cache records cause one normal lookup.
++                    pass
++                cache.invalidate_admin(target, session)
++        try:
++            entity = await self._resolve_or_join_target_uncached(client, target, should_join)
++        except Exception as exc:
++            if scope is not None and cache is not None and exc.__class__.__name__ in {
++                "ChannelPrivateError", "ChannelInvalidError", "ChatIdInvalidError", "PeerIdInvalidError",
++                "UserNotParticipantError", "UserBannedInChannelError", "ChatWriteForbiddenError",
++            }:
++                cache.invalidate_admin(target, scope[0])
++            raise
++        if scope is not None and cache is not None and isinstance(entity, (tl_types.Channel, tl_types.Chat)):
++            try:
++                member = bool(self._extract_invite_hash(target) or should_join or not bool(getattr(entity, "left", True)))
++                encoded = base64.b64encode(bytes(entity)).decode("ascii")
++                cache.mark_target_peer(target, scope[0], scope[1], encoded, member=member)
++            except Exception as exc:
++                self.log(f"Кэш группы не сохранён: {exc}")
++        return entity
++
++    async def _resolve_or_join_target_uncached(self, client: Any, target: str, should_join: bool) -> Any:
+         target = target.strip()
+         invite_hash = self._extract_invite_hash(target)
+         if invite_hash:
+@@ -5790,7 +5843,8 @@
+                 # Small/basic groups cannot be joined via JoinChannelRequest; if already a participant,
+                 # get_entity succeeded and we can continue. Otherwise propagate the useful Telegram error.
+                 name = exc.__class__.__name__
+-                if name not in {"ChannelInvalidError", "ChatIdInvalidError"}:
++                basic_member = tl_types is not None and isinstance(entity, tl_types.Chat) and not bool(getattr(entity, "left", True))
++                if name not in {"ChannelInvalidError", "ChatIdInvalidError"} or not basic_member:
+                     raise
+         return entity
+ 

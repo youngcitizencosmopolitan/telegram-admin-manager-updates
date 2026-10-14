@@ -1,0 +1,13 @@
+--- a/app/tests/test_monitor_new_count.py
++++ b/app/tests/test_monitor_new_count.py
+@@ -16,6 +16,10 @@
+ 
+     def put(self, rule):
+         self.rule = dict(rule)
++
++    def update_fields(self, tid, fields):
++        self.rule.update(fields)
++        return dict(self.rule)
+ 
+     def seen_files(self, tid):
+         return {'old.mp4'}

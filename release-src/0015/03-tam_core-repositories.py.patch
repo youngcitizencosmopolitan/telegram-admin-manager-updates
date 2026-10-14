@@ -1,0 +1,84 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -133,7 +133,7 @@
+ 
+ 
+ class GroupStateCache:
+-    """Time-limited group/admin/topic cache backed by state.db."""
++    """Persistent group/admin/topic cache backed by state.db; zero TTL has no expiry."""
+ 
+     def __init__(self, legacy_path: Path):
+         self.path = Path(legacy_path)
+@@ -187,9 +187,29 @@
+             stamp = float(ts or 0)
+         except Exception:
+             return False
+-        if stamp <= 0 or max_age_hours <= 0:
++        if stamp <= 0 or max_age_hours < 0:
+             return False
++        if max_age_hours == 0:
++            return True
+         return (time.time() - stamp) <= max_age_hours * 3600.0
++
++    def mark_target_peer(self, target: str, session: str, identity: str, encoded: str, *, member: bool) -> None:
++        with self._lock:
++            e = self.entry(target)
++            peers = dict(e.get("target_peers") or {})
++            peers[str(session)] = {"identity": str(identity), "encoded": str(encoded),
++                                   "member": bool(member), "updated_at": time.time()}
++            e["target_peers"] = peers
++            e["target"] = str(target)
++            self._store_entry(target, e)
++
++    def target_peer(self, target: str, session: str, identity: str, *, require_member: bool = False) -> str | None:
++        peer = (self.entry(target).get("target_peers") or {}).get(str(session), {})
++        if not isinstance(peer, dict) or str(peer.get("identity", "")) != str(identity):
++            return None
++        if require_member and not peer.get("member"):
++            return None
++        return str(peer.get("encoded") or "") or None
+ 
+     def fresh_admin_sessions(
+         self, target: str, max_age_hours: float, *, require_anonymous: bool = False
+@@ -385,12 +405,16 @@
+             if session:
+                 e["admin_sessions"] = [x for x in (e.get("admin_sessions") or []) if str(x) != str(session)]
+                 assignments.pop(str(session), None)
++                peers = dict(e.get("target_peers") or {})
++                peers.pop(str(session), None)
++                e["target_peers"] = peers
+             else:
+                 e["admin_sessions"] = []
+                 e["controller_session"] = ""
+                 assignments.clear()
++                e["target_peers"] = {}
++                e["last_admin_sync"] = 0
+             e["admin_assignments"] = assignments
+-            e["last_admin_sync"] = 0
+             self._store_entry(target, e)
+ 
+     def invalidate_topics(self, target: str) -> None:
+@@ -440,6 +464,12 @@
+ 
+     def put(self, rule: dict[str, Any]) -> None:
+         self.db.monitor_rule_put(dict(rule))
++
++    def set_accounts_for_all(self, sessions: list[str]) -> list[str]:
++        return self.db.monitor_rules_set_accounts(sessions)
++
++    def update_fields(self, rule_id: str, fields: dict[str, Any]) -> dict[str, Any]:
++        return self.db.monitor_rule_update_fields(rule_id, fields)
+ 
+     def seen_files(self, rule_id: str) -> set[str]:
+         return self.db.monitor_seen_files(rule_id)
+@@ -471,6 +501,10 @@
+         updated = dict(task)
+         updated["id"] = tid
+         updated["monitor_folder"] = wants_monitor
++        if existing.get("monitor_accounts_override"):
++            updated["monitor_accounts_override"] = True
++            updated["use_all_accounts"] = bool(existing.get("use_all_accounts", False))
++            updated["account_sessions"] = list(existing.get("account_sessions", []) or [])
+         same_identity = bool(existing and self._identity(existing) == self._identity(updated))
+         if same_identity:
+             for key in (

@@ -1,0 +1,187 @@
+--- /dev/null
++++ b/app/tests/test_target_peer_rpc_cache.py
+@@ -0,0 +1,184 @@
++import asyncio
++import base64
++import json
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++import telegram_admin_manager as main
++from batch_uploader import BatchUploaderPane
++from tam_core import ConfigStore, GroupStateCache
++from tam_core.models import Account
++
++
++class Channel:
++    def __init__(self, id=99, title='group', left=False):
++        self.id, self.title, self.left = id, title, left
++        self.forum = True
++        self.access_hash = 12345
++
++    def __bytes__(self):
++        return json.dumps(dict(id=self.id, title=self.title, left=self.left)).encode()
++
++
++class Reader:
++    def __init__(self, payload):
++        self.payload = payload
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *args):
++        pass
++
++    def tgread_object(self):
++        return Channel(**json.loads(self.payload))
++
++
++class TargetPeerRpcCacheTests(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.account = Account(session='one', label='A', phone='', user_id=1)
++        self.app = main.TelegramAdminManager.__new__(main.TelegramAdminManager)
++        self.app.store = SimpleNamespace(accounts=lambda: [self.account])
++        self.app.group_state_cache = GroupStateCache(self.root / 'group_state_cache.json')
++        self.app.log = lambda *args: None
++        self.calls = []
++        self.entity = Channel()
++        test = self
++
++        class Client:
++            session = SimpleNamespace(filename=str(test.root / 'one.session'), auth_key=SimpleNamespace(key=b'auth-one'))
++
++            async def get_entity(self, ref):
++                test.calls.append(('resolve', ref))
++                return test.entity
++
++            async def __call__(self, request):
++                test.calls.append(('request', request))
++                return SimpleNamespace(chat=test.entity)
++
++        self.client = Client()
++        self.addCleanup(patch.stopall)
++        patch.object(main, 'BinaryReader', Reader, create=True).start()
++        patch.object(main, 'tl_types', SimpleNamespace(Channel=Channel, Chat=type('Chat', (), {}))).start()
++        patch.object(main, 'CheckChatInviteRequest', lambda token: ('check', token)).start()
++        patch.object(main, 'ImportChatInviteRequest', lambda token: ('join', token)).start()
++        patch.object(main, 'JoinChannelRequest', lambda entity: ('join', entity.id)).start()
++
++    async def test_private_target_after_restart_is_resolved_without_invite_rpc(self):
++        first = await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.assertEqual(len(self.calls), 1)
++        self.app.group_state_cache = GroupStateCache(self.root / 'group_state_cache.json')
++        cached = await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.assertEqual(len(self.calls), 1, 'warm lookup must issue zero invite RPCs')
++        self.assertEqual(self.app._target_key(first), self.app._target_key(cached))
++        self.assertTrue(cached.forum)
++
++    async def test_join_is_not_repeated_for_confirmed_membership(self):
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', True)
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', True)
++        self.assertEqual(len(self.calls), 1)
++
++    async def test_new_auth_session_does_not_reuse_old_access_hash(self):
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.client.session = SimpleNamespace(filename=str(self.root / 'one.session'), auth_key=SimpleNamespace(key=b'new-key'))
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.assertEqual(len(self.calls), 2)
++
++    async def test_manual_reset_forces_one_new_target_check(self):
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.app.group_state_cache.clear('https://t.me/+invite')
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.assertEqual(len(self.calls), 2)
++
++    async def test_accessible_but_left_public_target_still_requires_join(self):
++        self.entity.left = True
++        await self.app._resolve_or_join_target(self.client, '@public', False)
++        self.assertEqual(len(self.calls), 1)
++        await self.app._resolve_or_join_target(self.client, '@public', True)
++        self.assertEqual([kind for kind, _ in self.calls], ['resolve', 'resolve', 'request'])
++
++    async def test_corrupt_peer_falls_back_to_single_network_lookup(self):
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        entry = self.app.group_state_cache.entry('https://t.me/+invite')
++        if not entry.get('target_peers'):
++            self.fail('Target peer must have been persisted')
++        entry['target_peers']['one']['encoded'] = base64.b64encode(b'bad TL payload').decode()
++        self.app.group_state_cache._store_entry('https://t.me/+invite', entry)
++        await self.app._resolve_or_join_target(self.client, 'https://t.me/+invite', False)
++        self.assertEqual(len(self.calls), 2)
++
++    async def test_failed_public_channel_join_is_never_cached_as_membership(self):
++        self.entity.left = True
++        failure = type('ChannelInvalidError', (Exception,), {})
++        async def fail_join(request):
++            raise failure('join failed')
++        class FailedClient:
++            session = self.client.session
++            get_entity = self.client.get_entity
++            __call__ = staticmethod(fail_join)
++        errors = SimpleNamespace(UserAlreadyParticipantError=type('Already', (Exception,), {}),
++                                 InviteRequestSentError=type('Pending', (Exception,), {}))
++        with patch.object(main, 'errors', errors):
++            with self.assertRaises(failure):
++                await self.app._resolve_or_join_target(FailedClient(), '@public', True)
++        self.assertFalse(self.app.group_state_cache.entry('@public').get('target_peers'))
++
++
++class IncrementalMonitorPreparationTests(unittest.IsolatedAsyncioTestCase):
++    async def test_known_admin_policy_skips_repeated_checks_and_only_prepares_new_account(self):
++        with tempfile.TemporaryDirectory() as td:
++            store = ConfigStore(Path(td) / 'config.json')
++            cache = GroupStateCache(Path(td) / 'group_state_cache.json')
++            a = Account(session='known', label='A', phone='', user_id=1)
++            b = Account(session='new', label='B', phone='', user_id=2)
++            cache.mark_admins('@g', {'known'}, policy_key='max', anonymous=True)
++            # An old TTL must not force a repeat of a confirmed unchanged assignment.
++            entry = cache.entry('@g')
++            entry['last_admin_sync'] = 1
++            cache._store_entry('@g', entry)
++            promote = AsyncMock(return_value=(1, 0))
++            pane = BatchUploaderPane.__new__(BatchUploaderPane)
++            pane.app = SimpleNamespace(store=store, group_state_cache=cache, log=lambda *a: None,
++                ui_call=lambda fn: None, account_usage_allows=lambda *a: True,
++                maximum_admin_policy_key=lambda title: 'max', safety_policy=lambda: {'enabled': False},
++                _promote_one_target_async=promote, _friendly_error=str)
++            pane.stop_event = threading.Event()
++            pane.refresh_monitor_tab = lambda: None
++            rules = [dict(id='r', target='@g', auto_admin=True)]
++            await pane._prepare_task_admins(rules, {'known': a})
++            promote.assert_not_awaited()
++            await pane._prepare_task_admins(rules, {'known': a, 'new': b})
++            self.assertEqual([a.session for a in promote.await_args.kwargs['selected']], ['new'])
++
++
++@unittest.skipIf(main.BinaryReader is None, 'Real TL roundtrip is also verified with the installed Telethon environment')
++class RealTelethonPeerCacheTests(unittest.IsolatedAsyncioTestCase):
++    async def test_real_channel_roundtrip_preserves_access_hash_forum_and_history_key(self):
++        with tempfile.TemporaryDirectory() as td:
++            entity = main.tl_types.Channel(id=123, title='forum', photo=main.tl_types.ChatPhotoEmpty(),
++                                          date=None, access_hash=987654321, megagroup=True, forum=True)
++            account = Account(session='test', label='test', phone='', user_id=7)
++            app = main.TelegramAdminManager.__new__(main.TelegramAdminManager)
++            app.store = SimpleNamespace(accounts=lambda: [account])
++            app.group_state_cache = GroupStateCache(Path(td) / 'cache.json')
++            app.log = lambda *a: None
++            client = SimpleNamespace(session=SimpleNamespace(filename=str(Path(td) / 'test.session'),
++                                      auth_key=SimpleNamespace(key=b'test-auth')), get_entity=AsyncMock(return_value=entity))
++            first = await app._resolve_or_join_target(client, '@forum', False)
++            app.group_state_cache = GroupStateCache(Path(td) / 'cache.json')
++            second = await app._resolve_or_join_target(client, '@forum', False)
++            client.get_entity.assert_awaited_once()
++            self.assertEqual(app._target_key(first), app._target_key(second))
++            self.assertEqual(second.access_hash, entity.access_hash)
++            self.assertTrue(second.forum)
++
++
++if __name__ == '__main__':
++    unittest.main()

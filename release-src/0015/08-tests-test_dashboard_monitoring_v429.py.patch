@@ -1,0 +1,13 @@
+--- a/app/tests/test_dashboard_monitoring_v429.py
++++ b/app/tests/test_dashboard_monitoring_v429.py
+@@ -22,6 +22,10 @@
+     def put(self, rule: dict) -> None:
+         self.rule = dict(rule)
+         self.saved.append(dict(rule))
++
++    def update_fields(self, tid: str, fields: dict) -> dict:
++        self.put({**self.rule, **fields})
++        return dict(self.rule)
+ 
+     def seen_files(self, rule_id: str) -> set[str]:
+         return set(self._seen)
