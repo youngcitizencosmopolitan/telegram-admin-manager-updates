@@ -1,0 +1,158 @@
+--- /dev/null
++++ b/app/tests/test_monitor_reservation_recovery.py
+@@ -0,0 +1,155 @@
++import asyncio
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from batch_uploader import BatchUploaderPane, _dedup_claim_disposition
++from tam_core.repositories import UploadHistory
++from test_monitor_new_count import Store, Tree
++
++
++class MonitorSubmissionTests(unittest.TestCase):
++    def test_same_running_rule_is_not_resubmitted_every_fast_tick(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {'id': 'r1', 'name': 'rule', 'monitor_folder': True, 'monitor_seen_initialized': True}
++        pane.app = SimpleNamespace(monitor_rules=Store(rule), log=lambda text: None, ui_call=lambda fn: fn())
++        pane.monitor_rules = lambda: [dict(rule)]
++        pane.monitor_runtime, pane.monitor_last_signatures, pane.monitor_pending_signatures = {}, {}, {}
++        pane.monitor_stop_event = threading.Event()
++        pane._queued_task_ids = lambda: {'r1'}
++        pane.refresh_monitor_tab = lambda: None
++        submissions = []
++        enqueue = pane._enqueue_batch
++        def submit(*a, **k): submissions.append(1); return enqueue(*a, **k)
++        pane._enqueue_batch = submit
++        def scan(task):
++            pane._folder_indexes['r1'] = SimpleNamespace(needs_poll=True, busy=True, has_work=True, close=lambda: None)
++            return 'same-snapshot', {'old.mp4'}
++        pane._scan_monitor_snapshot = scan
++        ticks = []
++        async def tick(seconds):
++            ticks.append(1)
++            if len(ticks) == 3: pane.monitor_stop_event.set()
++        with patch('batch_uploader.asyncio.sleep', tick):
++            asyncio.run(pane._monitor_loop())
++        self.assertEqual(len(submissions), 1, 'Deduplicated running rule is submitted in a tight loop')
++
++    def test_stale_reservation_is_blocked_instead_of_completed_duplicate(self):
++        self.assertEqual(_dedup_claim_disposition('stale'), 'blocked')
++
++    def test_confirmed_recovery_queues_a_durable_followup_for_occupied_rule(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {'id': 'r1', 'name': 'rule', 'folder': 'videos', 'target': '@group'}
++        pane.app = SimpleNamespace(monitor_rules=Store(rule), log=lambda text: None)
++        pane.monitor_last_signatures = {'r1': 'old'}
++        pane.monitor_pending_signatures = {'r1': 'pending'}
++        pane.monitor_blocked_signatures = {'r1': ('old', 0)}
++        pane._queued_task_ids = lambda: {'r1'}
++        pane._monitor_task_for_queue = lambda task: dict(task)
++        queued = []
++        pane._enqueue_batch = lambda tasks, **kwargs: queued.append((tasks, kwargs))
++        with patch('batch_uploader.messagebox.showinfo'):
++            pane._finish_unfinished_recovery(rule, 2)
++        self.assertEqual(len(queued), 1)
++        self.assertFalse(queued[0][1]['dedupe'])
++        self.assertEqual(pane.monitor_recovery_versions['r1'], 1)
++        self.assertNotIn('r1', pane.monitor_pending_signatures)
++        self.assertNotIn('r1', pane.monitor_blocked_signatures)
++
++    def test_monitor_table_exposes_blocked_rule_instead_of_100_percent_running(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {'id': 'r1', 'name': 'rule', 'monitor_folder': True}
++        pane.app = SimpleNamespace(store=SimpleNamespace(accounts=lambda: []),
++            group_state_cache=SimpleNamespace(entry=lambda target: {}, all_entries=lambda: []))
++        pane.monitor_rules = lambda: [rule]
++        pane.monitor_runtime = {}
++        pane.unified_monitor = pane.monitor_active = pane.running = True
++        pane.monitor_tree = Tree()
++        pane._monitor_selected_tid = lambda: None
++        pane._queued_task_ids = lambda: set()
++        pane._live_task_lock = threading.Lock()
++        pane.live_tasks = {'r1': rule}
++        pane.task_states = {'r1': {'total_bytes': 10001, 'processed_bytes': 10000,
++            'processed_files': 10, 'blocked': 1, 'active': {}}}
++        pane.monitor_summary_var = pane.monitor_state_var = SimpleNamespace(set=lambda value: None)
++        pane.refresh_monitor_tab(force=True)
++        values = pane.monitor_tree.rows['r1']
++        self.assertIn('повтор', str(values[6]).lower())
++        self.assertNotEqual(values[7], '100%')
++
++
++class StaleRecoveryTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.folder = self.root / 'videos'
++        self.folder.mkdir()
++        self.history = UploadHistory(self.root / 'uploads.db')
++        for fp, target, path, run in (
++            ('old', 'Channel:1#forum:a', self.folder / 'old.mp4', 'past'),
++            ('active', 'Channel:1', self.folder / 'active.mp4', 'current'),
++            ('other-group', 'Channel:2', self.folder / 'other.mp4', 'past'),
++            ('sibling', 'Channel:1', self.root / 'videos-other' / 'sibling.mp4', 'past')):
++            self.history.claim_fingerprint(fp, target, path, run, 'claim-'+fp)
++
++    def test_recovery_selects_only_old_reservations_in_exact_group_and_folder(self):
++        select = getattr(self.history, 'stale_reservations', None)
++        self.assertTrue(callable(select), 'No scoped unfinished-upload recovery')
++        rows = select(self.folder, 'Channel:1', 'current')
++        self.assertEqual([row['fingerprint'] for row in rows], ['old'])
++        release = getattr(self.history, 'release_stale_reservations', None)
++        self.assertTrue(callable(release))
++        self.assertEqual(release(rows, 'current'), 1)
++        with self.history.db.session() as conn:
++            remaining = {row[0] for row in conn.execute('SELECT fingerprint FROM upload_reservations')}
++        self.assertEqual(remaining, {'active', 'other-group', 'sibling'})
++
++    def test_recovery_never_deletes_a_replaced_claim_or_successful_history(self):
++        select = getattr(self.history, 'stale_reservations', None)
++        self.assertTrue(callable(select), 'No scoped unfinished-upload recovery')
++        rows = select(self.folder, 'Channel:1', 'current')
++        with self.history.db.session() as conn:
++            conn.execute("UPDATE upload_reservations SET claim_token='new-owner' WHERE fingerprint='old'")
++        self.assertEqual(self.history.release_stale_reservations(rows, 'current'), 0)
++        self.assertEqual(self.history.db.upload_claim_fingerprint(target_key='Channel:1#forum:a',
++            fingerprint='old', path='ignored', run_token='current', claim_token='attempt'), 'stale')
++
++    def test_completed_history_wins_during_recovery_confirmation(self):
++        rows = self.history.stale_reservations(self.folder, 'Channel:1', 'current')
++        self.history.db.upload_record(target_key='Channel:1#forum:a', fingerprint='old',
++            path=str(self.folder / 'old.mp4'), size=1, mtime_ns=1,
++            account_user_id=1, account_label='test', message_id=1)
++        self.assertEqual(self.history.release_stale_reservations(rows, 'current'), 0)
++        self.assertTrue(self.history.fingerprint_completed('old', 'Channel:1#forum:a'))
++
++    def test_already_completed_claim_is_not_offered_for_recovery(self):
++        self.history.db.upload_record(target_key='Channel:1#forum:a', fingerprint='old',
++            path=str(self.folder / 'old.mp4'), size=1, mtime_ns=1,
++            account_user_id=1, account_label='test', message_id=1)
++        self.assertEqual(self.history.stale_reservations(self.folder, 'Channel:1', 'current'), [])
++
++    def test_ui_requires_explicit_confirmation_before_releasing_old_claims(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        rule = {'id': 'r1', 'name': 'rule', 'folder': str(self.folder), 'target': '@group'}
++        pane.app = SimpleNamespace(monitor_rules=Store(rule), upload_history=self.history, ui_call=lambda fn: fn())
++        pane.dedup_run_token = 'current'
++        rows = self.history.stale_reservations(self.folder, 'Channel:1', 'current')
++        completed = []
++        pane._finish_unfinished_recovery = lambda rule, count: completed.append(count)
++        class InlineThread:
++            def __init__(self, target, **kwargs): self.target = target
++            def start(self): self.target()
++        with patch('batch_uploader.messagebox.askyesno', return_value=False), patch('batch_uploader.threading.Thread', InlineThread):
++            pane._confirm_unfinished_recovery(rule, rows)
++        self.assertEqual(completed, [])
++        self.assertEqual(len(self.history.stale_reservations(self.folder, 'Channel:1', 'current')), 1)
++        with patch('batch_uploader.messagebox.askyesno', return_value=True), patch('batch_uploader.threading.Thread', InlineThread):
++            pane._confirm_unfinished_recovery(rule, rows)
++        self.assertEqual(completed, [1])
++
++
++if __name__ == '__main__': unittest.main()

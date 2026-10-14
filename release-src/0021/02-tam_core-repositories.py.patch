@@ -1,0 +1,17 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -187,6 +187,14 @@
+     def release_fingerprint_reservation(self, fingerprint: str, target_key: str, claim_token: str) -> bool:
+         return self.db.upload_release_fingerprint_reservation(target_key, fingerprint, claim_token)
+ 
++    def stale_reservations(self, folder: Path, target_key: str, current_run: str):
++        root = Path(folder).resolve()
++        return [row for row in self.db.upload_stale_reservations(target_key, current_run)
++                if Path(row['path']).resolve().is_relative_to(root)]
++
++    def release_stale_reservations(self, rows, current_run: str) -> int:
++        return self.db.upload_release_stale_reservations(rows, current_run)
++
+     def record_completed(
+         self,
+         path: Path,
