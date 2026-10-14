@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0016",
-  "display_version": "0016",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0016/TelegramAdminManager_v0016_update.zip",
-  "sha256": "eb6bb03b5c25f748a56eec297565c849010bf7a9c2bed4b845bb1720f6b7b4d1",
-  "notes": "0016: fixes thumbnail extraction for H.264/HEVC videos with invalid color-space metadata rejected by FFmpeg 7. On that specific error, a bounded input-bitstream metadata fallback creates a standard JPEG without modifying the source video. Ordinary extraction, thumbnail caching and required-preview policy are preserved. Errors now retain the original FFmpeg cause instead of only the final empty-output message. Includes eight regression tests."
+  "version": "4.3.8.0017",
+  "display_version": "0017",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0017/TelegramAdminManager_v0017_update.zip",
+  "sha256": "8df9d152efff8d8fffa846c2c87424256c758ed1c65550e0cbab7acd6637ece4",
+  "notes": "0017: speeds up repeated monitoring scans with persistent file fingerprints and batched indexed upload-history checks. Unchanged known duplicates are skipped without reading media or flooding the activity UI. Oversized files are excluded before upload queues; Preflight can still report them and now runs in the background. Windows ChangeTime and file identity invalidate cached fingerprints after edits/replacement; files are revalidated around batch queries and at the skip boundary. Group/topic and recursive-flat deduplication policies, reservations and history clearing are preserved. Includes 22 regression tests; 2000 synthetic duplicate files checked with two database connections instead of 3999."
 }
