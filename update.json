@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0014",
-  "display_version": "0014",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0014/TelegramAdminManager_v0014_update.zip",
-  "sha256": "1daa95d7ff2c24f50a681687138435b8a3c72e8845e8a106304b3ef9bbdbf1d0",
-  "notes": "0014: Premium accounts prioritize large files across the current monitoring wave before taking ordinary files, including large files in later rules. Ordinary accounts keep their existing rule order. Preserves account selections, pause/stop, hot-add activation, upload history and multipart recovery. Includes twelve priority and worker integration tests."
+  "version": "4.3.8.0015",
+  "display_version": "0015",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0015/TelegramAdminManager_v0015_update.zip",
+  "sha256": "cd036f913195f49cb738464a3fadfa6c0065ccf4c5e4d2c580ba421a8d4a5b4f",
+  "notes": "0015: adds a single explicit account picker for all existing monitoring rules, preserving active batches and preventing later accounts from joining those rules automatically. Persists successful target resolution and membership per account/auth session to avoid repeated invite/join checks across restarts; reuses exact-policy admin assignments and prepares only unknown accounts. Zero cache TTL means no expiry. Access errors invalidate only the affected account/target; manual cache reset remains available. Includes scan/edit race, failed-join and real Telethon serialization checks."
 }
