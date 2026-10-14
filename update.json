@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0019",
-  "display_version": "0019",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0019/TelegramAdminManager_v0019_update.zip",
-  "sha256": "5aea43d65b0717a109b1339bb1de701b122b1ebaab1e850c1350be4317c55cd2",
-  "notes": "0019: checks upload history in batches of at most 2000 files and releases each result map before the next batch. Warm checks use metadata and cached fingerprints without reading video content. History checks share the existing two-scan limit across rules, support stop checks during metadata work and between batches, and show aggregate throttled progress. Stopping during a check no longer reports all files uploaded. Legacy forum history now uses indexed source lookups instead of loading all topic records; schema 12 adds a covering index while preserving history. Target/topic, content-change and reservation guards remain intact. Includes eight regression tests and synthetic 100000-file cache measurements."
+  "version": "4.3.8.0020",
+  "display_version": "0020",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0020/TelegramAdminManager_v0020_update.zip",
+  "sha256": "436b4d2f1e52de3da10ee3c2ee95ccc48a83bf9283388a6de1b143b1c1d80fce",
+  "notes": "0020: monitoring queues changed files after the initial full baseline, with epoch/identity validation and successful-batch cutoff acknowledgments that preserve failed work and later arrivals. Unchanged polls reuse membership and do not reread the full seen-file table; SQLite receives only membership additions/deletions. Directory reconciliation and notification bursts run in bounded steps, with staggered periodic checks, watcher-failure fallback and directory-handle cleanup. Manual, restored/stale and incompatible selections retain complete scans. GUI progress is coalesced per row/component every 500 ms; partial task fields merge and final activity values are frozen. Live numbered captions resolve full-catalog numbering from cached path references. Existing upload-history, preview, source mutation, topic, account and Premium policies remain. Includes 31 new regression tests; 330 tests pass locally with application dependencies."
 }
