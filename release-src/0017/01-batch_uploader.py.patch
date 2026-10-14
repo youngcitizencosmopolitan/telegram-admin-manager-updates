@@ -1,0 +1,172 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -4,6 +4,7 @@
+ import hashlib
+ import json
+ import inspect
++import os
+ import secrets
+ import threading
+ import time
+@@ -13,6 +14,7 @@
+ from typing import Any
+ 
+ from video_preview import PreviewError, make_video_thumbnail
++from tam_core.file_metadata import stat_identity
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind as _media_kind
+ from tam_core.preflight import build_preflight_report, format_preflight_report
+ from tam_core.table_sort import TreeviewSortController
+@@ -976,6 +978,8 @@
+         self.activity_paths = {}
+ 
+     def run_preflight(self) -> None:
++        if getattr(self, '_preflight_running', False):
++            return
+         rules = self.monitor_rules()
+         selected = self._monitor_selected_tid()
+         if selected:
+@@ -986,11 +990,26 @@
+             messagebox.showinfo("Telegram Admin Manager", "Нет выбранного или включённого правила для Preflight.", parent=self.app)
+             return
+         tasks = [self._monitor_task_for_queue(r) for r in chosen]
++        self._preflight_running = True
++
++        def work() -> None:
++            try:
++                self._run_preflight(tasks)
++            except Exception as exc:
++                self.app.log(f'Preflight: ошибка — {exc}')
++                self.app.ui_call(lambda error=str(exc): messagebox.showerror(
++                    'Telegram Admin Manager — Preflight', error, parent=self.app))
++            finally:
++                self.app.ui_call(lambda: setattr(self, '_preflight_running', False))
++
++        threading.Thread(target=work, daemon=True).start()
++
++    def _run_preflight(self, tasks: list[dict[str, Any]]) -> None:
+         file_rows: list[dict[str, Any]] = []
+         scan_warnings: list[str] = []
+         for task in tasks:
+             try:
+-                files, _total = self._scan_task_files(task)
++                files, _total = self._scan_task_files(task, include_oversized=True)
+                 for path in files:
+                     try:
+                         file_rows.append({"task_id": str(task.get("id", "")), "size": int(path.stat().st_size)})
+@@ -1030,7 +1049,7 @@
+                 report["warnings"].append(f"{task.get('name', 'Правило')}: права/контроллер не подтверждены кэшем; будут проверены при запуске.")
+         text = format_preflight_report(report)
+         self.app.log("Preflight:\n" + text.replace("\n", " | "))
+-        messagebox.showinfo("Telegram Admin Manager — Preflight", text, parent=self.app)
++        self.app.ui_call(lambda: messagebox.showinfo("Telegram Admin Manager — Preflight", text, parent=self.app))
+ 
+     def _save_cache_ttl(self) -> None:
+         if not hasattr(self, "cache_ttl_var"):
+@@ -2246,23 +2265,44 @@
+         self.save_tasks(tasks)
+         self.refresh_tasks()
+ 
+-    def _scan_task_files(self, task: dict[str, Any]) -> tuple[list[Path], int]:
++    def _scan_task_files(self, task: dict[str, Any], *, include_oversized: bool = False) -> tuple[list[Path], int]:
+         folder = Path(str(task.get("folder", "")))
+         if not folder.exists() or not folder.is_dir():
+             raise FileNotFoundError(f"Папка не существует: {folder}")
+-        iterator = folder.rglob("*") if task.get("recursive", True) else folder.glob("*")
+         allowed: set[str] = set()
+         if bool(task.get("send_videos", True)):
+             allowed.update(VIDEO_EXTENSIONS)
+         if bool(task.get("send_photos", False)):
+             allowed.update(PHOTO_EXTENSIONS)
+-        files = sorted((p for p in iterator if p.is_file() and p.suffix.lower() in allowed), key=lambda p: str(p).lower())
++        # DirEntry reuses directory metadata. Do not queue impossible uploads or
++        # reread every media file's metadata in a second pass over the tree.
++        files: list[Path] = []
+         total = 0
+-        for p in files:
++        directories = [folder]
++        recursive = bool(task.get('recursive', True))
++        while directories:
++            directory = directories.pop()
+             try:
+-                total += p.stat().st_size
++                with os.scandir(directory) as entries:
++                    for entry in entries:
++                        try:
++                            if entry.is_dir(follow_symlinks=False):
++                                if recursive:
++                                    directories.append(Path(entry.path))
++                                continue
++                            if Path(entry.name).suffix.lower() not in allowed or not entry.is_file():
++                                continue
++                            size = entry.stat().st_size
++                            if not include_oversized and _telegram_upload_lane(size) == 'too_large':
++                                continue
++                            files.append(Path(entry.path))
++                            total += size
++                        except OSError:
++                            continue
+             except OSError:
+-                pass
++                if directory == folder:
++                    raise
++        files.sort(key=lambda p: str(p).lower())
+         return files, total
+ 
+     def scan_all(self) -> None:
+@@ -4175,12 +4215,25 @@
+             "До 2 ГБ — любой; 2–4 ГБ — только Premium; >4 ГБ — пропуск."
+         )
+ 
++        completed_paths = None
++        batch_check = getattr(self.app.upload_history, 'completed_paths', None)
++        if callable(batch_check):
++            self.app.ui_call(lambda: self._set_task_row(tid, status="Проверка индекса…"))
++            completed_paths = await asyncio.to_thread(
++                batch_check, files, history_key_for_path,
++                lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
++                forum_target_key=str(target_key) if forum_mode else None,
++            )
++
+         pending: list[tuple[int, Path]] = []
+         for index, path in enumerate(files, start=1):
++            if index % 256 == 0:
++                await asyncio.sleep(0)
+             if self.stop_event.is_set():
+                 break
+             try:
+-                size = path.stat().st_size
++                current_stat = path.stat()
++                size = current_stat.st_size
+             except OSError:
+                 state["processed_files"] += 1
+                 state["failed"] += 1
+@@ -4194,14 +4247,14 @@
+                 self.app.log(f"{name} → {path.name}: ❌ нет темы «{topic_title}» и создать её не удалось")
+                 self.app.record_upload_error(task=name, target=task_target, path=str(path), account="—", attempts=1, error=f"Нет темы: {topic_title}")
+                 self.app.ui_call(lambda k=key, p=path, z=size, tt=topic_title: self._activity_update(k, name, p, "—", z, 0.0, 0.0, f"❌ Нет темы: {tt}"))
+-            elif (
++            elif (completed_paths.get(path) == stat_identity(current_stat) if completed_paths is not None else (
+                 self.app.upload_history.exact_completed(path, history_key_for_path(path))
+                 or (
+                     forum_mode
+                     and hasattr(self.app.upload_history, "exact_completed_forum")
+                     and self.app.upload_history.exact_completed_forum(path, str(target_key))
+                 )
+-            ):
++            )):
+                 state["processed_bytes"] += size
+                 state["processed_files"] += 1
+                 state["skipped"] += 1
+@@ -4392,7 +4445,11 @@
+                         self.app.ui_call(lambda k=key, p=path, a=account_name: self._activity_update(k, name, p, a, size, 0.0, 0.0, "Проверка"))
+ 
+                         try:
+-                            fingerprint = await asyncio.to_thread(self.app._quick_fingerprint, path)
++                            cached_reader = getattr(self.app.upload_history, 'cached_fingerprint', None)
++                            if callable(cached_reader):
++                                fingerprint = await asyncio.to_thread(cached_reader, path, self.app._quick_fingerprint)
++                            else:
++                                fingerprint = await asyncio.to_thread(self.app._quick_fingerprint, path)
+                         except Exception as exc:
+                             state["processed_bytes"] += size
+                             state["processed_files"] += 1
