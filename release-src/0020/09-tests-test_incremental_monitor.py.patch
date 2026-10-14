@@ -1,0 +1,213 @@
+--- /dev/null
++++ b/app/tests/test_incremental_monitor.py
+@@ -0,0 +1,210 @@
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from tam_core.folder_events import FolderSnapshotIndex
++from test_folder_events import FakeEvents
++
++try:
++    from tam_core.folder_scan import FolderWalker
++    from tam_core.monitor_delta import MonitorSeenState
++except ImportError:
++    FolderWalker = MonitorSeenState = None
++
++
++class IncrementalMonitorTests(unittest.TestCase):
++    def setUp(self):
++        self.assertIsNotNone(FolderWalker, 'Bounded reconciliation is missing')
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.now = [0.0]
++        self.rule = {'id': 'r1', 'folder': str(self.root), 'recursive': True,
++                     'target': '@group', 'monitor_seen_initialized': True}
++        self.index = FolderSnapshotIndex(self.rule, lambda t: self.fail('Full scan callback used'),
++            lambda size: 'small', clock=lambda: self.now[0], event_factory=FakeEvents,
++            quiet=3, walk_factory=FolderWalker, batch_size=3, budget=100)
++        self.addCleanup(self.index.close)
++
++    def file(self, name, data=b'video'):
++        p = self.root / name
++        p.parent.mkdir(parents=True, exist_ok=True)
++        p.write_bytes(data)
++        return p
++
++    def complete(self):
++        result = self.index.snapshot()
++        for _ in range(100):
++            if not self.index.reconciling:
++                break
++            result = self.index.snapshot()
++        self.assertFalse(self.index.reconciling)
++        self.now[0] += 3
++        return self.index.snapshot()
++
++    def test_large_reconciliation_yields_before_all_metadata_is_read(self):
++        for i in range(20):
++            self.file('%02d.mp4' % i)
++        signature, _ = self.index.snapshot()
++        self.assertEqual(signature, 'scanning')
++        self.assertTrue(self.index.reconciling)
++        self.assertLessEqual(len(self.index._entries), 3)
++        self.assertEqual(len(self.complete()[1]), 20)
++
++    def test_idle_snapshot_reuses_membership_without_iterating_all_entries(self):
++        self.file('a.mp4')
++        first = self.complete()
++
++        class NoIteration(dict):
++            def __iter__(self):
++                raise AssertionError('Idle poll iterated all files')
++
++        self.index._entries = NoIteration(self.index._entries)
++        second = self.index.snapshot()
++        self.assertEqual(second[0], first[0])
++        self.assertIs(second[1], first[1])
++
++    def test_delta_work_ack_does_not_erase_later_arrivals_or_edits(self):
++        self.file('a.mp4')
++        self.complete()
++        initial = self.index.work_snapshot()
++        self.assertTrue(initial['full'])
++        self.index.ack_work(initial['cutoff'])
++        b = self.file('b.mp4')
++        self.index.events.notify(b)
++        self.complete()
++        queued = self.index.work_snapshot()
++        self.assertEqual(queued['files'], ['b.mp4'])
++        self.assertFalse(queued['full'])
++        b.write_bytes(b'edited after queue')
++        self.index.events.notify(b)
++        self.complete()
++        self.index.ack_work(queued['cutoff'])
++        self.assertEqual(self.index.work_snapshot()['files'], ['b.mp4'])
++
++    def test_partial_reconciliation_finds_missed_create_and_delete(self):
++        old = self.file('old.mp4')
++        self.complete()
++        self.index.ack_work(self.index.work_snapshot()['cutoff'])
++        old.unlink()
++        self.file('missed.mp4')
++        self.now[0] = 300
++        signature, paths = self.complete()
++        self.assertEqual(paths, {'missed.mp4'})
++        self.assertNotEqual(signature, 'scanning')
++        self.assertEqual(self.index.work_snapshot()['files'], ['missed.mp4'])
++
++    def test_events_during_walk_survive_completion(self):
++        for i in range(12):
++            self.file('%02d.mp4' % i)
++        self.index.snapshot()
++        late = self.file('late.mp4')
++        self.index.events.notify(late)
++        self.assertIn('late.mp4', self.complete()[1])
++
++    def test_close_mid_walk_closes_directory_iterator(self):
++        for i in range(8):
++            self.file('%02d.mp4' % i)
++        self.index.snapshot()
++        walker = self.index._walker
++        self.assertIsNotNone(walker)
++        self.index.close()
++        self.assertTrue(walker.closed)
++
++    def test_permission_error_does_not_publish_partial_deletions(self):
++        self.file('old.mp4')
++        self.complete()
++        self.now[0] = 300
++
++        class BrokenWalker:
++            directories = ()
++            def __iter__(self): return self
++            def __next__(self): raise PermissionError('temporary access failure')
++            def close(self): pass
++
++        with patch.object(self.index, 'walk_factory', lambda task: BrokenWalker()):
++            self.assertEqual(self.index.snapshot()[0], 'error')
++        self.assertIn(self.root / 'old.mp4', self.index._entries)
++        self.assertTrue(self.index.needs_poll)
++        self.assertEqual(self.complete()[1], {'old.mp4'})
++
++    def test_seen_state_reads_once_and_writes_only_changed_paths(self):
++        self.assertIsNotNone(MonitorSeenState)
++        self.file('old.mp4')
++        self.complete()
++
++        class Store:
++            reads = 0
++            def __init__(self): self.paths, self.deltas = {'old.mp4'}, []
++            def seen_files(self, tid): self.reads += 1; return set(self.paths)
++            def replace_seen_files(self, tid, paths): self.paths = set(paths)
++            def apply_seen_delta(self, tid, added, removed):
++                self.deltas.append((set(added), set(removed)))
++                self.paths.difference_update(removed)
++                self.paths.update(added)
++
++        store, state = Store(), MonitorSeenState()
++        rule, count, _ = state.sync(self.index, store, self.rule, 1)
++        self.assertEqual(count, 0)
++        for _ in range(5):
++            self.index.snapshot()
++            state.sync(self.index, store, rule, 2)
++        self.assertEqual(store.reads, 1)
++        self.assertEqual(store.deltas, [])
++        new = self.file('new.mp4')
++        self.index.events.notify(new)
++        self.index.snapshot()
++        _, count, _ = state.sync(self.index, store, rule, 3)
++        self.assertEqual(count, 1)
++        self.assertEqual(store.reads, 1)
++        self.assertEqual(store.deltas, [({'new.mp4'}, set())])
++        self.assertEqual(store.paths, {'old.mp4', 'new.mp4'})
++
++    def test_seen_delta_updates_real_database_without_replacing_other_paths(self):
++        from tam_core.repositories import MonitorRuleStore
++        from tam_core.state_db import StateDatabase
++        store = MonitorRuleStore(StateDatabase(self.root / 'state.db'))
++        self.assertTrue(callable(getattr(store, 'apply_seen_delta', None)), 'Missing delta persistence')
++        store.replace_seen_files('r1', {'old.mp4', 'keep.mp4'})
++        store.replace_seen_files('r2', {'old.mp4'})
++        store.apply_seen_delta('r1', {'NEW.mp4'}, {'old.mp4'})
++        self.assertEqual(store.seen_files('r1'), {'keep.mp4', 'new.mp4'})
++        self.assertEqual(store.seen_files('r2'), {'old.mp4'})
++
++    def test_event_burst_also_yields_before_all_paths_are_refreshed(self):
++        from tam_core.folder_events import EventBuffer
++        self.complete()
++        self.index.events.buffer = EventBuffer(limit=100)
++        for i in range(10):
++            path = self.file('%02d.mp4' % i)
++            self.index.events.notify(path)
++        self.index.snapshot()
++        self.assertLessEqual(len(self.index._entries), 3)
++        self.assertTrue(self.index.needs_poll)
++        for _ in range(5): self.index.snapshot()
++        self.assertEqual(len(self.index._entries), 10)
++
++    def test_watcher_failure_triggers_prompt_bounded_fallback(self):
++        self.complete()
++        self.index.events.healthy = False
++        self.file('missed.mp4')
++        self.assertTrue(self.index.needs_poll)
++        self.assertEqual(self.complete()[1], {'missed.mp4'})
++
++    def test_root_loss_discards_catalog_without_iterating_each_path(self):
++        path = self.file('a.mp4')
++        self.complete()
++        epoch = self.index.epoch
++        class NoIteration(dict):
++            def __iter__(self): raise AssertionError('Root loss iterated full catalogue')
++        self.index._entries = NoIteration(self.index._entries)
++        path.unlink()
++        self.root.rmdir()
++        self.assertEqual(self.index.snapshot(), ('missing', set()))
++        self.root.mkdir()
++        self.assertNotEqual(self.index.epoch, epoch)
++
++
++if __name__ == '__main__':
++    unittest.main()

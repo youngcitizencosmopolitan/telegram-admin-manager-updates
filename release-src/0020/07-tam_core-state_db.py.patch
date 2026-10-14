@@ -1,0 +1,17 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -688,6 +688,14 @@
+                     ((rid, path) for path in normalized),
+                 )
+ 
++    def monitor_seen_delta(self, rule_id: str, added: Iterable[str], removed: Iterable[str]) -> None:
++        rid = str(rule_id)
++        def rows(paths):
++            return ((rid, str(p).replace('\\', '/').casefold()) for p in paths if str(p))
++        with self.session() as conn:
++            conn.executemany('DELETE FROM monitor_seen_files WHERE rule_id=? AND path_key=?', rows(removed))
++            conn.executemany('INSERT OR IGNORE INTO monitor_seen_files(rule_id,path_key) VALUES(?,?)', rows(added))
++
+     # ---------- group cache ----------
+     def group_get(self, target: str) -> dict[str, Any]:
+         key = self.normalize_target_key(target)

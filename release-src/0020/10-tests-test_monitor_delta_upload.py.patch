@@ -1,0 +1,129 @@
+--- /dev/null
++++ b/app/tests/test_monitor_delta_upload.py
+@@ -0,0 +1,126 @@
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from batch_uploader import BatchUploaderPane
++from tam_core.folder_events import FolderSnapshotIndex
++from test_folder_events import FakeEvents
++
++
++class DeltaSelectionTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.rule = {'id': 'r1', 'folder': str(self.root), 'target': '@group', 'recursive': True}
++        self.old = self.root / 'old.mp4'
++        self.old.write_bytes(b'old')
++        self.pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        self.index = FolderSnapshotIndex(self.rule, self.pane._scan_task_files, lambda z: 'small',
++            quiet=0, event_factory=FakeEvents)
++        self.addCleanup(self.index.close)
++        self.index.snapshot()
++        self.index.ack_work(self.index.work_snapshot()['cutoff'])
++        self.new = self.root / 'new.mp4'
++        self.new.write_bytes(b'new')
++        self.index.events.notify(self.new)
++        self.index.snapshot()
++        self.pane._folder_indexes = {'r1': self.index}
++        self.task = {**self.rule, '_monitor_delta': self.index.work_snapshot()}
++
++    def test_event_batch_selects_only_changed_file(self):
++        self.assertEqual(self.pane._scan_task_files(self.task), ([self.new], 3))
++
++    def test_removed_queued_file_does_not_expand_to_whole_tree(self):
++        self.new.unlink()
++        self.assertEqual(self.pane._scan_task_files(self.task), ([], 0))
++
++    def test_restart_unknown_epoch_falls_back_to_complete_scan(self):
++        self.pane._folder_indexes = None
++        self.assertEqual(set(self.pane._scan_task_files(self.task)[0]), {self.old, self.new})
++
++    def test_changed_route_and_numbered_caption_fall_back_to_complete_scan(self):
++        for update in ({'target': '@other'}, {'caption': '{index}/{total} {filename}'}):
++            with self.subTest(update=update):
++                self.assertEqual(set(self.pane._scan_task_files({**self.task, **update})[0]), {self.old, self.new})
++
++    def test_invalid_relative_path_falls_back_to_complete_scan(self):
++        task = {**self.task, '_monitor_delta': {**self.task['_monitor_delta'], 'files': ['../outside.mp4']}}
++        self.assertEqual(set(self.pane._scan_task_files(task)[0]), {self.old, self.new})
++
++    def test_dispatch_retains_delta_with_latest_caption_and_account_settings(self):
++        from tam_core import monitor_delta
++        merge = getattr(monitor_delta, 'task_for_dispatch', None)
++        self.assertTrue(callable(merge), 'Queue dispatcher drops delta metadata')
++        latest = {**self.rule, 'caption': 'new caption', 'account_sessions': ['chosen']}
++        result = merge(latest, self.task)
++        self.assertEqual(result['caption'], 'new caption')
++        self.assertEqual(result['account_sessions'], ['chosen'])
++        self.assertEqual(result['_monitor_delta'], self.task['_monitor_delta'])
++        self.assertNotIn('_monitor_delta', merge({**latest, 'target': '@other'}, self.task))
++
++    def test_success_ack_applies_only_to_matching_index_epoch(self):
++        ack = getattr(self.pane, '_ack_monitor_work', None)
++        self.assertTrue(callable(ack), 'Successful queue work is never acknowledged')
++        self.pane._ack_monitor_work(self.task)
++        self.assertFalse(self.index.has_work)
++        self.old.write_bytes(b'edited')
++        self.index.events.notify(self.old)
++        self.index.snapshot()
++        wrong = {**self.task, '_monitor_delta': {**self.task['_monitor_delta'], 'epoch': 'past-session', 'cutoff': 999}}
++        self.pane._ack_monitor_work(wrong)
++        self.assertTrue(self.index.has_work)
++
++    def run_queue(self, failed=False, later=False):
++        from tam_core.repositories import MonitorRuleStore
++        from tam_core.state_db import StateDatabase
++        db = StateDatabase(self.root / 'state.db')
++        repo = MonitorRuleStore(db)
++        repo.put(self.rule)
++        pane = self.pane
++        noop = lambda *a, **k: None
++        pane.app = SimpleNamespace(store=SimpleNamespace(data={'upload_tasks': []}, db=db),
++            monitor_rules=repo, ui_call=noop, log=noop)
++        pane._queue_lock = threading.Lock()
++        pane._live_task_lock = threading.RLock()
++        pane.pending_batches = [{'id': 'q1', 'task_ids': ['r1'], 'source': 'Мониторинг',
++            'task_snapshots': [self.task], 'monitor_signatures': {'r1': 'queued-sig'}}]
++        pane.queue_halt_requested = False
++        pane.live_tasks = {}
++        pane.stop_event = threading.Event()
++        pane._effective_global_parallel = lambda tasks: 1
++        pane.monitor_last_signatures, pane.monitor_pending_signatures = {}, {'r1': 'queued-sig'}
++        pane.monitor_prepared_targets, pane.monitor_runtime = set(), {}
++        captured = []
++
++        async def batch(tasks, *args, **kwargs):
++            captured.extend(tasks)
++            pane.task_states = {'r1': {'failed': int(failed)}}
++            if later:
++                path = self.root / 'later.mp4'
++                path.write_bytes(b'later')
++                self.index.events.notify(path)
++                self.index.snapshot()
++            return set()
++
++        pane._run_batch = batch
++        pane._queue_worker()
++        self.assertEqual(captured[0]['_monitor_delta']['files'], ['new.mp4'])
++
++    def test_real_dispatch_acknowledges_successful_delta(self):
++        self.run_queue()
++        self.assertFalse(self.index.has_work)
++
++    def test_real_dispatch_retains_failed_work_for_retry(self):
++        self.run_queue(failed=True)
++        self.assertEqual(self.index.work_snapshot()['files'], ['new.mp4'])
++
++    def test_real_dispatch_retains_arrival_during_successful_upload(self):
++        self.run_queue(later=True)
++        self.assertEqual(self.index.work_snapshot()['files'], ['later.mp4'])
++
++
++if __name__ == '__main__':
++    unittest.main()

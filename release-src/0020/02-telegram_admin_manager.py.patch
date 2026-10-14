@@ -1,0 +1,47 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -70,7 +70,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0019"
++APP_VERSION = "0020"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -351,6 +351,8 @@
+         self._dashboard_refresh_ms = 1000
+         self._group_catalog_ui_interval = 3.0
+         self._ui_queue: queue.Queue[Callable[[], Any]] = queue.Queue()
++        from tam_core.ui_latest import UiLatest
++        self._ui_latest = UiLatest()
+         self._visible_log_lines = 0
+         self._log_text_widgets: list[tk.Text] = []
+         self._tree_sort_controllers: list[TreeviewSortController] = []
+@@ -4382,6 +4384,14 @@
+             return
+         self._ui_queue.put(func)
+ 
++    def ui_latest(self, key, func: Callable[[], Any]) -> None:
++        if not self._closed:
++            self._ui_latest.put(key, func)
++
++    def ui_latest_fields(self, key, fields, func: Callable[..., Any]) -> None:
++        if not self._closed:
++            self._ui_latest.put_fields(key, fields, func)
++
+     def _drain_ui_queue(self) -> None:
+         if self._closed:
+             return
+@@ -4398,6 +4408,11 @@
+             except Exception:
+                 self._write_log(traceback.format_exc())
+             processed += 1
++        for func in self._ui_latest.drain():
++            try:
++                func()
++            except Exception:
++                self._write_log(traceback.format_exc())
+         self.after(10 if not self._ui_queue.empty() else 50, self._drain_ui_queue)
+ 
+     def ui_ask(self, func: Callable[[], Any]) -> Any:

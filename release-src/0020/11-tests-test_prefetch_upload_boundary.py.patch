@@ -1,0 +1,71 @@
+--- a/app/tests/test_prefetch_upload_boundary.py
++++ b/app/tests/test_prefetch_upload_boundary.py
+@@ -111,6 +111,68 @@
+         self.assertEqual([Path(p) for p, _ in self.sent], [first, second])
+         self.assertEqual(self.errors, [])
+ 
++    async def test_monitor_delta_upload_does_not_rescan_completed_siblings(self):
++        from tam_core.folder_events import FolderSnapshotIndex
++        from test_folder_events import FakeEvents
++        old = self.file('old.mp4', b'old')
++        self.history.record_completed(old, 'group', b'old'.hex(), self.account, 1)
++        index = FolderSnapshotIndex(self.rule, self.pane._scan_task_files, lambda z: 'small',
++            quiet=0, event_factory=FakeEvents)
++        try:
++            index.snapshot()
++            index.ack_work(index.work_snapshot()['cutoff'])
++            new = self.file('new.mp4', b'new')
++            index.events.notify(new)
++            index.snapshot()
++            self.pane._folder_indexes = {'r1': index}
++            self.rule['_monitor_delta'] = index.work_snapshot()
++            await self.run_task()
++            self.assertEqual(self.pane.task_states['r1']['total_files'], 1)
++            self.assertEqual(self.reads, [new])
++            self.assertEqual([Path(p) for p, _ in self.sent], [new])
++        finally:
++            index.close()
++
++    async def test_delayed_terminal_paints_preserve_each_file_size(self):
++        from tam_core.ui_latest import UiLatest
++        first = self.file('a.mp4', b'first')
++        second = self.file('b.mp4', b'longer second')
++        buffer = UiLatest()
++        painted = {}
++        self.pane.app.ui_latest = buffer.put
++        self.pane._set_task_row = lambda *a, **k: None
++        self.pane._activity_update = lambda key, name, path, account, size, *args: painted.update({path: size})
++        await self.run_task()
++        for callback in buffer.drain():
++            callback()
++        self.assertEqual(painted, {first: 5, second: 13})
++
++    async def test_live_numbered_caption_uses_full_catalog_after_delta_scan(self):
++        from tam_core.folder_events import FolderSnapshotIndex
++        from test_folder_events import FakeEvents
++        old = self.file('a-old.mp4', b'old')
++        self.history.record_completed(old, 'group', b'old'.hex(), self.account, 1)
++        index = FolderSnapshotIndex(self.rule, self.pane._scan_task_files, lambda z: 'small',
++            quiet=0, event_factory=FakeEvents)
++        try:
++            index.snapshot()
++            index.ack_work(index.work_snapshot()['cutoff'])
++            new = self.file('z-new.mp4', b'new')
++            index.events.notify(new)
++            index.snapshot()
++            self.pane._folder_indexes = {'r1': index}
++            self.rule['_monitor_delta'] = index.work_snapshot()
++            scanner = self.pane._scan_task_files
++            def scan_then_edit(task):
++                result = scanner(task)
++                self.pane.live_tasks['r1']['caption'] = '{index}/{total}'
++                return result
++            self.pane._scan_task_files = scan_then_edit
++            await self.run_task()
++            self.assertEqual(self.sent[0][1]['caption'], '2/2')
++        finally:
++            index.close()
++
+     async def test_copy_wait_does_not_hold_account_and_can_be_stopped(self):
+         self.file()
+         self.pool.readiness.quiet = 60

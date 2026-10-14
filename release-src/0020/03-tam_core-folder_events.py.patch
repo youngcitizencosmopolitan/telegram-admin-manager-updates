@@ -1,0 +1,415 @@
+--- a/app/tam_core/folder_events.py
++++ b/app/tam_core/folder_events.py
+@@ -5,6 +5,7 @@
+ import os
+ import threading
+ import time
++from collections import deque
+ from pathlib import Path
+ 
+ from .file_readiness import FileReadiness, read_stamp
+@@ -84,26 +85,60 @@
+ 
+ class FolderSnapshotIndex:
+     def __init__(self, task, scan, lane, *, clock=time.monotonic, event_factory=WatchEvents,
+-                 quiet=3.0, reconcile=300.0):
++                 quiet=3.0, reconcile=300.0, walk_factory=None, batch_size=256,
++                 budget=0.025, phase=0.0):
++        import uuid
+         self.task = dict(task)
+         self.root = Path(os.path.abspath(task['folder']))
+         self.scan, self.lane = scan, lane
+         self.clock, self.event_factory = clock, event_factory
+-        self.reconcile = reconcile
++        self.reconcile, self.phase = reconcile, phase
++        self.walk_factory, self.batch_size, self.budget = walk_factory, batch_size, budget
+         self.readiness = FileReadiness(quiet, clock)
+         self.events = None
+-        self._entries = {}
+-        self._ready = set()
++        self._watcher_healthy = None
++        self._event_backlog = deque()
++        self.epoch = uuid.uuid4().hex
++        self._lock = threading.RLock()
++        self._entries, self._work, self._membership = {}, {}, {}
++        self._ready, self._pending_paths = set(), set()
++        self._pending_heap = []
++        self._relative_files, self._relative_counts = set(), {}
++        self._revision = self._counter = 0
++        self._digest = 0
+         self._last_full = None
++        self._next_full = 0.0
+         self._directories = ()
+-        self._cached = None
+-        self._dirty = True
++        self._walker = self._cleanup = self._seen = None
++        self._full_required = True
++        self.closed = False
++        self._missing = False
+         self.pending = False
+ 
+     @property
++    def reconciling(self):
++        return self._walker is not None or self._cleanup is not None
++
++    @property
++    def relative_files(self):
++        # Owned by the index; consumers must not mutate this live view.
++        return self._relative_files
++
++    @property
++    def has_work(self):
++        return bool(self._work)
++
++    @property
+     def needs_poll(self):
+-        return (self._last_full is None or self.pending or bool(self.events and self.events.pending)
+-                or self.clock() - self._last_full >= self.reconcile)
++        return (self._last_full is None or self.reconciling or self.pending
++                or bool(self._event_backlog) or bool(self.events and self.events.pending)
++                or bool(self.events and self._watcher_healthy and not self.events.healthy)
++                or self.clock() >= self._next_full)
++
++    @property
++    def busy(self):
++        return (self.reconciling or bool(self._event_backlog)
++                or bool(self._pending_heap and self._pending_heap[0][0] <= self.clock()))
+ 
+     def _eligible(self, path):
+         try:
+@@ -112,12 +147,52 @@
+             return False
+         if not self.task.get('recursive', True) and len(relative.parts) != 1:
+             return False
+-        allowed = set()
+-        if self.task.get('send_videos', True):
+-            allowed.update(VIDEO_EXTENSIONS)
+-        if self.task.get('send_photos', False):
+-            allowed.update(PHOTO_EXTENSIONS)
+-        return path.suffix.lower() in allowed
++        return ((self.task.get('send_videos', True) and path.suffix.lower() in VIDEO_EXTENSIONS)
++                or (self.task.get('send_photos', False) and path.suffix.lower() in PHOTO_EXTENSIONS))
++
++    def _relative(self, path):
++        return path.relative_to(self.root).as_posix().casefold()
++
++    def _member(self, relative, present):
++        self._revision += 1
++        self._membership[relative] = (present, self._revision)
++
++    def _hash(self, path, stamp):
++        payload = repr((path.relative_to(self.root).as_posix(), stamp)).encode('utf-8', 'surrogatepass')
++        return int.from_bytes(hashlib.blake2b(payload, digest_size=16).digest(), 'big')
++
++    def _unready(self, path):
++        if path in self._ready:
++            self._digest ^= self._hash(path, self._entries[path])
++            self._ready.remove(path)
++
++    def _remove(self, path):
++        if path not in self._entries:
++            return
++        self._unready(path)
++        self._entries.pop(path)
++        self._work.pop(path, None)
++        self._pending_paths.discard(path)
++        self.readiness.forget(path)
++        relative = self._relative(path)
++        self._relative_counts[relative] -= 1
++        if self._relative_counts[relative] == 0:
++            self._relative_counts.pop(relative)
++            self._relative_files.discard(relative)
++            self._member(relative, False)
++
++    def _schedule(self, path, delay):
++        import heapq
++        self._counter += 1
++        heapq.heappush(self._pending_heap, (self.clock() + delay, self._counter, path))
++
++    def _make_ready(self, path, stamp):
++        if path not in self._ready:
++            self._ready.add(path)
++            self._pending_paths.discard(path)
++            self._digest ^= self._hash(path, stamp)
++            self._revision += 1
++            self._work[path] = self._revision
+ 
+     def _refresh(self, path):
+         path = Path(os.path.abspath(path))
+@@ -126,92 +201,217 @@
+             stamp = read_stamp(path) if self._eligible(path) and path.is_file() else None
+             if stamp is not None and self.lane(stamp[0]) == 'too_large':
+                 stamp = None
++        except FileNotFoundError:
++            stamp = None
+         except OSError:
+-            stamp = None
++            return  # A transient access failure must not delete known membership.
+         if stamp is None:
+-            if previous is not None:
+-                self._entries.pop(path, None)
+-                self._ready.discard(path)
+-                self.readiness.forget(path)
+-                self._dirty = True
++            self._remove(path)
+         elif previous != stamp:
++            self._unready(path)
++            self._work.pop(path, None)
++            if previous is None:
++                relative = self._relative(path)
++                count = self._relative_counts.get(relative, 0)
++                self._relative_counts[relative] = count + 1
++                if not count:
++                    self._relative_files.add(relative)
++                    self._member(relative, True)
+             self._entries[path] = stamp
+-            self._ready.discard(path)
++            self._pending_paths.add(path)
+             self.readiness.forget(path)
+-            self._dirty = True
+-            # Start the quiet window at the first observation, not its mtime.
++            self.readiness.observe(path, stamp)
+             try:
+-                self.readiness.check(path)
++                ready = self.readiness.check(path)
++                if ready == stamp:
++                    self._make_ready(path, stamp)
++                    return
+             except FileNotFoundError:
+-                self._entries.pop(path, None)
+-                self.readiness.forget(path)
++                self._remove(path)
++                return
+             except OSError:
+-                # A transient sharing/access failure leaves the file pending;
+-                # it must not terminate unrelated monitoring rules.
+                 pass
++            self._schedule(path, self.readiness.quiet)
++
++    def _set_directories(self, directories):
++        directories = tuple(sorted(directories))
++        if directories != self._directories:
++            self._directories = directories
++            self._revision += 1
++
++    def _finish_reconcile(self):
++        self._last_full = self.clock()
++        interval = self.reconcile if self.events.healthy else max(15, self.task.get('monitor_interval', 60))
++        self._next_full = self._last_full + interval + self.phase
++        self._walker = self._cleanup = self._seen = None
++
++    def _cancel_walk(self):
++        if self._walker is not None:
++            self._walker.close()
++        self._walker = self._cleanup = self._seen = None
++
++    def _reconcile_step(self):
++        if self.walk_factory is None:
++            files, _ = self.scan(self.task)
++            current = {Path(os.path.abspath(p)) for p in files}
++            for path in current:
++                self._refresh(path)
++            for path in set(self._entries) - current:
++                self._remove(path)
++            self._set_directories(p.name for p in self.root.iterdir() if p.is_dir())
++            self._finish_reconcile()
++            return
++        if not self.reconciling:
++            self._walker = self.walk_factory(self.task)
++            self._seen = set()
++        deadline = time.monotonic() + self.budget
++        for _ in range(self.batch_size):
++            if time.monotonic() >= deadline:
++                break
++            if self._walker is not None:
++                try:
++                    path = next(self._walker)
++                except StopIteration:
++                    directories = self._walker.directories
++                    self._walker.close()
++                    self._walker = None
++                    self._set_directories(directories)
++                    self._cleanup = iter(tuple(self._entries))
++                    continue
++                if path is not None:
++                    path = Path(os.path.abspath(path))
++                    self._seen.add(path)
++                    self._refresh(path)
++            elif self._cleanup is not None:
++                try:
++                    path = next(self._cleanup)
++                except StopIteration:
++                    self._finish_reconcile()
++                    break
++                if path not in self._seen:
++                    self._remove(path)
+ 
+     def snapshot(self):
++        with self._lock:
++            return self._snapshot()
++
++    def _snapshot(self):
++        import heapq
++        self.closed = False
+         if not self.root.is_dir():
+-            self.close()
+-            self._entries.clear()
+-            self._ready.clear()
++            self._cancel_walk()
++            if self.events is not None:
++                self.events.close()
++                self.events = None
++            if not self._missing:
++                import uuid
++                self.epoch = uuid.uuid4().hex
++                self._entries, self._work, self._membership = {}, {}, {}
++                self._ready, self._pending_paths = set(), set()
++                self._relative_files, self._relative_counts = set(), {}
++                self._pending_heap, self._event_backlog = [], deque()
++                self.readiness = FileReadiness(self.readiness.quiet, self.clock)
++                self._digest = self._revision = 0
++                self._directories = ()
++            self._missing = True
++            self.closed = True
+             self._last_full = None
+             self.pending = False
+-            self._dirty = True
+-            self._cached = None
+-            return 'missing', set()
++            self._full_required = True
++            return 'missing', self._relative_files
++        self._missing = False
+         if self.events is None:
+             self.events = self.event_factory(self.root, bool(self.task.get('recursive', True)))
+         paths, force_full = self.events.drain()
+         now = self.clock()
+-        if self._last_full is None or force_full or not self.events.healthy or now - self._last_full >= self.reconcile:
++        if self._watcher_healthy and not self.events.healthy:
++            self._next_full = 0
++        self._watcher_healthy = self.events.healthy
++        if force_full:
++            self._cancel_walk()
++            self._event_backlog.clear()
++            self._next_full = 0
++        # Apply notifications even while a directory pass is in progress.
++        self._event_backlog.extend(paths)
++        if self._seen is not None:
++            self._seen.update(Path(os.path.abspath(p)) for p in paths)
++        if len(self._event_backlog) > 4096:
++            self._cancel_walk()
++            self._event_backlog.clear()
++            self._next_full = 0
++        deadline = time.monotonic() + self.budget
++        for _ in range(self.batch_size):
++            if not self._event_backlog or time.monotonic() >= deadline:
++                break
++            self._refresh(self._event_backlog.popleft())
++        if (self.reconciling or self._last_full is None or now >= self._next_full
++                or (self.walk_factory is None and not self.events.healthy)):
+             try:
+-                files, _ = self.scan(self.task)
+-                current = {Path(os.path.abspath(p)) for p in files}
+-                for path in current | set(self._entries):
+-                    if path in current:
+-                        self._refresh(path)
+-                    else:
+-                        self._entries.pop(path, None)
+-                        self._ready.discard(path)
+-                        self.readiness.forget(path)
+-                        self._dirty = True
+-                directories = tuple(sorted(p.name for p in self.root.iterdir() if p.is_dir()))
+-                if directories != self._directories:
+-                    self._directories, self._dirty = directories, True
+-                self._last_full = now
++                self._reconcile_step()
+             except OSError:
++                self._cancel_walk()
++                self._next_full = 0
+                 self._last_full = None
+-                return 'error', set()
+-        else:
+-            for path in paths:
+-                self._refresh(path)
+-        for path in set(self._entries) - self._ready:
++                return 'error', self._relative_files
++        deadline = time.monotonic() + self.budget
++        for _ in range(self.batch_size):
++            if not self._pending_heap or self._pending_heap[0][0] > now or time.monotonic() >= deadline:
++                break
++            _, _, path = heapq.heappop(self._pending_heap)
++            if path not in self._pending_paths:
++                continue
+             try:
+                 stamp = self.readiness.check(path)
+                 if stamp is not None:
+-                    if self._entries[path] != stamp:
++                    if self._entries.get(path) != stamp:
+                         self._refresh(path)
+                     else:
+-                        self._ready.add(path)
+-                        self._dirty = True
++                        self._make_ready(path, stamp)
++                else:
++                    self._schedule(path, max(0.5, self.readiness.quiet))
++            except FileNotFoundError:
++                self._remove(path)
+             except OSError:
+-                self._refresh(path)
+-        self.pending = len(self._ready) < len(self._entries)
+-        relative_files = {p.relative_to(self.root).as_posix().casefold() for p in self._entries}
++                self._schedule(path, 1.0)
++        self.pending = bool(self._pending_paths)
++        if self._last_full is None:
++            return 'scanning', self._relative_files
+         if not self._ready and self.pending:
+-            return 'pending', relative_files
+-        if self._dirty or self._cached is None:
+-            digest = hashlib.blake2b(digest_size=16)
+-            digest.update(repr(self._directories).encode('utf-8', 'surrogatepass'))
+-            for path in sorted(self._ready, key=lambda p: str(p).lower()):
+-                relative = path.relative_to(self.root).as_posix()
+-                digest.update(repr((relative, self._entries[path])).encode('utf-8', 'surrogatepass'))
+-            self._cached = digest.hexdigest(), relative_files
+-            self._dirty = False
+-        return self._cached[0], relative_files
++            return 'pending', self._relative_files
++        from .monitor_delta import monitor_identity
++        route = hashlib.blake2b(repr((monitor_identity(self.task), self._directories)).encode('utf-8'), digest_size=16).hexdigest()
++        return f'v2:{route}:{len(self._ready)}:{self._digest:032x}', self._relative_files
++
++    def membership_changes(self):
++        with self._lock:
++            return (self._revision, {p for p, (present, _) in self._membership.items() if present},
++                    {p for p, (present, _) in self._membership.items() if not present})
++
++    def ack_membership(self, cutoff):
++        with self._lock:
++            self._membership = {p: v for p, v in self._membership.items() if v[1] > cutoff}
++
++    def work_snapshot(self, limit=10000):
++        from .monitor_delta import monitor_identity
++        with self._lock:
++            full = self._full_required or len(self._work) > limit
++            return {'epoch': self.epoch, 'identity': list(monitor_identity(self.task)),
++                    'cutoff': self._revision, 'full': full,
++                    'files': [] if full else sorted(p.relative_to(self.root).as_posix() for p in self._work)}
++
++    def numbering_snapshot(self):
++        with self._lock:
++            return tuple(self._entries)
++
++    def ack_work(self, cutoff):
++        with self._lock:
++            self._work = {p: revision for p, revision in self._work.items() if revision > cutoff}
++            self._full_required = False
+ 
+     def close(self):
+-        if self.events is not None:
+-            self.events.close()
+-            self.events = None
++        with self._lock:
++            self.closed = True
++            self._cancel_walk()
++            if self.events is not None:
++                self.events.close()
++                self.events = None

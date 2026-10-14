@@ -1,0 +1,95 @@
+--- /dev/null
++++ b/app/tam_core/monitor_delta.py
+@@ -0,0 +1,92 @@
++"""Monitoring identities, incremental detection state and upload selections."""
++import os
++from pathlib import Path
++
++
++def monitor_identity(task):
++    return (os.path.abspath(str(task.get('folder', ''))), str(task.get('target', '')),
++            bool(task.get('recursive', True)), bool(task.get('send_videos', True)),
++            bool(task.get('send_photos', False)), bool(task.get('forum_topics_from_subfolders', False)))
++
++
++def task_for_dispatch(current, queued):
++    result = dict(current)
++    result.pop('_monitor_delta', None)
++    delta = queued.get('_monitor_delta')
++    if isinstance(delta, dict) and tuple(delta.get('identity', ())) == monitor_identity(current):
++        result['_monitor_delta'] = dict(delta)
++    return result
++
++
++def selected_delta_files(task, indexes, lane):
++    delta = task.get('_monitor_delta')
++    if not isinstance(delta, dict) or delta.get('full'):
++        return None
++    index = (indexes or {}).get(str(task.get('id', '')))
++    if (index is None or index.closed or delta.get('epoch') != index.epoch
++            or tuple(delta.get('identity', ())) != monitor_identity(task)
++            or monitor_identity(index.task) != monitor_identity(task)):
++        return None
++    caption = str(task.get('caption', ''))
++    if '{index}' in caption or '{total}' in caption:
++        return None
++    names = delta.get('files')
++    if not isinstance(names, list) or len(names) > 10000:
++        return None
++    root = Path(os.path.abspath(task['folder']))
++    selected = set()
++    for name in names:
++        if not isinstance(name, str) or not name:
++            return None
++        relative = Path(name)
++        if relative.is_absolute() or relative.drive or '..' in relative.parts:
++            return None
++        path = Path(os.path.abspath(root / relative))
++        if not path.is_relative_to(root):
++            return None
++        selected.add(path)
++    files, total = [], 0
++    for path in sorted(selected, key=lambda p: str(p).lower()):
++        try:
++            if index._eligible(path) and path.is_file():
++                size = path.stat().st_size
++                if lane(size) != 'too_large':
++                    files.append(path)
++                    total += size
++        except FileNotFoundError:
++            continue
++    # Freeze cached path references only, without filesystem reads. A later live
++    # caption edit may introduce {index}/{total}; derive ranks lazily in that case.
++    task['_monitor_numbering'] = {'paths': index.numbering_snapshot(), 'positions': None}
++    return files, total
++
++
++class MonitorSeenState:
++    def __init__(self):
++        self.epoch = None
++        self.paths = set()
++
++    def sync(self, index, store, rule, now):
++        tid = str(rule.get('id', ''))
++        updated = dict(rule)
++        initialized = not bool(rule.get('monitor_seen_initialized', False))
++        revision, added, removed = index.membership_changes()
++        if self.epoch != index.epoch:
++            previous = store.seen_files(tid)
++            current = set(index.relative_files)
++            count = 0 if initialized else len(current - previous)
++            if current != previous:
++                store.replace_seen_files(tid, current)
++            self.paths, self.epoch = current, index.epoch
++        else:
++            count = len(added - self.paths)
++            if added or removed:
++                store.apply_seen_delta(tid, added, removed)
++                self.paths.difference_update(removed)
++                self.paths.update(added)
++        index.ack_membership(revision)
++        updated['monitor_seen_initialized'] = True
++        if count:
++            updated['monitor_last_new_count'] = count
++            updated['monitor_last_detection'] = now
++        return updated, count, initialized
