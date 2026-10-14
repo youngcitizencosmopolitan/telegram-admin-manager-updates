@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0015",
-  "display_version": "0015",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0015/TelegramAdminManager_v0015_update.zip",
-  "sha256": "cd036f913195f49cb738464a3fadfa6c0065ccf4c5e4d2c580ba421a8d4a5b4f",
-  "notes": "0015: adds a single explicit account picker for all existing monitoring rules, preserving active batches and preventing later accounts from joining those rules automatically. Persists successful target resolution and membership per account/auth session to avoid repeated invite/join checks across restarts; reuses exact-policy admin assignments and prepares only unknown accounts. Zero cache TTL means no expiry. Access errors invalidate only the affected account/target; manual cache reset remains available. Includes scan/edit race, failed-join and real Telethon serialization checks."
+  "version": "4.3.8.0016",
+  "display_version": "0016",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0016/TelegramAdminManager_v0016_update.zip",
+  "sha256": "eb6bb03b5c25f748a56eec297565c849010bf7a9c2bed4b845bb1720f6b7b4d1",
+  "notes": "0016: fixes thumbnail extraction for H.264/HEVC videos with invalid color-space metadata rejected by FFmpeg 7. On that specific error, a bounded input-bitstream metadata fallback creates a standard JPEG without modifying the source video. Ordinary extraction, thumbnail caching and required-preview policy are preserved. Errors now retain the original FFmpeg cause instead of only the final empty-output message. Includes eight regression tests."
 }
