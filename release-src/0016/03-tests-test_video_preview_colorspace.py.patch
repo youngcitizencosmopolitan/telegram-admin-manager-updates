@@ -1,0 +1,128 @@
+--- /dev/null
++++ b/app/tests/test_video_preview_colorspace.py
+@@ -0,0 +1,125 @@
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import video_preview as preview
++
++
++COLOR_ERROR = ('[graph input] Invalid color space\n'
++               '[vf] Error reinitializing filters!\n'
++               '[out] Nothing was written into output file, because no packets.\n')
++
++
++class PreviewColorspaceTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.video = self.root / 'video.mp4'
++        self.video.write_bytes(b'unchanged video bytes')
++        self.cache = self.root / 'cache'
++        self.calls = []
++
++    def run_thumbnail(self, runner):
++        with patch.object(preview, '_ffmpeg_executable', return_value='ffmpeg'), \
++             patch.object(preview.subprocess, 'run', side_effect=runner), \
++             patch.object(preview, '_compress_jpeg'):
++            return preview.make_video_thumbnail(self.video, self.cache)
++
++    def success(self, cmd):
++        Path(cmd[-1]).write_bytes(b'JPEG frame')
++        return SimpleNamespace(returncode=0, stderr='')
++
++    def test_normal_video_uses_original_single_attempt(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            return self.success(cmd)
++        result = self.run_thumbnail(runner)
++        self.assertEqual(result.read_bytes(), b'JPEG frame')
++        self.assertEqual(len(self.calls), 1)
++        self.assertNotIn('-bsf:v', self.calls[0])
++
++    def test_invalid_color_space_uses_input_h264_metadata_repair(self):
++        before = self.video.read_bytes()
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            if '-bsf:v' in cmd:
++                self.assertLess(cmd.index('-bsf:v'), cmd.index('-i'))
++                self.assertIn('h264_metadata=matrix_coefficients=1', cmd)
++                return self.success(cmd)
++            return SimpleNamespace(returncode=1, stderr=COLOR_ERROR)
++        try:
++            result = self.run_thumbnail(runner)
++        except preview.PreviewError as exc:
++            self.fail('Color-space metadata should be recoverable: ' + str(exc))
++        self.assertTrue(result.is_file())
++        self.assertEqual(self.video.read_bytes(), before)
++        self.assertLessEqual(len(self.calls), 5)
++
++    def test_hevc_uses_its_own_metadata_filter(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            if 'hevc_metadata=matrix_coefficients=1' in cmd:
++                return self.success(cmd)
++            error = 'Codec hevc is not supported by h264_metadata' if '-bsf:v' in cmd else COLOR_ERROR
++            return SimpleNamespace(returncode=1, stderr=error)
++        try:
++            result = self.run_thumbnail(runner)
++        except preview.PreviewError as exc:
++            self.fail('HEVC color-space metadata should be recoverable: ' + str(exc))
++        self.assertTrue(result.is_file())
++
++    def test_short_video_repair_can_fall_back_to_first_frame(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            if '-bsf:v' not in cmd:
++                return SimpleNamespace(returncode=1, stderr=COLOR_ERROR)
++            if 'h264_metadata=matrix_coefficients=1' in cmd and cmd[cmd.index('-ss') + 1] == '0':
++                return self.success(cmd)
++            return SimpleNamespace(returncode=0, stderr='No frame at requested position')
++        try:
++            self.assertTrue(self.run_thumbnail(runner).is_file())
++        except preview.PreviewError as exc:
++            self.fail('Repair must try the first frame for short videos: ' + str(exc))
++
++    def test_unrecoverable_error_preserves_root_cause(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            return SimpleNamespace(returncode=1, stderr=COLOR_ERROR)
++        with self.assertRaises(preview.PreviewError) as raised:
++            self.run_thumbnail(runner)
++        self.assertIn('Invalid color space', str(raised.exception))
++        self.assertLessEqual(len(self.calls), 5)
++        self.assertFalse(list(self.cache.glob('*.jpg')))
++
++    def test_other_errors_do_not_trigger_metadata_repair(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            return SimpleNamespace(returncode=1, stderr='moov atom not found')
++        with self.assertRaises(preview.PreviewError):
++            self.run_thumbnail(runner)
++        self.assertEqual(len(self.calls), 3)
++        self.assertTrue(all('-bsf:v' not in cmd for cmd in self.calls))
++
++    def test_timeouts_stay_bounded_without_false_success(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
++        with self.assertRaises(preview.PreviewError):
++            self.run_thumbnail(runner)
++        self.assertEqual(len(self.calls), 3)
++
++    def test_successful_thumbnail_is_reused_without_another_ffmpeg_process(self):
++        def runner(cmd, **kwargs):
++            self.calls.append(cmd)
++            return self.success(cmd)
++        first = self.run_thumbnail(runner)
++        with patch.object(preview.subprocess, 'run', side_effect=AssertionError('Unexpected extra process')):
++            self.assertEqual(preview.make_video_thumbnail(self.video, self.cache), first)
++
++
++if __name__ == '__main__':
++    unittest.main()
