@@ -1,0 +1,202 @@
+--- /dev/null
++++ b/app/tests/test_bounded_history.py
+@@ -0,0 +1,199 @@
++import contextlib
++import asyncio
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_core.repositories import UploadHistory
++from tam_core.models import Account
++from batch_uploader import BatchUploaderPane
++
++
++class BoundedHistoryTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.path = self.root / 'clip.mp4'
++        self.path.write_bytes(b'video')
++        self.history = UploadHistory(self.root / 'uploads.db')
++        st = self.path.stat()
++        self.history.db.upload_record(target_key='group', fingerprint='fp',
++            path=str(self.path.resolve()), size=5, mtime_ns=st.st_mtime_ns,
++            account_user_id=1, account_label='test', message_id=1)
++
++    def check(self, paths, **kwargs):
++        return self.history.completed_paths(paths, lambda p: 'group', lambda p, fp: fp, **kwargs)
++
++    def test_history_queries_start_before_entire_input_is_materialized(self):
++        consumed, sizes = [], []
++        original = self.history.db.upload_completed_candidates
++
++        def paths():
++            for i in range(4105):
++                consumed.append(i)
++                yield self.path
++
++        def query(candidates, forum):
++            sizes.append(len(candidates))
++            self.assertLessEqual(len(candidates), 2000, 'Unbounded history query')
++            if len(sizes) == 1:
++                self.assertLessEqual(len(consumed), 2000, 'Entire input retained before first query')
++            return original(candidates, forum)
++
++        with patch.object(self.history.db, 'upload_completed_candidates', query):
++            result = self.check(paths())
++        self.assertEqual(set(result), {self.path})
++        self.assertEqual(len(consumed), 4105)
++        self.assertEqual(len(sizes), 3)
++
++    def test_stop_before_scan_does_not_touch_files_or_database(self):
++        with patch.object(self.history, '_file_signature', side_effect=AssertionError('File touched')):
++            with patch.object(self.history.db, 'connect', side_effect=AssertionError('DB touched')):
++                self.assertEqual(self.check([self.path], stopped=lambda: True), {})
++
++    def test_stop_during_metadata_scan_does_not_finish_chunk(self):
++        stop = threading.Event()
++        seen = []
++        original = self.history._file_signature
++
++        def metadata(path):
++            seen.append(path)
++            if len(seen) == 10:
++                stop.set()
++            return original(path)
++
++        with patch.object(self.history, '_file_signature', metadata):
++            self.assertEqual(self.check([self.path] * 5000, stopped=stop.is_set), {})
++        self.assertEqual(len(seen), 10)
++
++    def test_stop_after_sql_discards_partial_results_and_remaining_chunks(self):
++        stop = threading.Event()
++        original = self.history.db.upload_completed_candidates
++        queries = []
++
++        def query(*args):
++            queries.append(1)
++            result = original(*args)
++            stop.set()
++            return result
++
++        with patch.object(self.history.db, 'upload_completed_candidates', query):
++            self.assertEqual(self.check([self.path] * 4105, stopped=stop.is_set), {})
++        self.assertEqual(len(queries), 1)
++
++    def test_forum_lookup_does_not_walk_unrelated_legacy_history(self):
++        with self.history.db.session() as conn:
++            conn.executemany('INSERT INTO uploads(target_key,fingerprint,path,size,mtime_ns,account_label,completed_at) VALUES(?,?,?,?,?,?,?)',
++                [('group#topic:123', 'fp%d' % i, '/unrelated/%d.mp4' % i, 5, 1, 'test', 1)
++                 for i in range(10000)])
++        original = self.history.db.session
++
++        @contextlib.contextmanager
++        def limited_query():
++            with original() as conn:
++                # A single indexed lookup should not execute thousands of VM
++                # instructions merely because unrelated topic history exists.
++                conn.set_progress_handler(lambda: 1, 2000)
++                yield conn
++
++        with patch.object(self.history.db, 'session', limited_query):
++            result = self.history.db.upload_completed_candidates(
++                [('group#forum:missing', str(self.path), 5, 1, '', 1)], 'group')
++        self.assertEqual(result, set())
++
++    def test_legacy_topic_match_stays_scoped_and_preserves_content_guard(self):
++        st = self.path.stat()
++        self.history.db.upload_record(target_key='group#topic:7', fingerprint='old',
++            path=str(self.path), size=5, mtime_ns=st.st_mtime_ns,
++            account_user_id=1, account_label='test', message_id=2)
++        rows = [
++            ('group#forum:title', str(self.path), 5, st.st_mtime_ns, '', 1),
++            ('group#forum:title', str(self.path), 5, st.st_mtime_ns, 'old', 0),
++            ('group#forum:title', str(self.path), 5, st.st_mtime_ns, 'new', 0),
++            ('group#forum:title', str(self.path) + '.other', 5, st.st_mtime_ns, 'old', 0),
++        ]
++        self.assertEqual(self.history.db.upload_completed_candidates(rows, 'group'), {0, 1})
++        self.assertEqual(self.history.db.upload_completed_candidates(rows, 'other'), set())
++
++
++class HistoryUploaderTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        root = Path(self.tmp.name)
++        self.history = UploadHistory(root / 'uploads.db')
++        self.files = []
++        for i in range(30):
++            path = root / ('clip%02d.mp4' % i)
++            path.write_bytes(b'video')
++            self.files.append(path)
++        with self.history.db.session() as conn:
++            conn.executemany('INSERT INTO uploads(target_key,fingerprint,path,size,mtime_ns,account_label,completed_at) VALUES(?,?,?,?,?,?,?)',
++                [('group', 'fp%d' % i, str(p.resolve()), 5, p.stat().st_mtime_ns, 'test', 1)
++                 for i, p in enumerate(self.files)])
++        self.pane = pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        noop = lambda *args, **kwargs: None
++        self.rows = []
++
++        async def resolve(*args):
++            return SimpleNamespace(title='group')
++
++        pane.app = SimpleNamespace(store=SimpleNamespace(data={'upload_tasks': []}, save=noop),
++            group_state_cache=SimpleNamespace(fresh_admin_sessions=lambda *args: set()),
++            upload_history=self.history, _resolve_or_join_target=resolve,
++            _target_key=lambda entity: 'group', ui_call=lambda fn: fn(), log=noop)
++        pane._set_task_row = lambda *args, **kwargs: self.rows.append(kwargs)
++        pane._effective_task_sessions = lambda *args: ['s1']
++        pane._cache_ttl_hours = lambda: 24
++        pane.account_health, pane.task_states = {}, {}
++        pane.stop_event = threading.Event()
++        pane._emit_dashboard = pane._emit_task_metrics = noop
++        pane._scan_task_files = lambda task: (self.files, 150)
++        self.rule = {'id': 'r1', 'name': 'history', 'folder': str(root),
++                     'target': '@group', 'auto_admin': False, 'recursive': False}
++
++    async def run_task(self):
++        account = Account(session='s1', label='test', phone='', user_id=1)
++        await self.pane._run_one_task(self.rule, {'s1': (account, object())}, {'s1': False},
++            {'s1': asyncio.Lock()}, asyncio.Semaphore(1), asyncio.Semaphore(1), asyncio.Semaphore(1))
++
++    async def test_uploader_consumes_history_in_bounded_slices_without_reading_content(self):
++        sizes = []
++        original = self.history.completed_paths
++
++        def check(paths, *args, **kwargs):
++            sizes.append(len(paths))
++            self.assertLessEqual(len(paths), 8, 'Uploader retains full history result')
++            return original(paths, *args, **kwargs)
++
++        with patch('batch_uploader.HISTORY_CHECK_BATCH_SIZE', 8, create=True):
++            with patch.object(self.history, 'completed_paths', check):
++                await self.run_task()
++        self.assertEqual(sizes, [8, 8, 8, 6])
++        self.assertEqual(self.pane.task_states['r1']['skipped'], 30)
++        self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++        statuses = [row.get('status', '') for row in self.rows]
++        self.assertTrue(any('30/30' in status for status in statuses), statuses)
++        self.assertLessEqual(len(self.rows), 7, 'Per-file UI update flood')
++
++    async def test_stop_during_history_query_never_reports_all_files_completed(self):
++        original = self.history.completed_paths
++
++        def check(*args, **kwargs):
++            result = original(*args, **kwargs)
++            self.pane.stop_event.set()
++            return result
++
++        with patch.object(self.history, 'completed_paths', check):
++            await self.run_task()
++        self.assertEqual(self.pane.task_states['r1']['processed_files'], 0)
++        self.assertFalse(any(row.get('progress') == '100%' for row in self.rows), self.rows)
++        self.assertTrue(any('Останов' in row.get('status', '') for row in self.rows), self.rows)
++
++
++if __name__ == '__main__':
++    unittest.main()

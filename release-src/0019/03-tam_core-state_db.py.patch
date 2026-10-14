@@ -1,0 +1,40 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -10,7 +10,7 @@
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 11
++SCHEMA_VERSION = 12
+ 
+ 
+ class StateDatabase:
+@@ -166,6 +166,8 @@
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_uploads_exact
+                     ON uploads(target_key, path, size, mtime_ns);
++                CREATE INDEX IF NOT EXISTS idx_uploads_source
++                    ON uploads(path, size, mtime_ns, target_key, fingerprint);
+ 
+                 CREATE TABLE IF NOT EXISTS file_fingerprints (
+                     path TEXT PRIMARY KEY,
+@@ -775,13 +777,13 @@
+             )}
+             if forum_target_key is not None:
+                 prefix = f'{forum_target_key}#topic:'
+-                legacy = {(r[0], r[1], r[2], r[3]) for r in conn.execute(
+-                    'SELECT path,size,mtime_ns,fingerprint FROM uploads WHERE target_key>=? AND target_key<?',
++                result.update(row[0] for row in conn.execute(
++                    'SELECT c.rowid-1 FROM candidates c WHERE EXISTS ('
++                    'SELECT 1 FROM uploads u WHERE u.path=c.path AND u.size=c.size AND u.mtime_ns=c.mtime_ns '
++                    'AND u.target_key>=? AND u.target_key<? '
++                    "AND (c.allow_exact OR (c.fingerprint<>'' AND u.fingerprint=c.fingerprint)))",
+                     (prefix, prefix + '\uffff'),
+-                )}
+-                legacy_exact = {(p, size, mtime) for p, size, mtime, _ in legacy}
+-                result.update(i for i, (_, path, size, mtime, fp, allow_exact) in enumerate(candidates)
+-                    if (allow_exact and (path, size, mtime) in legacy_exact) or (fp and (path, size, mtime, fp) in legacy))
++                ))
+         return result
+ 
+     def upload_exact_completed(self, target_key: str, path: str, size: int, mtime_ns: int) -> bool:
