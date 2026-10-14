@@ -1,0 +1,274 @@
+--- /dev/null
++++ b/app/tests/test_premium_global_priority.py
+@@ -0,0 +1,271 @@
++import asyncio
++import threading
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_core.models import Account
++import unittest
++
++import batch_uploader as bu
++
++
++class PremiumPriorityTests(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        priority_class = getattr(bu, '_PremiumWorkPriority', None)
++        self.assertIsNotNone(priority_class, 'Shared Premium priority is required')
++        self.priority = priority_class(['first', 'later'])
++        self.stop = threading.Event()
++        self.premium = {'premium': True, 'regular': False}
++        self.jobs = []
++
++    async def asyncTearDown(self):
++        for job in self.jobs:
++            job.cancel()
++        await asyncio.gather(*self.jobs, return_exceptions=True)
++
++    def queue(self, *items):
++        result = asyncio.Queue()
++        for item in items:
++            result.put_nowait(item)
++        return result
++
++    def start(self, tid, session, small, big, gate=None, priority=True, signal=None):
++        job = asyncio.create_task(bu._next_upload_job(
++            task_id=tid, session=session, small_queue=small, big_queue=big,
++            premium_by_session=self.premium, start_after=gate,
++            priority=self.priority if priority else None,
++            stop_event=self.stop, disabled=lambda: False,
++            signal_drained=signal or (lambda: None),
++        ))
++        self.jobs.append(job)
++        return job
++
++    async def assert_waiting(self, job):
++        with self.assertRaises(asyncio.TimeoutError):
++            await asyncio.wait_for(asyncio.shield(job), timeout=0.03)
++
++    async def test_premium_waits_for_all_rule_snapshots_before_small_file(self):
++        small, big = self.queue('small'), self.queue()
++        self.priority.register('first', big, lambda session: True)
++        job = self.start('first', 'premium', small, big)
++        await self.assert_waiting(job)
++        self.priority.finish('later')  # An empty/failed preparation releases the barrier.
++        self.assertEqual(await asyncio.wait_for(job, 1), 'small')
++
++    async def test_premium_takes_big_from_later_rule_before_first_rule_small(self):
++        first_small, first_big = self.queue('small'), self.queue()
++        later_small, later_big = self.queue('later-small'), self.queue('big')
++        self.priority.register('first', first_big, lambda session: True)
++        self.priority.register('later', later_big, lambda session: True)
++        first = self.start('first', 'premium', first_small, first_big)
++        await self.assert_waiting(first)
++        gate = asyncio.Event()  # Earlier ordinary work has not drained.
++        later = self.start('later', 'premium', later_small, later_big, gate)
++        self.assertEqual(await asyncio.wait_for(later, 1), 'big')
++        self.assertFalse(gate.is_set())
++        self.assertEqual(await asyncio.wait_for(first, 1), 'small')
++
++    async def test_regular_account_keeps_order_and_never_claims_big(self):
++        gate = asyncio.Event()
++        small, big = self.queue('small'), self.queue('big')
++        self.priority.register('first', self.queue(), lambda session: True)
++        self.priority.register('later', big, lambda session: True)
++        job = self.start('later', 'regular', small, big, gate)
++        await self.assert_waiting(job)
++        self.assertEqual(big.qsize(), 1)
++        gate.set()
++        self.assertEqual(await asyncio.wait_for(job, 1), 'small')
++        self.assertEqual(big.qsize(), 1)
++
++    async def test_premium_returns_to_small_files_after_big_queue_drains(self):
++        small, big = self.queue('small'), self.queue('big')
++        self.priority.register('first', big, lambda session: True)
++        self.priority.finish('later')
++        self.assertEqual(await self.start('first', 'premium', small, big), 'big')
++        self.assertEqual(await self.start('first', 'premium', small, big), 'small')
++
++    async def test_inaccessible_or_paused_big_rule_does_not_block_small(self):
++        small, big = self.queue('small'), self.queue('inaccessible-big')
++        self.priority.register('first', self.queue(), lambda session: True)
++        self.priority.register('later', big, lambda session: False)
++        self.assertEqual(await self.start('first', 'premium', small, self.queue()), 'small')
++        self.assertEqual(big.qsize(), 1)
++
++    async def test_stop_while_waiting_keeps_small_file_queued(self):
++        small, big = self.queue('small'), self.queue()
++        self.priority.register('first', big, lambda session: True)
++        job = self.start('first', 'premium', small, big)
++        await self.assert_waiting(job)
++        self.stop.set()
++        self.assertIsNone(await asyncio.wait_for(job, 1))
++        self.assertEqual(small.qsize(), 1)
++
++    async def test_finished_task_releases_its_unavailable_big_queue(self):
++        small, big = self.queue('small'), self.queue('abandoned-big')
++        self.priority.register('first', self.queue(), lambda session: True)
++        self.priority.register('later', big, lambda session: True)
++        job = self.start('first', 'premium', small, self.queue())
++        await self.assert_waiting(job)
++        self.priority.finish('later')
++        self.assertEqual(await asyncio.wait_for(job, 1), 'small')
++
++    async def test_empty_middle_rule_releases_regular_work_while_premium_uploads(self):
++        prior_drained, middle_drained = asyncio.Event(), asyncio.Event()
++        middle_small, middle_big = self.queue(), self.queue('big')
++
++        def release_middle():
++            if prior_drained.is_set() and middle_small.empty():
++                middle_drained.set()
++
++        self.priority.register('first', middle_big, lambda session: True, release_middle)
++        self.priority.register('later', self.queue(), lambda session: True)
++        # Premium is now uploading; no further jobs will be requested from middle.
++        middle_big.get_nowait()
++        job = self.start('later', 'regular', self.queue('small'), self.queue(), middle_drained)
++        await self.assert_waiting(job)
++        prior_drained.set()
++        self.assertEqual(await asyncio.wait_for(job, 1), 'small')
++
++    async def test_single_rule_premium_still_prefers_big(self):
++        small, big = self.queue('small'), self.queue('big')
++        self.assertEqual(await self.start('first', 'premium', small, big, priority=False), 'big')
++
++
++class PremiumPriorityUploadTests(unittest.IsolatedAsyncioTestCase):
++    async def exercise_uploads(self, hot_add, activation_failure=False):
++        def noop(*args, **kwargs):
++            pass
++
++        pane = bu.BatchUploaderPane.__new__(bu.BatchUploaderPane)
++        regular_started, release_regular = asyncio.Event(), asyncio.Event()
++        premium_sent = asyncio.Event()
++        later_activation, release_activation = asyncio.Event(), asyncio.Event()
++        sent = []
++        premium_flags = {'regular': False}
++        if not hot_add:
++            premium_flags['premium'] = True
++
++        class Client:
++            def __init__(self, session):
++                self.session = session
++
++            async def send_file(self, entity, path, **kwargs):
++                sent.append((self.session, Path(path).name))
++                if self.session == 'regular':
++                    regular_started.set()
++                    await release_regular.wait()
++                else:
++                    premium_sent.set()
++                return SimpleNamespace(id=len(sent))
++
++        async def resolve(client, target, join):
++            if hot_add and client.session == 'premium' and target == 'later':
++                later_activation.set()
++                await release_activation.wait()
++                if activation_failure:
++                    raise RuntimeError('Target unavailable for this account')
++            return SimpleNamespace(title=target)
++
++        async def open_gate(*args):
++            return True
++
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            small = []
++            for n in range(10):
++                path = root / ('small%d.mp4' % n)
++                path.write_bytes(b's')
++                small.append(path)
++            big = root / 'large.mp4'
++            big.write_bytes(b'big')
++            rules = [{'id': tid, 'name': tid, 'target': tid, 'folder': td,
++                      'auto_admin': False, 'video_preview_mode': 'off', 'delay': 0,
++                      'monitor_folder': True} for tid in ('first', 'later')]
++            pane.app = SimpleNamespace(
++                store=SimpleNamespace(data={'upload_tasks': []}, save=noop),
++                group_state_cache=SimpleNamespace(fresh_admin_sessions=lambda *args: set()),
++                upload_history=SimpleNamespace(exact_completed=lambda *args: False,
++                    claim_fingerprint=lambda *args: 'reserved',
++                    release_fingerprint_reservation=lambda *args: True, record_completed=noop),
++                safety_policy=lambda: {'enabled': False}, account_usage_allows=lambda *args: True,
++                _resolve_or_join_target=resolve, _target_key=lambda entity: entity.title,
++                _quick_fingerprint=str, ui_call=noop, log=noop, refresh_safety_health_table=noop,
++                record_upload_error=noop, _friendly_error=str,
++                _is_retryable_upload_error=lambda *args: False,
++            )
++            pane._scan_task_files = lambda task: (small, len(small)) if task['id'] == 'first' else ([big], 3)
++            pane._cache_ttl_hours = lambda: 24
++            pane.account_health, pane.task_states = {}, {}
++            pane._live_task_lock = threading.RLock()
++            pane.live_tasks = {rule['id']: dict(rule) for rule in rules}
++            pane.dedup_run_token = 'test'
++            pane.stop_event = threading.Event()
++            pane._emit_dashboard = pane._emit_task_metrics = noop
++            pane._wait_gate = open_gate
++            pane.task_pause_events = {}
++            for rule in rules:
++                event = threading.Event()
++                event.set()
++                pane.task_pause_events[rule['id']] = event
++            clients = {session: (Account(session=session, label=session, phone='', user_id=i), Client(session))
++                       for i, session in enumerate(premium_flags, 1)}
++            locks = {session: asyncio.Lock() for session in clients}
++            priority = bu._PremiumWorkPriority(['first', 'later'])
++            first_drained, later_drained = asyncio.Event(), asyncio.Event()
++            global_sem, preview_sem, scan_sem = asyncio.Semaphore(2), asyncio.Semaphore(1), asyncio.Semaphore(2)
++
++            async def run(rule, start_after, drained):
++                try:
++                    await pane._run_one_task(rule, clients, premium_flags, locks, global_sem, preview_sem, scan_sem,
++                                             start_after=start_after, drained_event=drained, premium_priority=priority)
++                finally:
++                    priority.finish(rule['id'])
++                    drained.set()
++
++            running = [asyncio.create_task(run(rules[0], None, first_drained)),
++                       asyncio.create_task(run(rules[1], first_drained, later_drained))]
++            with patch.object(bu, 'TELEGRAM_DEFAULT_PARTS_LIMIT', 2), patch.object(bu, 'TELEGRAM_PREMIUM_PARTS_LIMIT', 4):
++                try:
++                    await asyncio.wait_for(regular_started.wait(), 3)
++                    if hot_add:
++                        premium_flags['premium'] = True
++                        clients['premium'] = (Account(session='premium', label='premium', phone='', user_id=2), Client('premium'))
++                        locks['premium'] = asyncio.Lock()
++                        await asyncio.wait_for(later_activation.wait(), 3)
++                        with self.assertRaises(asyncio.TimeoutError):
++                            await asyncio.wait_for(premium_sent.wait(), 0.05)
++                        release_activation.set()
++                    await asyncio.wait_for(premium_sent.wait(), 3)
++                    expected = 'small1.mp4' if activation_failure else 'large.mp4'
++                    self.assertEqual(next(name for session, name in sent if session == 'premium'), expected)
++                    self.assertFalse(first_drained.is_set(), 'ordinary first-rule files must still be pending')
++                    release_regular.set()
++                    await asyncio.wait_for(asyncio.gather(*running), 5)
++                    self.assertEqual(pane.task_states['later']['success'], 0 if activation_failure else 1)
++                    self.assertEqual(pane.task_states['first']['success'], len(small))
++                finally:
++                    release_activation.set()
++                    release_regular.set()
++                    pane.stop_event.set()
++                    for job in running:
++                        if not job.done():
++                            job.cancel()
++                    results = await asyncio.gather(*running, return_exceptions=True)
++                    for result in results:
++                        if isinstance(result, Exception):
++                            raise result
++
++    async def test_real_workers_send_later_big_file_before_first_rule_drains(self):
++        await self.exercise_uploads(hot_add=False)
++
++    async def test_hot_added_premium_waits_for_later_big_target_activation(self):
++        await self.exercise_uploads(hot_add=True)
++
++    async def test_failed_hot_target_activation_releases_premium_to_small_files(self):
++        await self.exercise_uploads(hot_add=True, activation_failure=True)
++
++
++if __name__ == '__main__':
++    unittest.main()
