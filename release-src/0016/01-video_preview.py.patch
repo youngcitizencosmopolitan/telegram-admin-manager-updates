@@ -1,0 +1,83 @@
+--- a/app/video_preview.py
++++ b/app/video_preview.py
+@@ -3,6 +3,7 @@
+ import hashlib
+ import shutil
+ import subprocess
++from collections import deque
+ from pathlib import Path
+ 
+ try:
+@@ -99,15 +100,23 @@
+ 
+     # First try a frame one second in so black opening frames are less likely.
+     # For very short/corrupt files, retry from the first frame.
+-    attempts = ("1.0", "0.05", "0")
++    attempts = deque((seek, None) for seek in ("1.0", "0.05", "0"))
+     last_error = ""
+-    for seek in attempts:
++    color_error = ""
++    while attempts:
++        seek, metadata_filter = attempts.popleft()
+         cmd = [
+             ffmpeg,
+             "-hide_banner",
+             "-loglevel", "error",
+             "-y",
+             "-ss", seek,
++        ]
++        if metadata_filter is not None:
++            # Repair only the decoder's input metadata. The source file is
++            # opened read-only and only the thumbnail is written.
++            cmd.extend(["-bsf:v", metadata_filter])
++        cmd.extend([
+             "-i", str(video),
+             "-an",
+             "-sn",
+@@ -116,13 +125,15 @@
+             "-vf", f"scale={MAX_THUMB_SIDE}:{MAX_THUMB_SIDE}:force_original_aspect_ratio=decrease",
+             "-q:v", "4",
+             str(tmp),
+-        ]
++        ])
+         try:
+             proc = subprocess.run(
+                 cmd,
+                 stdout=subprocess.DEVNULL,
+                 stderr=subprocess.PIPE,
+                 text=True,
++                encoding="utf-8",
++                errors="replace",
+                 timeout=45,
+                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+             )
+@@ -130,7 +141,19 @@
+                 _compress_jpeg(tmp)
+                 tmp.replace(out)
+                 return out
+-            last_error = (proc.stderr or "").strip().splitlines()[-1] if proc.stderr else "FFmpeg не извлёк кадр"
++            lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
++            last_error = "; ".join(lines[:3])[:1200] if lines else "FFmpeg не извлёк кадр"
++            if not color_error and "invalid color space" in (proc.stderr or "").casefold():
++                color_error = last_error
++                # FFmpeg 7 rejects reserved color matrices before video filters
++                # can run. Fix the H.264/HEVC headers before the decoder instead.
++                # The codec-specific filter rejects other codecs without altering
++                # their input. Retry at 1s and at the first frame for short clips.
++                attempts.clear()
++                attempts.extend(
++                    (position, codec + "_metadata=matrix_coefficients=1")
++                    for position in ("1.0", "0") for codec in ("h264", "hevc")
++                )
+         except subprocess.TimeoutExpired:
+             last_error = "FFmpeg превысил время ожидания"
+         except Exception as exc:
+@@ -141,4 +164,7 @@
+         except OSError:
+             pass
+ 
+-    raise PreviewError(f"не удалось создать превью для {video.name}: {last_error or 'нет видеокадра'}")
++    detail = color_error or last_error or "нет видеокадра"
++    if color_error and last_error and last_error != color_error:
++        detail += f"; восстановление превью: {last_error}"
++    raise PreviewError(f"не удалось создать превью для {video.name}: {detail}")
