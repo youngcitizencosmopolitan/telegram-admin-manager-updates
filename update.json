@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0020",
-  "display_version": "0020",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0020/TelegramAdminManager_v0020_update.zip",
-  "sha256": "436b4d2f1e52de3da10ee3c2ee95ccc48a83bf9283388a6de1b143b1c1d80fce",
-  "notes": "0020: monitoring queues changed files after the initial full baseline, with epoch/identity validation and successful-batch cutoff acknowledgments that preserve failed work and later arrivals. Unchanged polls reuse membership and do not reread the full seen-file table; SQLite receives only membership additions/deletions. Directory reconciliation and notification bursts run in bounded steps, with staggered periodic checks, watcher-failure fallback and directory-handle cleanup. Manual, restored/stale and incompatible selections retain complete scans. GUI progress is coalesced per row/component every 500 ms; partial task fields merge and final activity values are frozen. Live numbered captions resolve full-catalog numbering from cached path references. Existing upload-history, preview, source mutation, topic, account and Premium policies remain. Includes 31 new regression tests; 330 tests pass locally with application dependencies."
+  "version": "4.3.8.0021",
+  "display_version": "0021",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0021/TelegramAdminManager_v0021_update.zip",
+  "sha256": "d1879073a69b686553c98523a0ae3498737124dd2f049d33c3b601c7098d85cf",
+  "notes": "0021: interrupted uploads from previous runs appear as unconfirmed sends instead of completed duplicates. Scoped, explicitly confirmed recovery protects completed history and current claims, and queues a durable retry after any active batch. Monitoring keeps pending signatures for occupied rules and stops repeated unchanged submissions and false queue messages. Blocked progress cannot show 100%; account selection and Premium large-file priority remain unchanged. Includes 13 regression tests; 343 tests pass with application dependencies."
 }
