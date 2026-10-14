@@ -1,0 +1,349 @@
+--- /dev/null
++++ b/app/tests/test_file_index_performance.py
+@@ -0,0 +1,346 @@
++import asyncio
++import os
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from batch_uploader import BatchUploaderPane, _dedup_fingerprint_for_upload
++from tam_core.repositories import UploadHistory
++from tam_core.models import Account
++from tam_core.state_db import StateDatabase
++
++
++class FileIndexTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.history = UploadHistory(self.root / 'uploads.db')
++        self.video = self.root / 'video.mp4'
++        self.video.write_bytes(b'video')
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def fingerprint(self, path=None, reader=None):
++        self.assertTrue(callable(getattr(self.history, 'cached_fingerprint', None)),
++                        'Persistent file fingerprints are missing')
++        return self.history.cached_fingerprint(path or self.video, reader or (lambda p: p.read_bytes().hex()))
++
++    def completed(self, files=None, target='channel', recursive=False, forum=None):
++        self.assertTrue(callable(getattr(self.history, 'completed_paths', None)),
++                        'Batched history filtering is missing')
++        task = {'recursive': recursive}
++        return set(self.history.completed_paths(
++            files or [self.video], lambda p: target,
++            lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
++            forum_target_key=forum))
++
++    def record(self, path, fingerprint, target='channel'):
++        st = path.stat()
++        self.history.db.upload_record(target_key=target, fingerprint=fingerprint,
++            path=str(path.resolve()), size=st.st_size, mtime_ns=st.st_mtime_ns,
++            account_user_id=1, account_label='test', message_id=10)
++
++    def test_persistent_fingerprint_does_not_read_unchanged_file_after_restart(self):
++        calls = []
++        self.assertEqual(self.fingerprint(reader=lambda p: calls.append(p) or 'fp'), 'fp')
++        self.history = UploadHistory(self.root / 'uploads.db')
++        self.assertEqual(self.fingerprint(reader=lambda p: self.fail('Read unchanged video')), 'fp')
++        self.assertEqual(len(calls), 1)
++
++    def test_size_or_timestamp_change_recomputes_fingerprint(self):
++        self.fingerprint(reader=lambda p: 'before')
++        self.video.write_bytes(b'changed video')
++        self.assertEqual(self.fingerprint(reader=lambda p: 'after'), 'after')
++        st = self.video.stat()
++        os.utime(self.video, ns=(st.st_atime_ns, st.st_mtime_ns + 1000000000))
++        self.assertEqual(self.fingerprint(reader=lambda p: 'after-mtime'), 'after-mtime')
++
++    def test_same_size_edit_with_restored_mtime_recomputes_fingerprint(self):
++        self.fingerprint(reader=lambda p: 'old-content')
++        st = self.video.stat()
++        self.video.write_bytes(b'other')
++        os.utime(self.video, ns=(st.st_atime_ns, st.st_mtime_ns))
++        self.assertEqual(self.fingerprint(reader=lambda p: 'new-content'), 'new-content')
++
++    def test_mutation_during_read_is_not_cached(self):
++        def mutate(path):
++            path.write_bytes(b'changed while reading')
++            return 'unstable'
++        with self.assertRaises(OSError):
++            self.fingerprint(reader=mutate)
++        self.assertEqual(self.fingerprint(reader=lambda p: 'stable'), 'stable')
++
++    def test_failed_reader_does_not_poison_cache(self):
++        def fail(path):
++            raise OSError('unreadable')
++        with self.assertRaises(OSError):
++            self.fingerprint(reader=fail)
++        self.assertEqual(self.fingerprint(reader=lambda p: 'recovered'), 'recovered')
++
++    def test_unknown_change_token_disables_fingerprint_reuse(self):
++        calls = []
++        with patch('tam_core.repositories.change_token', return_value=None):
++            self.fingerprint(reader=lambda p: calls.append(p) or 'content')
++            self.fingerprint(reader=lambda p: calls.append(p) or 'content')
++        self.assertEqual(len(calls), 2)
++
++    def test_schema_upgrade_keeps_existing_upload_history(self):
++        self.record(self.video, 'content')
++        with self.history.db.session() as conn:
++            conn.execute('DROP TABLE file_fingerprints')
++        self.history.db = StateDatabase(self.history.db.path)
++        self.assertTrue(self.history.exact_completed(self.video, 'channel'))
++        self.assertEqual(self.fingerprint(reader=lambda p: 'content'), 'content')
++
++    def test_known_duplicate_is_filtered_without_recording_false_upload(self):
++        self.fingerprint(reader=lambda p: 'content')
++        original = self.root / 'original.mp4'
++        original.write_bytes(b'video')
++        self.record(original, 'content')
++        self.assertEqual(self.completed(), {self.video})
++        self.assertFalse(self.history.exact_completed(self.video, 'channel'))
++        self.assertEqual(self.completed(target='other-channel'), set())
++
++    def test_unchanged_exact_upload_is_filtered_without_fingerprint(self):
++        self.record(self.video, 'uncached-content')
++        self.assertEqual(self.completed(), {self.video})
++
++    def test_changed_duplicate_is_not_filtered(self):
++        self.fingerprint(reader=lambda p: 'content')
++        original = self.root / 'original.mp4'
++        original.write_bytes(b'video')
++        self.record(original, 'content')
++        self.video.write_bytes(b'a changed file')
++        self.assertEqual(self.completed(), set())
++
++    def test_recursive_flat_mode_preserves_separate_source_items(self):
++        self.fingerprint(reader=lambda p: 'content')
++        original = self.root / 'original.mp4'
++        original.write_bytes(b'video')
++        self.record(original, _dedup_fingerprint_for_upload({'recursive': True}, original, 'content'))
++        self.assertEqual(self.completed(recursive=True), set())
++
++    def test_forum_legacy_history_is_respected(self):
++        self.record(self.video, 'content', 'channel#topic:123')
++        self.assertEqual(self.completed(target='channel#forum:title', forum='channel'), {self.video})
++        self.assertEqual(self.completed(target='other#forum:title', forum='other'), set())
++
++    def test_reservations_are_not_cached_as_completed_uploads(self):
++        self.fingerprint(reader=lambda p: 'content')
++        self.history.claim_fingerprint('content', 'channel', self.video, 'old-run', 'claim')
++        self.assertEqual(self.completed(), set())
++        self.history.release_fingerprint_reservation('content', 'channel', 'claim')
++        self.assertEqual(self.completed(), set())
++
++    def test_clearing_history_releases_cached_duplicate(self):
++        self.fingerprint(reader=lambda p: 'content')
++        self.record(self.video, 'content')
++        self.assertEqual(self.completed(), {self.video})
++        with self.history.db.session() as conn:
++            conn.execute('DELETE FROM uploads')
++        self.assertEqual(self.completed(), set())
++
++    def test_resolved_alias_in_another_topic_is_not_skipped(self):
++        alias = self.root / 'alias.mp4'
++        alias.write_bytes(b'video')
++        self.record(self.video, 'content', 'topic-a')
++        original = self.history._file_signature
++
++        def signature(path):
++            # Model two symlinks resolving to one source in different topics.
++            return original(self.video)
++
++        self.assertTrue(callable(getattr(self.history, 'completed_paths', None)))
++        with patch.object(self.history, '_file_signature', signature):
++            completed = self.history.completed_paths([self.video, alias],
++                lambda p: 'topic-a' if p == self.video else 'topic-b', lambda p, fp: fp)
++        self.assertEqual(set(completed), {self.video})
++
++    def test_file_changed_during_bulk_query_is_not_skipped(self):
++        self.record(self.video, 'content')
++        original = self.history.db.upload_completed_candidates if hasattr(self.history.db, 'upload_completed_candidates') else None
++        self.assertTrue(callable(original))
++
++        def mutate(*args):
++            completed = original(*args)
++            self.video.write_bytes(b'changed during query')
++            return completed
++
++        with patch.object(self.history.db, 'upload_completed_candidates', mutate):
++            self.assertEqual(self.completed(), set())
++
++    def test_large_batch_uses_constant_number_of_connections(self):
++        files = []
++        for i in range(1200):
++            path = self.root / ('%04d.mp4' % i)
++            path.write_bytes(b'x')
++            files.append(path)
++        self.record(files[0], 'first')
++        with patch.object(self.history.db, 'connect', wraps=self.history.db.connect) as connect:
++            self.assertEqual(self.completed(files), {files[0]})
++        self.assertLessEqual(connect.call_count, 3)
++
++    def test_filter_runs_off_async_loop(self):
++        async def exercise():
++            owner = threading.get_ident()
++            seen = []
++            def target(path):
++                seen.append(threading.get_ident())
++                return 'channel'
++            await asyncio.to_thread(self.history.completed_paths, [self.video], target, lambda p, fp: fp)
++            self.assertTrue(seen)
++            self.assertTrue(all(t != owner for t in seen))
++        self.assertTrue(callable(getattr(self.history, 'completed_paths', None)), 'Missing background batch API')
++        asyncio.run(exercise())
++
++
++class ScanLimitTests(unittest.TestCase):
++    def test_preflight_scans_off_ui_thread_and_delivers_dialog_on_ui_queue(self):
++        owner = threading.get_ident()
++        threads, callbacks = [], []
++        finished = threading.Event()
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.monitor_rules = lambda: [{'id': 'r1', 'monitor_folder': True, 'target': ''}]
++        pane._monitor_selected_tid = lambda: None
++
++        def scan(*args, **kwargs):
++            threads.append(threading.get_ident())
++            return [], 0
++
++        def enqueue(fn):
++            callbacks.append(fn)
++            if len(callbacks) == 2:
++                finished.set()
++
++        pane._scan_task_files = scan
++        pane.app = SimpleNamespace(store=SimpleNamespace(accounts=lambda: []),
++            account_usage=lambda session: {}, account_is_restricted=lambda session: False,
++            log=lambda text: None, ui_call=enqueue)
++        with patch('batch_uploader.messagebox.showinfo') as dialog:
++            pane.run_preflight()
++            self.assertTrue(finished.wait(2), 'Preflight did not queue result and completion')
++            self.assertTrue(threads)
++            self.assertTrue(all(t != owner for t in threads), 'Preflight blocked the UI thread')
++            self.assertFalse(dialog.called)
++            for fn in callbacks:
++                fn()
++            dialog.assert_called_once()
++        self.assertFalse(pane._preflight_running)
++
++    def test_oversized_files_are_excluded_before_queue_and_return_when_shrunk(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'large.mp4'
++            path.write_bytes(b'12345')
++            pane = BatchUploaderPane.__new__(BatchUploaderPane)
++            task = {'folder': td, 'recursive': True}
++            with patch('batch_uploader.TELEGRAM_PREMIUM_PARTS_LIMIT', 4):
++                self.assertEqual(pane._scan_task_files(task), ([], 0))
++                self.assertEqual(pane._scan_monitor_snapshot(task)[1], set())
++                path.write_bytes(b'123')
++                self.assertEqual(pane._scan_task_files(task), ([path], 3))
++                self.assertEqual(pane._scan_monitor_snapshot(task)[1], {'large.mp4'})
++
++    def test_preflight_can_still_report_oversized_files(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'large.mp4'
++            path.write_bytes(b'12345')
++            pane = BatchUploaderPane.__new__(BatchUploaderPane)
++            with patch('batch_uploader.TELEGRAM_PREMIUM_PARTS_LIMIT', 4):
++                self.assertEqual(pane._scan_task_files({'folder': td}, include_oversized=True), ([path], 5))
++
++
++class UploadIndexBoundaryTests(unittest.IsolatedAsyncioTestCase):
++    async def test_repeat_pass_skips_known_duplicates_without_reads_sends_or_ui_flood(self):
++        with tempfile.TemporaryDirectory() as td:
++            root = Path(td)
++            for i in range(40):
++                (root / ('copy%03d.mp4' % i)).write_bytes(b'same video')
++            history = UploadHistory(root / 'uploads.db')
++            pane = BatchUploaderPane.__new__(BatchUploaderPane)
++            noop = lambda *args, **kwargs: None
++            ui_calls, reads, sends = [], [], []
++            owner = threading.get_ident()
++
++            async def resolve(*args):
++                return SimpleNamespace(title='group')
++
++            async def open_gate(*args):
++                return True
++
++            class Client:
++                async def send_file(self, entity, path, **kwargs):
++                    sends.append(path)
++                    return SimpleNamespace(id=len(sends))
++
++            def read(path):
++                self.assertNotEqual(threading.get_ident(), owner)
++                reads.append(path)
++                return path.read_bytes().hex()
++
++            rule = {'id': 'r1', 'name': 'index', 'folder': td, 'target': '@group',
++                    'recursive': False, 'auto_admin': False, 'video_preview_mode': 'off'}
++            pane.app = SimpleNamespace(
++                store=SimpleNamespace(data={'upload_tasks': []}, save=noop),
++                group_state_cache=SimpleNamespace(fresh_admin_sessions=lambda *args: set()),
++                upload_history=history, safety_policy=lambda: {'enabled': False},
++                account_usage_allows=lambda *args: True, _resolve_or_join_target=resolve,
++                _target_key=lambda entity: 'group', _quick_fingerprint=read,
++                ui_call=lambda fn: ui_calls.append(fn), log=noop,
++                refresh_safety_health_table=noop, record_upload_error=noop,
++                _friendly_error=str, _is_retryable_upload_error=lambda *args: False)
++            pane._effective_task_sessions = lambda *args: ['s1']
++            pane._cache_ttl_hours = lambda: 24
++            pane.account_health, pane.task_states = {}, {}
++            pane._live_task_lock = threading.RLock()
++            pane.live_tasks = {'r1': dict(rule)}
++            pane.dedup_run_token = 'test'
++            pane.stop_event = threading.Event()
++            pane._emit_dashboard = pane._emit_task_metrics = noop
++            pane._wait_gate = open_gate
++            pane.task_pause_events = {}
++            account = Account(session='s1', label='test', phone='', user_id=1)
++
++            async def run():
++                await pane._run_one_task(dict(rule), {'s1': (account, Client())}, {'s1': False},
++                    {'s1': asyncio.Lock()}, asyncio.Semaphore(1), asyncio.Semaphore(1), asyncio.Semaphore(1))
++
++            await run()
++            self.assertEqual(len(sends), 1)
++            self.assertEqual(len(reads), 40)
++            self.assertEqual(pane.task_states['r1']['failed'], 0)
++            reads.clear()
++            sends.clear()
++            ui_calls.clear()
++            # Reopen the facade, just like a program restart.
++            pane.app.upload_history = UploadHistory(root / 'uploads.db')
++            with patch.object(pane.app.upload_history.db, 'connect', wraps=pane.app.upload_history.db.connect) as connect:
++                await run()
++            self.assertEqual(reads, [])
++            self.assertEqual(sends, [])
++            self.assertEqual(pane.task_states['r1']['skipped'], 40)
++            self.assertLessEqual(connect.call_count, 3)
++            self.assertLessEqual(len(ui_calls), 5)
++
++            # A file can change after the batch query returned its snapshot.
++            # The uploader must compare it with the stat at the skip boundary.
++            first = root / 'copy000.mp4'
++            original_check = pane.app.upload_history.completed_paths
++
++            def mutate_after_check(*args, **kwargs):
++                checked = original_check(*args, **kwargs)
++                first.write_bytes(b'a new version of the video')
++                return checked
++
++            with patch.object(pane.app.upload_history, 'completed_paths', mutate_after_check):
++                await run()
++            self.assertEqual(reads, [first])
++            self.assertEqual(sends, [str(first)])
++            self.assertEqual(pane.task_states['r1']['failed'], 0)
++
++
++if __name__ == '__main__':
++    unittest.main()

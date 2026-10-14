@@ -1,0 +1,67 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -9,6 +9,7 @@
+ from .defaults import DEFAULT_CONFIG
+ from .models import Account
+ from .state_db import StateDatabase
++from .file_metadata import change_token, stat_identity
+ 
+ 
+ class ConfigStore:
+@@ -71,6 +72,56 @@
+     def _stat(path: Path) -> tuple[str, int, int]:
+         st = path.stat()
+         return str(path.resolve()), int(st.st_size), int(st.st_mtime_ns)
++
++    @staticmethod
++    def _file_signature(path: Path) -> tuple[str, Any, str]:
++        st = path.stat()
++        token = change_token(path, st)
++        # If the filesystem cannot supply a change token, use the normal reader
++        # instead of trusting a potentially stale persistent fingerprint.
++        signature = json.dumps([2, *stat_identity(st), token]) if token is not None else ''
++        return str(path.resolve()), st, signature
++
++    def cached_fingerprint(self, path: Path, reader) -> str:
++        norm, _st, signature = self._file_signature(path)
++        row = self.db.file_fingerprints_get([norm]).get(norm)
++        if signature and row and row[0] == signature and row[1]:
++            return row[1]
++        fingerprint = reader(path)
++        after_norm, after_st, after_signature = self._file_signature(path)
++        if (after_norm, stat_identity(after_st), after_signature) != (norm, stat_identity(_st), signature):
++            raise OSError('File changed while checking its fingerprint')
++        if signature:
++            self.db.file_fingerprint_put(norm, signature, fingerprint)
++        return fingerprint
++
++    def completed_paths(self, paths: list[Path], target_key_for_path, fingerprint_key_for_path,
++                        *, forum_target_key: str | None = None) -> dict[Path, tuple[int, ...]]:
++        """Metadata-only warm scan. Never turn reservations into successful uploads."""
++        files = []
++        for path in paths:
++            try:
++                norm, st, signature = self._file_signature(path)
++                files.append((path, norm, st, signature))
++            except OSError:
++                continue
++        cached = self.db.file_fingerprints_get([item[1] for item in files])
++        candidates = []
++        for path, norm, st, signature in files:
++            row = cached.get(norm)
++            fingerprint = fingerprint_key_for_path(path, row[1]) if signature and row and row[0] == signature and row[1] else ''
++            candidates.append((target_key_for_path(path), norm, st.st_size, st.st_mtime_ns, fingerprint))
++        completed = self.db.upload_completed_candidates(candidates, forum_target_key)
++        result = {}
++        for i in completed:
++            path, norm, st, signature = files[i]
++            try:
++                current_norm, current_st, current_signature = self._file_signature(path)
++                if (current_norm, stat_identity(current_st), current_signature) == (norm, stat_identity(st), signature):
++                    result[path] = stat_identity(current_st)
++            except OSError:
++                continue
++        return result
+ 
+     def exact_completed(self, path: Path, target_key: str) -> bool:
+         try:

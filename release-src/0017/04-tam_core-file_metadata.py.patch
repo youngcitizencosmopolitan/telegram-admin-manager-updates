@@ -1,0 +1,53 @@
+--- /dev/null
++++ b/app/tam_core/file_metadata.py
+@@ -0,0 +1,50 @@
++"""Cheap change tokens for persistent file fingerprints; never read media data."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++if os.name == 'nt':
++    import ctypes
++    from ctypes import wintypes
++
++    class _FileBasicInfo(ctypes.Structure):
++        _fields_ = [('CreationTime', ctypes.c_longlong), ('LastAccessTime', ctypes.c_longlong),
++                    ('LastWriteTime', ctypes.c_longlong), ('ChangeTime', ctypes.c_longlong),
++                    ('FileAttributes', wintypes.DWORD)]
++
++    _kernel = ctypes.WinDLL('kernel32', use_last_error=True)
++    _create = _kernel.CreateFileW
++    _create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
++                        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
++    _create.restype = wintypes.HANDLE
++    _info = _kernel.GetFileInformationByHandleEx
++    _info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
++    _info.restype = wintypes.BOOL
++    _close = _kernel.CloseHandle
++    _close.argtypes = [wintypes.HANDLE]
++    _close.restype = wintypes.BOOL
++
++
++def change_token(path: Path, stat) -> int | None:
++    if os.name != 'nt':
++        return stat.st_ctime_ns
++    # Python's Windows st_ctime is creation time, not the NTFS change time.
++    # Query FILE_BASIC_INFO with attribute-only access and unrestricted sharing.
++    name = str(path.resolve())
++    if not name.startswith('\\\\?\\'):
++        name = '\\\\?\\UNC\\' + name[2:] if name.startswith('\\\\') else '\\\\?\\' + name
++    handle = _create(name, 0x80, 0x7, None, 3, 0, None)
++    if handle in (None, ctypes.c_void_p(-1).value):
++        return None
++    try:
++        info = _FileBasicInfo()
++        if _info(handle, 0, ctypes.byref(info), ctypes.sizeof(info)) and info.ChangeTime > 0:
++            return int(info.ChangeTime)
++        return None
++    finally:
++        _close(handle)
++
++
++def stat_identity(stat) -> tuple[int, ...]:
++    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino)

@@ -1,12 +1,15 @@
 {
-  "version": "0016",
-  "base_version": "0015",
-  "manifest_version": "4.3.8.0016",
-  "display_version": "0016",
+  "version": "0017",
+  "base_version": "0016",
+  "manifest_version": "4.3.8.0017",
+  "display_version": "0017",
   "patch_files": [
-    "release-src/0016/01-video_preview.py.patch",
-    "release-src/0016/02-telegram_admin_manager.py.patch",
-    "release-src/0016/03-tests-test_video_preview_colorspace.py.patch"
+    "release-src/0017/01-batch_uploader.py.patch",
+    "release-src/0017/02-tam_core-repositories.py.patch",
+    "release-src/0017/03-tam_core-state_db.py.patch",
+    "release-src/0017/04-tam_core-file_metadata.py.patch",
+    "release-src/0017/05-telegram_admin_manager.py.patch",
+    "release-src/0017/06-tests-test_file_index_performance.py.patch"
   ],
-  "notes": "0016: fixes thumbnail extraction for H.264/HEVC videos with invalid color-space metadata rejected by FFmpeg 7. On that specific error, a bounded input-bitstream metadata fallback creates a standard JPEG without modifying the source video. Ordinary extraction, thumbnail caching and required-preview policy are preserved. Errors now retain the original FFmpeg cause instead of only the final empty-output message. Includes eight regression tests."
+  "notes": "0017: speeds up repeated monitoring scans with persistent file fingerprints and batched indexed upload-history checks. Unchanged known duplicates are skipped without reading media or flooding the activity UI. Oversized files are excluded before upload queues; Preflight can still report them and now runs in the background. Windows ChangeTime and file identity invalidate cached fingerprints after edits/replacement; files are revalidated around batch queries and at the skip boundary. Group/topic and recursive-flat deduplication policies, reservations and history clearing are preserved. Includes 22 regression tests; 2000 synthetic duplicate files checked with two database connections instead of 3999."
 }
