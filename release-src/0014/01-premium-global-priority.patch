@@ -1,0 +1,229 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -169,6 +169,85 @@
+     """
+     if drained_event is not None and small_queue.empty():
+         drained_event.set()
++
++
++class _PremiumWorkPriority:
++    """Pending Premium queues shared by one monitoring wave, on one event loop."""
++
++    def __init__(self, task_ids: list[str]):
++        self.preparing = set(task_ids)
++        self.queues: dict[str, tuple[asyncio.Queue[Any], Any]] = {}
++        self.regular_lane_callbacks: dict[str, Any] = {}
++
++    def register(self, task_id: str, queue: asyncio.Queue[Any], eligible: Any, release_regular: Any = None) -> None:
++        if release_regular is not None:
++            self.regular_lane_callbacks[task_id] = release_regular
++        self.queues[task_id] = (queue, eligible)
++        self.preparing.discard(task_id)
++
++    def finish(self, task_id: str) -> None:
++        # Also release the scan barrier after empty folders or preparation errors.
++        self.preparing.discard(task_id)
++        self.queues.pop(task_id, None)
++        self.regular_lane_callbacks.pop(task_id, None)
++
++    def release_regular_lanes(self) -> None:
++        # Empty middle rules must relay their ordinary gate even when their
++        # only active worker is busy sending a large file on Premium.
++        for release in self.regular_lane_callbacks.values():
++            release()
++
++    @property
++    def ready(self) -> bool:
++        return not self.preparing
++
++    def has_work(self, session: str) -> bool:
++        return any(not queue.empty() and eligible(session) for queue, eligible in self.queues.values())
++
++
++async def _next_upload_job(
++    *, task_id: str, session: str, small_queue: asyncio.Queue[Any], big_queue: asyncio.Queue[Any],
++    premium_by_session: dict[str, bool], start_after: asyncio.Event | None,
++    priority: _PremiumWorkPriority | None, stop_event: Any, disabled: Any, signal_drained: Any,
++) -> Any:
++    """Keep ordinary rule ordering while letting Premium claim later big files."""
++    while not stop_event.is_set() and not disabled():
++        if priority is not None:
++            priority.release_regular_lanes()
++        premium = bool(premium_by_session.get(session, False))
++        if premium and priority is not None:
++            # Do not let a fast first rule consume Premium on small files before
++            # slower folder/target preparation has exposed its large-file queue.
++            if not priority.ready:
++                await asyncio.sleep(0.25)
++                continue
++            try:
++                return big_queue.get_nowait()
++            except asyncio.QueueEmpty:
++                pass
++            if priority.has_work(session):
++                await asyncio.sleep(0.25)
++                continue
++
++        if start_after is not None and not start_after.is_set():
++            await asyncio.sleep(0.25)
++            continue
++        signal_drained()
++        if premium:
++            try:
++                item = big_queue.get_nowait()
++                signal_drained()
++                return item
++            except asyncio.QueueEmpty:
++                pass
++        try:
++            item = small_queue.get_nowait()
++            signal_drained()
++            return item
++        except asyncio.QueueEmpty:
++            signal_drained()
++            return None
++    return None
+ 
+ 
+ def _hot_add_candidate_sessions(
+@@ -3206,6 +3285,7 @@
+                 "Файлы >2 ГБ маршрутизируются только на Premium; >4 ГБ пропускаются."
+             )
+             drain_events = [asyncio.Event() for _ in tasks] if pipeline else []
++            premium_priority = _PremiumWorkPriority([str(t.get("id", "")) for t in tasks]) if pipeline else None
+ 
+             async def run_task(pos: int, task: dict[str, Any]):
+                 start_after = drain_events[pos - 1] if pipeline and pos > 0 else None
+@@ -3214,9 +3294,11 @@
+                     return await self._run_one_task(
+                         task, clients, premium_by_session, account_locks, global_sem, preview_sem, scan_sem,
+                         start_after=start_after, drained_event=drained_event, live_pool_changed=live_pool_changed,
+-                        hot_admin_locks=hot_admin_locks,
++                        hot_admin_locks=hot_admin_locks, premium_priority=premium_priority,
+                     )
+                 finally:
++                    if premium_priority is not None:
++                        premium_priority.finish(str(task.get("id", "")))
+                     # Never deadlock the next priority task on an early return/error.
+                     if drained_event is not None:
+                         drained_event.set()
+@@ -3885,6 +3967,7 @@
+         drained_event: asyncio.Event | None = None,
+         live_pool_changed: asyncio.Event | None = None,
+         hot_admin_locks: dict[str, asyncio.Lock] | None = None,
++        premium_priority: _PremiumWorkPriority | None = None,
+     ) -> None:
+         tid = str(task.get("id", ""))
+         name = str(task.get("name", "Задание"))
+@@ -3945,6 +4028,7 @@
+                 resolved[session] = entity
+             except Exception as exc:
+                 self.app.log(f"{name}: {account.display} не открыл цель — {self.app._friendly_error(exc)}")
++        activation_failed = set(sessions) - set(resolved)
+         sessions = [s for s in sessions if s in resolved]
+         if not sessions or target_key is None:
+             raise RuntimeError("Ни один выбранный аккаунт не смог открыть цель с требуемыми правами администратора.")
+@@ -4087,7 +4171,21 @@
+                 return small_queue
+ 
+         def signal_drained_if_ready() -> None:
+-            _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
++            if start_after is None or start_after.is_set():
++                _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
++
++        if premium_priority is not None:
++            def premium_eligible(session: str) -> bool:
++                gate = self.task_pause_events.get(tid)
++                requested = bool(task.get("use_all_accounts", True)) or session in (task.get("account_sessions", []) or [])
++                restricted = getattr(self.app, "account_is_restricted", None)
++                return (
++                    requested and session not in activation_failed
++                    and (gate is None or gate.is_set())
++                    and not (callable(restricted) and restricted(session))
++                    and self._runtime_task_account_allowed(task, session)
++                )
++            premium_priority.register(tid, big_queue, premium_eligible, signal_drained_if_ready)
+ 
+         async def activate_hot_session(session: str) -> bool:
+             if session in resolved:
+@@ -4129,22 +4227,13 @@
+                 return False
+ 
+         async def next_job(session: str) -> tuple[int, Path] | None:
+-            if health(session).get("disabled"):
+-                return None
+-            if premium_by_session.get(session, False):
+-                try:
+-                    item = big_queue.get_nowait()
+-                    signal_drained_if_ready()
+-                    return item
+-                except asyncio.QueueEmpty:
+-                    pass
+-            try:
+-                item = small_queue.get_nowait()
+-                signal_drained_if_ready()
+-                return item
+-            except asyncio.QueueEmpty:
+-                signal_drained_if_ready()
+-                return None
++            return await _next_upload_job(
++                task_id=tid, session=session, small_queue=small_queue, big_queue=big_queue,
++                premium_by_session=premium_by_session, start_after=start_after,
++                priority=premium_priority, stop_event=self.stop_event,
++                disabled=lambda: bool(health(session).get("disabled")),
++                signal_drained=signal_drained_if_ready,
++            )
+ 
+         async def worker(session: str) -> None:
+             account, client = clients[session]
+@@ -4194,6 +4283,12 @@
+                         return
+                     if not self._runtime_task_account_allowed(task, session):
+                         queue_for_path(path).put_nowait(item)
++                        continue
++                    if (
++                        premium_priority is not None and premium_by_session.get(session, False)
++                        and upload_lane != "premium" and premium_priority.has_work(session)
++                    ):
++                        small_queue.put_nowait(item)
+                         continue
+                     async with task_sem:
+                         if not await self._wait_gate(tid):
+@@ -4611,17 +4706,10 @@
+ 
+         if start_after is not None and not start_after.is_set():
+             self.app.ui_call(lambda: self._set_task_row(tid, status="Ожидает свободные аккаунты…", speed="—", eta="—"))
+-            while not self.stop_event.is_set() and not start_after.is_set():
+-                try:
+-                    await asyncio.wait_for(start_after.wait(), timeout=0.25)
+-                except asyncio.TimeoutError:
+-                    pass
+-            if self.stop_event.is_set():
+-                return
+-
+-        # Once this task itself is allowed to run, only its regular (<=2 GB) lane
+-        # gates the next monitoring task. Premium-only work may continue in parallel.
+-        _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
++
++        # Ordinary jobs still release the next rule in order. Premium jobs can
++        # bypass that gate only to take an eligible large file from this wave.
++        signal_drained_if_ready()
+ 
+         max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, 101 + FILE_PART_REQUEUE_LIMIT)
+         for _wave in range(max_waves):
+@@ -4637,8 +4725,13 @@
+                 for session in list(clients):
+                     if session in started_sessions or session not in requested or health(session).get("disabled"):
+                         continue
+-                    if session not in resolved and not await activate_hot_session(session):
+-                        continue
++                    if session not in resolved:
++                        # A hot-added Premium must reserve its large-file priority
++                        # while this rule is still resolving/promoting the account.
++                        activation_failed.discard(session)
++                        if not await activate_hot_session(session):
++                            activation_failed.add(session)
++                            continue
+                     started_sessions.add(session)
+                     worker_tasks[session] = asyncio.create_task(worker(session))
+ 

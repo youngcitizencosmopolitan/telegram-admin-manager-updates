@@ -1,13 +1,12 @@
 {
-  "version": "0013",
-  "base_version": "0012",
-  "manifest_version": "4.3.8.0013",
-  "display_version": "0013",
+  "version": "0014",
+  "base_version": "0013",
+  "manifest_version": "4.3.8.0014",
+  "display_version": "0014",
   "patch_files": [
-    "release-src/0013/01-monitor-new-count.patch",
-    "release-src/0013/02-version.patch",
-    "release-src/0013/03-test-compat.patch",
-    "release-src/0013/04-regression-tests.patch"
+    "release-src/0014/01-premium-global-priority.patch",
+    "release-src/0014/02-version.patch",
+    "release-src/0014/03-premium-priority-tests.patch"
   ],
-  "notes": "0013: fixes stale New counts in folder monitoring. Counts clear after a scan without new files or successful batch completion; historical detections no longer appear as current arrivals after restart. Arrivals detected during an older batch remain protected. Includes five regression tests."
+  "notes": "0014: Premium accounts prioritize large files across the current monitoring wave before taking ordinary files, including large files in later rules. Ordinary accounts keep their existing rule order. Preserves account selections, pause/stop, hot-add activation, upload history and multipart recovery. Includes twelve priority and worker integration tests."
 }
