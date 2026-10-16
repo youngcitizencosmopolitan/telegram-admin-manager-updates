@@ -1,0 +1,62 @@
+--- /dev/null
++++ b/app/tests/test_monitor_recovery_button.py
+@@ -0,0 +1,59 @@
++import tkinter as tk
++import unittest
++from tkinter import ttk
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++from batch_uploader import BatchUploaderPane
++
++
++class MonitorRecoveryButtonTests(unittest.TestCase):
++    def setUp(self):
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            self.skipTest(f'Tk display is unavailable: {exc}')
++        self.addCleanup(self.root.destroy)
++        self.root.withdraw()
++        self.window = tk.Toplevel(self.root)
++        self.window.withdraw()
++        self.window.attributes('-alpha', 0)
++        self.window.geometry('1190x810')
++        self.pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        self.pane.monitor_parent = self.window
++        self.pane.app = SimpleNamespace(store=SimpleNamespace(data={}))
++        self.pane._register_sortable_tree = Mock()
++        self.pane.retry_unfinished_uploads = Mock()
++
++    def assert_recovery_button(self, builder):
++        builder()
++        self.window.deiconify()
++        self.root.update()
++        def descendants(widget):
++            for child in widget.winfo_children():
++                yield child
++                yield from descendants(child)
++        buttons = [widget for widget in descendants(self.window)
++                   if isinstance(widget, ttk.Button)
++                   and widget.cget('text') == 'Незавершённые отправки…']
++        self.assertEqual(len(buttons), 1, 'Recovery must be accessible in this monitor layout')
++        button = buttons[0]
++        self.assertTrue(button.winfo_ismapped())
++        self.assertGreaterEqual(button.winfo_x(), 0)
++        self.assertLessEqual(button.winfo_x() + button.winfo_width(), button.master.winfo_width())
++        self.pane.monitor_tree.insert('', 'end', iid='selected-rule', text='Selected rule')
++        self.pane.monitor_tree.selection_set('selected-rule')
++        self.pane.retry_unfinished_uploads.side_effect = lambda: self.assertEqual(
++            self.pane._monitor_selected_tid(), 'selected-rule')
++        button.invoke()
++        self.pane.retry_unfinished_uploads.assert_called_once_with()
++
++    def test_unified_monitor_exposes_recovery_for_selected_rule(self):
++        self.assert_recovery_button(self.pane._build_unified_monitor_ui)
++
++    def test_separate_monitor_keeps_recovery_for_selected_rule(self):
++        self.assert_recovery_button(self.pane._build_monitor_ui)
++
++
++if __name__ == '__main__':
++    unittest.main()

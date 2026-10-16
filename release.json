@@ -1,17 +1,12 @@
 {
-  "version": "0021",
-  "base_version": "0020",
-  "manifest_version": "4.3.8.0021",
-  "display_version": "0021",
+  "version": "0022",
+  "base_version": "0021",
+  "manifest_version": "4.3.8.0022",
+  "display_version": "0022",
   "patch_files": [
-    "release-src/0021/01-batch_uploader.py.patch",
-    "release-src/0021/02-tam_core-repositories.py.patch",
-    "release-src/0021/03-tam_core-state_db.py.patch",
-    "release-src/0021/04-telegram_admin_manager.py.patch",
-    "release-src/0021/05-tests-test_monitor_delta_upload.py.patch",
-    "release-src/0021/06-tests-test_monitor_reservation_recovery.py.patch",
-    "release-src/0021/07-tests-test_prefetch_upload_boundary.py.patch",
-    "release-src/0021/08-tests-test_v0004_dedup_reservations.py.patch"
+    "release-src/0022/01-batch_uploader.py.patch",
+    "release-src/0022/02-telegram_admin_manager.py.patch",
+    "release-src/0022/03-tests-test_monitor_recovery_button.py.patch"
   ],
-  "notes": "0021: interrupted uploads from previous runs appear as unconfirmed sends instead of completed duplicates. Scoped, explicitly confirmed recovery protects completed history and current claims, and queues a durable retry after any active batch. Monitoring keeps pending signatures for occupied rules and stops repeated unchanged submissions and false queue messages. Blocked progress cannot show 100%; account selection and Premium large-file priority remain unchanged. Includes 13 regression tests; 343 tests pass with application dependencies."
+  "notes": "0022: exposes the unfinished-send recovery button in the unified monitoring window actually used by the application. Version 0021 mistakenly added it only to the separate legacy layout. Existing confirmation, reservation scope, completed-history protections, account and upload behavior remain unchanged. Two native Tk regressions check both layouts, visible button geometry and selected-rule callback."
 }
