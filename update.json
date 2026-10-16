@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0023",
-  "display_version": "0023",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0023/TelegramAdminManager_v0023_update.zip",
-  "sha256": "a03998a61f61b8e3d4a1dcb102098858eefdac59f6a56f888e677520cfac927d",
-  "notes": "0023: redesigned desktop workspace with nine persistent sidebar sections, saved light/dark/system appearance, shared collapsible journal, transfer summary and selected-rule details. Recovery actions stay visible at small window sizes and high DPI; rule rows update in place. The existing upload queue has a dedicated page; manual tasks/import remain accessible, pause controls synchronize across views, and account registration remains separate from monitoring participation. Long forms scroll with editor Save kept visible. Upload history, reservation confirmation, account selection, Premium routing and Telegram request policies are preserved."
+  "version": "4.3.8.0024",
+  "display_version": "0024",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0024/TelegramAdminManager_v0024_update.zip",
+  "sha256": "ad2cae19aaaee0ded27647b200f28560670f74955a0906c9414f7fd6c916bd46",
+  "notes": "0024: keep unconfirmed previous-run upload warnings across later queue waves and incremental batches. Display unresolved sends in the transfer summary and rule inspector; label file totals as the current batch. Double-click a file or use Open rule to select its exact monitoring rule and access scoped recovery. Confirmed duplicates clear their own warning; changed/deleted rules discard obsolete UI state. Upload reservations, confirmation before retry, history, account routing and Telegram request policies are preserved."
 }
