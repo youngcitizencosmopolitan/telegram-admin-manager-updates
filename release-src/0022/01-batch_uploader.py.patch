@@ -1,0 +1,10 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -900,6 +900,7 @@
+         ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+         ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+         ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
++        ttk.Button(cache_bar, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
+ 
+         body = tk.PanedWindow(p, orient="vertical", sashwidth=7, bg="#d8dee8", bd=0, relief="flat")
+         body.grid(row=3, column=0, sticky="nsew")
