@@ -1,0 +1,50 @@
+--- /dev/null
++++ b/app/tam_ui/queue_view.py
+@@ -0,0 +1,47 @@
++"""A view of the controller's existing queue, never a queue owner."""
++from tkinter import ttk
++import tkinter as tk
++
++
++class QueueView:
++    COMMANDS = ('resume_queue', 'toggle_pause_all', 'stop', 'remove_selected_queue_item', 'clear_pending_queue')
++
++    def __init__(self, parent, commands: dict):
++        self.frame = ttk.Frame(parent, padding=(0, 8))
++        self.frame.columnconfigure(0, weight=1); self.frame.rowconfigure(1, weight=1)
++        tools = ttk.Frame(self.frame); tools.grid(row=0, column=0, sticky='ew', pady=(0, 12))
++        self.resume_button = ttk.Button(tools, text='Продолжить очередь', style='Primary.TButton',
++                                        command=commands['resume_queue'], state='disabled')
++        self.resume_button.pack(side='left')
++        self.pause_button = ttk.Button(tools, text='Пауза', command=commands['toggle_pause_all'], state='disabled')
++        self.pause_button.pack(side='left', padx=5)
++        self.stop_button = ttk.Button(tools, text='Стоп', command=commands['stop'], state='disabled')
++        self.stop_button.pack(side='left')
++        ttk.Button(tools, text='Удалить выбранный пакет', command=commands['remove_selected_queue_item']).pack(side='left', padx=(16, 5))
++        ttk.Button(tools, text='Очистить ожидающие', command=commands['clear_pending_queue']).pack(side='left')
++        body = ttk.Frame(self.frame); body.grid(row=1, column=0, sticky='nsew')
++        body.columnconfigure(0, weight=1); body.rowconfigure(0, weight=1)
++        self.tree = ttk.Treeview(body, columns=('source', 'tasks', 'status', 'created'), show='headings', selectmode='browse')
++        for key, title, width in [('source','Источник',120), ('tasks','Правила / задания',360),
++                                  ('status','Состояние',240), ('created','Добавлено',100)]:
++            self.tree.heading(key, text=title)
++            self.tree.column(key, width=width, minwidth=80, stretch=key in ('tasks','status'))
++        self.tree.grid(row=0, column=0, sticky='nsew')
++        y = ttk.Scrollbar(body, orient='vertical', command=self.tree.yview); y.grid(row=0, column=1, sticky='ns')
++        x = ttk.Scrollbar(body, orient='horizontal', command=self.tree.xview); x.grid(row=1, column=0, sticky='ew')
++        self.tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
++        self.status_var = tk.StringVar(value='Очередь пуста')
++        ttk.Label(self.frame, textvariable=self.status_var, style='Section.TLabel').grid(row=2, column=0, sticky='w', pady=(12, 4))
++        ttk.Label(self.frame, text='Восстановленные после сбоя пакеты запускаются только по кнопке «Продолжить очередь».',
++                  style='Muted.TLabel', wraplength=780).grid(row=3, column=0, sticky='w')
++
++    def upsert_item(self, qid: str, values: dict) -> None:
++        row = tuple(values.get(k, '') for k in ('source', 'tasks', 'status', 'created'))
++        if self.tree.exists(qid):
++            self.tree.item(qid, values=row)
++        else:
++            self.tree.insert('', 'end', iid=qid, values=row)
++
++    def select_item(self, qid: str | None):
++        if qid and self.tree.exists(qid):
++            self.tree.selection_set(qid)

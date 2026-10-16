@@ -1,0 +1,412 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -606,6 +606,11 @@
+     # ---------- UI ----------
+     def _build_ui(self) -> None:
+         p = self.parent
++        if self.unified_monitor and hasattr(self.app, 'workspace'):
++            from tam_ui.scrollable import ScrollableFrame
++            scroll = ScrollableFrame(p)
++            scroll.pack(fill='both', expand=True)
++            p = scroll.content
+         p.columnconfigure(0, weight=1)
+         p.rowconfigure(3, weight=2)
+         p.rowconfigure(7, weight=1)
+@@ -720,27 +725,38 @@
+         self.stop_btn.pack(side="left", padx=(14, 5))
+         ttk.Label(controls, text="Мониторинг вынесен в отдельную вкладку", foreground="#666666").pack(side="right")
+ 
+-        queue_frame = ttk.LabelFrame(p, text="Очередь загрузок", padding=5)
+-        queue_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+-        queue_frame.columnconfigure(0, weight=1)
+-        qcols = ("source", "tasks", "status", "created")
+-        self.queue_tree = ttk.Treeview(queue_frame, columns=qcols, show="headings", height=5, selectmode="browse")
+-        for col, title, width in (("source", "Источник", 110), ("tasks", "Задания", 520), ("status", "Статус", 150), ("created", "Добавлено", 85)):
+-            self.queue_tree.heading(col, text=title)
+-            self.queue_tree.column(col, width=width, minwidth=70, anchor="w")
+-        self.queue_tree.grid(row=0, column=0, sticky="ew")
+-        qsb = ttk.Scrollbar(queue_frame, orient="vertical", command=self.queue_tree.yview)
+-        qsb.grid(row=0, column=1, sticky="ns")
+-        self.queue_tree.configure(yscrollcommand=qsb.set)
+-        self._register_sortable_tree(self.queue_tree, "batch.queue", {"created": "time"})
+-        qtools = ttk.Frame(queue_frame)
+-        qtools.grid(row=1, column=0, sticky="ew", pady=(5, 0))
+-        self.resume_queue_btn = ttk.Button(qtools, text="▶ Продолжить очередь", command=self.resume_queue, state="disabled")
+-        self.resume_queue_btn.pack(side="left")
+-        ttk.Button(qtools, text="Удалить выбранное из очереди", command=self.remove_selected_queue_item).pack(side="left", padx=5)
+-        ttk.Button(qtools, text="Очистить ожидающие", command=self.clear_pending_queue).pack(side="left", padx=5)
+-        self.queue_status_var = tk.StringVar(value="Очередь пуста")
+-        ttk.Label(qtools, textvariable=self.queue_status_var).pack(side="right")
++        if self.unified_monitor and hasattr(self.app, 'queue_workspace'):
++            from tam_ui.queue_view import QueueView
++            qparent = self.app.queue_workspace
++            qparent.columnconfigure(0, weight=1); qparent.rowconfigure(0, weight=1)
++            self.queue_view = QueueView(qparent, {name: getattr(self, name) for name in QueueView.COMMANDS})
++            self.queue_view.frame.grid(row=0, column=0, sticky='nsew')
++            self.queue_tree = self.queue_view.tree
++            self.resume_queue_btn = self.queue_view.resume_button
++            self.queue_status_var = self.queue_view.status_var
++            self._register_sortable_tree(self.queue_tree, 'batch.queue', {'created': 'time'})
++        else:
++            queue_frame = ttk.LabelFrame(p, text="Очередь загрузок", padding=5)
++            queue_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
++            queue_frame.columnconfigure(0, weight=1)
++            qcols = ("source", "tasks", "status", "created")
++            self.queue_tree = ttk.Treeview(queue_frame, columns=qcols, show="headings", height=5, selectmode="browse")
++            for col, title, width in (("source", "Источник", 110), ("tasks", "Задания", 520), ("status", "Статус", 150), ("created", "Добавлено", 85)):
++                self.queue_tree.heading(col, text=title)
++                self.queue_tree.column(col, width=width, minwidth=70, anchor="w")
++            self.queue_tree.grid(row=0, column=0, sticky="ew")
++            qsb = ttk.Scrollbar(queue_frame, orient="vertical", command=self.queue_tree.yview)
++            qsb.grid(row=0, column=1, sticky="ns")
++            self.queue_tree.configure(yscrollcommand=qsb.set)
++            self._register_sortable_tree(self.queue_tree, "batch.queue", {"created": "time"})
++            qtools = ttk.Frame(queue_frame)
++            qtools.grid(row=1, column=0, sticky="ew", pady=(5, 0))
++            self.resume_queue_btn = ttk.Button(qtools, text="▶ Продолжить очередь", command=self.resume_queue, state="disabled")
++            self.resume_queue_btn.pack(side="left")
++            ttk.Button(qtools, text="Удалить выбранное из очереди", command=self.remove_selected_queue_item).pack(side="left", padx=5)
++            ttk.Button(qtools, text="Очистить ожидающие", command=self.clear_pending_queue).pack(side="left", padx=5)
++            self.queue_status_var = tk.StringVar(value="Очередь пуста")
++            ttk.Label(qtools, textvariable=self.queue_status_var).pack(side="right")
+ 
+         activity_tools = ttk.Frame(p)
+         activity_tools.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+@@ -786,6 +802,10 @@
+             ),
+             wraplength=1050,
+         ).grid(row=8, column=0, sticky="w", pady=(7, 0))
++        if self.unified_monitor:
++            activity_tools.destroy()
++            activity_frame.destroy()
++            p.rowconfigure(7, weight=0)
+ 
+     def _build_monitor_ui(self) -> None:
+         p = self.monitor_parent
+@@ -866,129 +886,74 @@
+         ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+ 
+     def _build_unified_monitor_ui(self) -> None:
+-        """Build one monitoring workspace; queue remains an internal mechanism."""
+-        p = self.monitor_parent
+-        if p is None:
+-            return
+-        p.columnconfigure(0, weight=1)
+-        p.rowconfigure(2, weight=1)
+-
+-        top = ttk.Frame(p)
+-        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+-        ttk.Label(top, text="Мониторинг папок", font=("Segoe UI", 13, "bold")).pack(side="left")
+-        self.monitor_btn = ttk.Button(top, text="👁 Включить мониторинг", command=self.toggle_monitoring)
+-        self.monitor_btn.pack(side="left", padx=(16, 5))
+-        ttk.Button(top, text="Обновить", command=lambda: self.refresh_monitor_tab(force=True)).pack(side="left", padx=5)
+-        ttk.Button(top, text="Preflight", command=self.run_preflight).pack(side="left", padx=5)
+-        ttk.Button(top, text="Аккаунты для всех правил...", command=self.choose_monitor_accounts_for_all).pack(side="left", padx=5)
+-        self.monitor_state_var = tk.StringVar(value="Остановлен")
+-        ttk.Label(top, textvariable=self.monitor_state_var, font=("Segoe UI", 10, "bold")).pack(side="right")
+-
+-        self.monitor_transfer_summary_var = tk.StringVar(
+-            value="Осталось загрузить: 0 Б · файлов: 0 / 0 · скорость: — · ETA: —"
+-        )
+-        ttk.Label(
+-            p, textvariable=self.monitor_transfer_summary_var, font=("Segoe UI", 10, "bold")
+-        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+-
+-        cache_bar = ttk.LabelFrame(p, text="Кэш Telegram", padding=7)
+-        cache_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+-        ttk.Label(cache_bar, text="Права/темы не перепроверять:").pack(side="left")
+-        self.cache_ttl_var = tk.StringVar(value=str(self.app.store.data.get("group_cache_ttl_hours", 24)))
+-        ttl = ttk.Spinbox(cache_bar, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
+-        ttl.pack(side="left", padx=(6, 3))
+-        ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+-        ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+-        ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
+-        ttk.Button(cache_bar, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
+-
+-        body = tk.PanedWindow(p, orient="vertical", sashwidth=7, bg="#d8dee8", bd=0, relief="flat")
+-        body.grid(row=3, column=0, sticky="nsew")
+-        self.monitor_body_pane = body
+-
+-        rules_panel = ttk.LabelFrame(body, text="Правила мониторинга", padding=6)
+-        rules_panel.columnconfigure(0, weight=1)
+-        rules_panel.rowconfigure(0, weight=1)
+-        body.add(rules_panel, stretch="always", minsize=260)
+-
+-        cols = ("on", "folder", "target", "caption", "interval", "new", "queue", "progress", "speed", "eta", "state")
+-        self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="browse")
+-        headings = {
+-            "#0": "Правило", "on": "Мон.", "folder": "Папка", "target": "Группа",
+-            "caption": "Подпись", "interval": "Интервал", "new": "Новые", "queue": "Работа",
+-            "progress": "%", "speed": "Скорость", "eta": "Осталось", "state": "Состояние",
+-        }
+-        widths = {
+-            "#0": 145, "on": 45, "folder": 220, "target": 175, "caption": 220,
+-            "interval": 65, "new": 55, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
+-        }
+-        centered = {"on", "interval", "new", "queue", "progress"}
+-        for col, title in headings.items():
+-            self.monitor_tree.heading(col, text=title)
+-            self.monitor_tree.column(col, width=widths[col], minwidth=45, anchor="center" if col in centered else "w")
+-        self.monitor_tree.grid(row=0, column=0, sticky="nsew")
+-        msb = ttk.Scrollbar(rules_panel, orient="vertical", command=self.monitor_tree.yview)
+-        msb.grid(row=0, column=1, sticky="ns")
+-        self.monitor_tree.configure(yscrollcommand=msb.set)
+-        self._register_sortable_tree(self.monitor_tree, "monitor.rules", {"interval": "number", "new": "number", "progress": "percent", "speed": "speed", "eta": "duration"}, first_descending={"speed"})
+-        self.monitor_tree.bind("<Double-1>", lambda _e: self.edit_monitor_rule())
+-        self.monitor_tree.bind("<Button-3>", self._show_monitor_context)
+-
+-        tools = ttk.Frame(rules_panel)
+-        tools.grid(row=1, column=0, sticky="ew", pady=(7, 0))
+-        ttk.Button(tools, text="+ Добавить", command=self.add_monitor_rule).pack(side="left")
+-        ttk.Button(tools, text="Вкл / выкл", command=self.toggle_selected_monitor_rule).pack(side="left", padx=4)
+-        ttk.Button(tools, text="Изменить правило…", command=self.edit_monitor_rule).pack(side="left", padx=4)
+-        ttk.Button(tools, text="Изменить подпись…", command=self.edit_monitor_caption).pack(side="left", padx=4)
+-        ttk.Button(tools, text="Темы сейчас", command=self.sync_selected_monitor_topics).pack(side="left", padx=4)
+-        ttk.Button(tools, text="Загрузить сейчас", command=self.enqueue_selected_monitor_rule).pack(side="left", padx=4)
+-        ttk.Button(tools, text="Удалить", command=self.remove_selected_monitor_rule).pack(side="left", padx=4)
+-        self.monitor_summary_var = tk.StringVar(value="Правил: 0")
+-        ttk.Label(tools, textvariable=self.monitor_summary_var).pack(side="right")
+-
+-        activity_panel = ttk.LabelFrame(body, text="Текущие / последние файлы", padding=6)
+-        activity_panel.columnconfigure(0, weight=1)
+-        activity_panel.rowconfigure(1, weight=1)
+-        body.add(activity_panel, stretch="always", minsize=220)
+-
+-        activity_tools = ttk.Frame(activity_panel)
+-        activity_tools.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+-        self.resume_queue_btn = ttk.Button(activity_tools, text="▶ Продолжить", command=self.resume_queue, state="disabled")
+-        self.resume_queue_btn.pack(side="left")
+-        self.pause_all_btn = ttk.Button(activity_tools, text="⏸ Пауза", command=self.toggle_pause_all, state="disabled")
+-        self.pause_all_btn.pack(side="left", padx=4)
+-        self.stop_btn = ttk.Button(activity_tools, text="■ Стоп", command=self.stop, state="disabled")
+-        self.stop_btn.pack(side="left", padx=4)
+-        ttk.Button(activity_tools, text="Очистить завершённые", command=self.clear_finished_activity).pack(side="left", padx=(12, 4))
+-        self.queue_status_var = tk.StringVar(value="Очередь пуста")
+-        ttk.Label(activity_tools, textvariable=self.queue_status_var).pack(side="right")
+-
+-        acols = ("task", "account", "size", "progress", "speed", "status")
+-        self.activity = ttk.Treeview(activity_panel, columns=acols, show="tree headings", selectmode="browse", height=8)
+-        self.activity_heading_labels = {
+-            "#0": "Файл", "task": "Правило", "account": "Аккаунт", "size": "Размер",
+-            "progress": "%", "speed": "Скорость", "status": "Статус",
+-        }
+-        for key, title in self.activity_heading_labels.items():
+-            self.activity.heading(key, text=title, command=lambda c=key: self._sort_activity(c))
+-        self.activity.column("#0", width=330, minwidth=160)
+-        self.activity.column("task", width=160, minwidth=100)
+-        self.activity.column("account", width=170, minwidth=100)
+-        self.activity.column("size", width=85, anchor="e")
+-        self.activity.column("progress", width=65, anchor="center")
+-        self.activity.column("speed", width=100, anchor="e")
+-        self.activity.column("status", width=125)
+-        self.activity.grid(row=1, column=0, sticky="nsew")
+-        asb = ttk.Scrollbar(activity_panel, orient="vertical", command=self.activity.yview)
+-        asb.grid(row=1, column=1, sticky="ns")
+-        self.activity.configure(yscrollcommand=asb.set)
+-        self.activity.bind("<Button-3>", self._show_activity_context)
+-        self.activity.tag_configure("uploading", foreground="#005fb8")
+-        self.activity.tag_configure("success", foreground="#1a7f37")
+-        self.activity.tag_configure("error", foreground="#b42318", background="#fff1f0")
+-        self.activity.tag_configure("skipped", foreground="#8a5a00")
+-        self.activity_rows = {}
+-        self.activity_paths = {}
++        from tam_ui.monitor_view import MonitorView
++        if self.monitor_parent is None:
++            return
++        commands = {name: getattr(self, name) for name in MonitorView.COMMANDS}
++        view = MonitorView(self.monitor_parent, commands,
++            {key: getattr(self, attr) for key, attr in [('remaining', 'remaining_var'), ('speed', 'total_speed_var'),
++                                                      ('eta', 'eta_var'), ('files', 'done_var')] if hasattr(self, attr)},
++            ttl=str(self.app.store.data.get('group_cache_ttl_hours', 24)), on_select=self._update_monitor_details,
++            queue_var=getattr(self, 'queue_status_var', None))
++        view.frame.grid(row=0, column=0, sticky='nsew')
++        self.monitor_parent.columnconfigure(0, weight=1)
++        self.monitor_parent.rowconfigure(0, weight=1)
++        self.monitor_view = view
++        self.monitor_tree, self.activity = view.tree, view.activity
++        self.monitor_state_var, self.monitor_summary_var = view.state_var, view.summary_var
++        self.monitor_btn = view.monitor_button
++        self.monitor_body_pane = view.body_pane
++        self.monitor_details_pane = view.details_pane
++        self.cache_ttl_var = view.cache_ttl_var
++        self._manual_pause_all_btn = getattr(self, 'pause_all_btn', None)
++        self._manual_stop_btn = getattr(self, 'stop_btn', None)
++        self.resume_queue_btn, self.pause_all_btn, self.stop_btn = view.resume_button, view.pause_button, view.stop_button
++        self.queue_status_var = view.queue_var
++        self.activity_heading_labels = view.activity_headings
++        self.activity_rows, self.activity_paths = {}, {}
++        self._register_sortable_tree(self.monitor_tree, 'monitor.rules',
++            {'interval': 'number', 'new': 'number', 'progress': 'percent', 'speed': 'speed', 'eta': 'duration'},
++            first_descending={'speed'})
++        self.monitor_tree.bind('<Double-1>', lambda _e: self.edit_monitor_rule())
++        self.monitor_tree.bind('<Button-3>', self._show_monitor_context)
++        self.activity.bind('<Button-3>', self._show_activity_context)
++        for key in self.activity_heading_labels:
++            self.activity.heading(key, command=lambda c=key: self._sort_activity(c))
++
++    def _update_monitor_details(self) -> None:
++        if not hasattr(self, 'monitor_view'):
++            return
++        from tam_ui.monitor_presentation import rule_presentation
++        tid = self._monitor_selected_tid()
++        self.monitor_view.select_rule(tid)
++        store = getattr(self.app, 'monitor_rules', None)
++        rule = store.get(tid) if tid and store else None
++        if not rule:
++            self.monitor_view.show_details({})
++            return
++        state = getattr(self, 'task_states', {}).get(tid, {})
++        data = rule_presentation(rule, getattr(self, 'monitor_runtime', {}).get(tid, {}), state,
++            running=tid in getattr(self, 'live_tasks', {}), queued=tid in self._queued_task_ids())
++        accounts = self.app.store.accounts()
++        selected = self._effective_task_sessions(self._monitor_task_for_queue(rule), {a.session: a for a in accounts})
++        premium = sum(bool(a.premium) for a in accounts if a.session in selected)
++        data['accounts'] = f'{len(selected)} выбрано · Premium: {premium}'
++        target = str(rule.get('target', ''))
++        data['target'] = self.app.group_display_name(target) if hasattr(self.app, 'group_display_name') else target
++        self.monitor_view.show_details(data)
++
++    def _upsert_monitor_row(self, parent, position, *, iid, text, values):
++        tree = self.monitor_tree
++        if hasattr(tree, 'exists'):
++            state = self.task_states.get(iid, {})
++            tags = ('warning',) if state.get('blocked') else ('error',) if state.get('failed') else ()
++            args = dict(text=text, values=values, tags=tags)
++            if tree.exists(iid):
++                tree.item(iid, **args)
++            else:
++                tree.insert(parent, position, iid=iid, **args)
++        else:
++            tree.insert(parent, position, iid=iid, text=text, values=values)
+ 
+     def run_preflight(self) -> None:
+         if getattr(self, '_preflight_running', False):
+@@ -1111,14 +1076,18 @@
+         accounts = {a.session for a in self.app.store.accounts()}
+         with self._live_task_lock:
+             live_ids = set(self.live_tasks)
+-        for iid in self.monitor_tree.get_children(""):
+-            self.monitor_tree.delete(iid)
++        native_tree = hasattr(self.monitor_tree, 'exists')
++        retained = set()
++        if not native_tree:
++            for iid in self.monitor_tree.get_children(""):
++                self.monitor_tree.delete(iid)
+         enabled_count = 0
+         active_count = 0
+         for rule in rules:
+             tid = str(rule.get("id", ""))
+             if not tid:
+                 continue
++            retained.add(tid)
+             monitored = bool(rule.get("monitor_folder", False))
+             if monitored:
+                 enabled_count += 1
+@@ -1159,9 +1128,11 @@
+                     if work_text == 'Выполняется':
+                         active_count -= 1
+                     work_text = f'Нужен повтор: {blocked_count}'
++            from tam_ui.monitor_presentation import rule_presentation
++            presentation = rule_presentation(rule, runtime, task_state, running=tid in live_ids, queued=tid in queued)
+             caption = str(rule.get("caption", ""))
+             if self.unified_monitor:
+-                self.monitor_tree.insert(
++                self._upsert_monitor_row(
+                     "", "end", iid=tid, text=str(rule.get("name", "Правило")),
+                     values=(
+                         "✓" if monitored else "—",
+@@ -1170,7 +1141,7 @@
+                         caption if caption else "—",
+                         f"{interval}с",
+                         str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
+-                        work_text,
++                        presentation['status'],
+                         f"{progress:.0f}%" if work_text != "—" and not blocked_count else "—",
+                         _fmt_speed(speed),
+                         _fmt_eta(eta_seconds) if work_text == "Выполняется" else ("0с" if progress >= 100.0 and work_text == "—" else "—"),
+@@ -1180,7 +1151,7 @@
+             else:
+                 next_ts = float(runtime.get("next_check", 0) or 0)
+                 next_text = self._clock(next_ts) if self.monitor_active and monitored else "—"
+-                self.monitor_tree.insert(
++                self._upsert_monitor_row(
+                     "", "end", iid=tid, text=str(rule.get("name", "Правило")),
+                     values=(
+                         "✓" if monitored else "—", "Автономно", str(rule.get("folder", "")),
+@@ -1191,12 +1162,22 @@
+                         work_text, state_text,
+                     ),
+                 )
++        if native_tree:
++            for iid in self.monitor_tree.get_children(''):
++                if iid not in retained:
++                    self.monitor_tree.delete(iid)
+         if selected and self.monitor_tree.exists(selected):
+-            self.monitor_tree.selection_set(selected)
++            if self.monitor_tree.selection() != (selected,):
++                self.monitor_tree.selection_set(selected)
+         self.monitor_summary_var.set(
+             f"Правил: {enabled_count}/{len(rules)} · выполняется: {active_count} · кэш групп: {len(self.app.group_state_cache.all_entries())}"
+         )
+         self.monitor_state_var.set("Работает" if self.monitor_active else "Остановлен")
++        self._update_monitor_details()
++        workspace = getattr(self.app, 'workspace', None)
++        if workspace:
++            workspace.set_error_count(sum(int(s.get('blocked', 0) or 0) + int(s.get('failed', 0) or 0)
++                                          for s in self.task_states.values()))
+ 
+     def _save_monitor_rule(self, rule: dict[str, Any]) -> None:
+         self.app.monitor_rules.put(rule)
+@@ -2983,6 +2964,10 @@
+         self.resume_queue_btn.configure(
+             state="normal" if (pending and not self.queue_worker_active) else "disabled"
+         )
++        if hasattr(self, 'queue_view'):
++            self.queue_view.resume_button.configure(state='normal' if pending and not self.queue_worker_active else 'disabled')
++            for button in (self.queue_view.pause_button, self.queue_view.stop_button):
++                button.configure(state='normal' if current else 'disabled')
+         if self.unified_monitor and hasattr(self, "monitor_tree"):
+             self.refresh_monitor_tab(force=True)
+ 
+@@ -3327,12 +3312,23 @@
+             return
+         if self.pause_all_event.is_set():
+             self.pause_all_event.clear()
+-            self.pause_all_btn.configure(text="▶ Продолжить текущий пакет")
++            self._update_pause_labels()
+             self.app.busy_label.configure(text="Очередь: текущий пакет на паузе после активных файлов…")
+         else:
+             self.pause_all_event.set()
+-            self.pause_all_btn.configure(text="⏸ Пауза текущего пакета")
++            self._update_pause_labels()
+             self.app.busy_label.configure(text="Очередь загрузок…")
++
++    def _update_pause_labels(self):
++        paused = not self.pause_all_event.is_set()
++        text = ('Продолжить' if paused else 'Пауза') if getattr(self, 'unified_monitor', False) else (
++            '▶ Продолжить текущий пакет' if paused else '⏸ Пауза текущего пакета')
++        buttons = [self.pause_all_btn, getattr(self, '_manual_pause_all_btn', None)]
++        if hasattr(self, 'queue_view'):
++            buttons.append(self.queue_view.pause_button)
++        for button in buttons:
++            if button is not None:
++                button.configure(text=text)
+ 
+     def toggle_pause_selected(self) -> None:
+         tid = self.selected_task_id()
+@@ -3364,7 +3360,14 @@
+         # New work can always be added while another batch is running.
+         self.start_all_btn.configure(state="normal")
+         self.start_selected_btn.configure(state="normal")
+-        self.pause_all_btn.configure(state="normal" if running else "disabled", text="⏸ Пауза текущего пакета")
++        self.pause_all_btn.configure(state="normal" if running else "disabled")
++        self._update_pause_labels()
++        for button in (getattr(self, '_manual_pause_all_btn', None), getattr(self, '_manual_stop_btn', None)):
++            if button is not None:
++                button.configure(state='normal' if running else 'disabled')
++        if hasattr(self, 'queue_view'):
++            self.queue_view.pause_button.configure(state='normal' if running else 'disabled')
++            self.queue_view.stop_button.configure(state='normal' if running else 'disabled')
+         self.pause_task_btn.configure(state="normal" if running else "disabled")
+         self.stop_btn.configure(state="normal" if running else "disabled")
+         if hasattr(self, "monitor_btn"):

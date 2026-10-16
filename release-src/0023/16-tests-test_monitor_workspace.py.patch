@@ -1,0 +1,49 @@
+--- /dev/null
++++ b/app/tests/test_monitor_workspace.py
+@@ -0,0 +1,46 @@
++import tkinter as tk
++import unittest
++from unittest.mock import Mock
++from tam_ui.monitor_view import MonitorView
++
++
++class MonitorViewTests(unittest.TestCase):
++    def setUp(self):
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            self.skipTest(str(exc))
++        self.addCleanup(self.root.destroy)
++        self.root.withdraw(); self.root.attributes('-alpha', 0)
++        self.root.geometry('950x540')
++        self.calls = []
++        self.commands = {key:Mock() for key in MonitorView.COMMANDS}
++        self.commands['retry_unfinished_uploads'] = lambda: self.calls.append(self.view.selected)
++        self.view = MonitorView(self.root, self.commands)
++        self.view.frame.pack(fill='both', expand=True)
++        self.root.deiconify(); self.root.update()
++
++    def test_recovery_action_is_visible_and_scoped_to_selected_rule(self):
++        self.view.select_rule('r1')
++        self.view.show_details({'name':'VIP', 'folder':'F:/'+'long/'*25,
++                                'target':'VIP', 'accounts':'15 выбрано',
++                                'detail':'Не подтверждено', 'recovery_count':1})
++        self.root.update()
++        self.assertTrue(self.view.recovery_button.winfo_ismapped())
++        self.view.recovery_button.invoke()
++        self.assertEqual(self.calls, ['r1'])
++
++    def test_no_selection_clears_recovery_and_preserves_row_on_update(self):
++        self.view.update_rule('r1', {'name':'rule', 'values':('✓','','VIP','','60с','—','Загрузка','20%','—','—','')})
++        self.view.select_rule('r1')
++        self.view.tree.selection_set('r1')
++        for n in range(20):
++            self.view.update_rule('r1', {'name':'rule', 'values':('✓','','VIP','','60с','—','Загрузка',str(n),'—','—','')})
++        self.assertEqual(self.view.tree.selection(), ('r1',))
++        self.assertEqual(self.view.tree.get_children(), ('r1',))
++        self.view.select_rule(None)
++        self.view.show_details({})
++        self.assertEqual(str(self.view.recovery_button.cget('state')), 'disabled')
++
++
++if __name__ == '__main__': unittest.main()

@@ -1,0 +1,12 @@
+--- a/app/tests/test_monitor_recovery_button.py
++++ b/app/tests/test_monitor_recovery_button.py
+@@ -45,6 +45,9 @@
+         self.pane.monitor_tree.selection_set('selected-rule')
+         self.pane.retry_unfinished_uploads.side_effect = lambda: self.assertEqual(
+             self.pane._monitor_selected_tid(), 'selected-rule')
++        if hasattr(self.pane, 'monitor_view'):
++            self.pane.monitor_view.select_rule('selected-rule')
++            self.pane.monitor_view.show_details({'name': 'Selected rule', 'recovery_count': 1})
+         button.invoke()
+         self.pane.retry_unfinished_uploads.assert_called_once_with()
+ 

@@ -1,12 +1,33 @@
 {
-  "version": "0022",
-  "base_version": "0021",
-  "manifest_version": "4.3.8.0022",
-  "display_version": "0022",
+  "version": "0023",
+  "base_version": "0022",
+  "manifest_version": "4.3.8.0023",
+  "display_version": "0023",
   "patch_files": [
-    "release-src/0022/01-batch_uploader.py.patch",
-    "release-src/0022/02-telegram_admin_manager.py.patch",
-    "release-src/0022/03-tests-test_monitor_recovery_button.py.patch"
+    "release-src/0023/01-batch_uploader.py.patch",
+    "release-src/0023/02-docs-superpowers-plans-2026-10-16-app-ui-redesign.md.patch",
+    "release-src/0023/03-docs-superpowers-specs-2026-10-16-app-ui-redesign.md.patch",
+    "release-src/0023/04-tam_core-defaults.py.patch",
+    "release-src/0023/05-tam_ui-monitor_presentation.py.patch",
+    "release-src/0023/06-tam_ui-monitor_view.py.patch",
+    "release-src/0023/07-tam_ui-queue_view.py.patch",
+    "release-src/0023/08-tam_ui-scrollable.py.patch",
+    "release-src/0023/09-tam_ui-task_editor.py.patch",
+    "release-src/0023/10-tam_ui-theme.py.patch",
+    "release-src/0023/11-tam_ui-workspace.py.patch",
+    "release-src/0023/12-telegram_admin_manager.py.patch",
+    "release-src/0023/13-tests-test_0008_remaining_summary.py.patch",
+    "release-src/0023/14-tests-test_monitor_presentation.py.patch",
+    "release-src/0023/15-tests-test_monitor_recovery_button.py.patch",
+    "release-src/0023/16-tests-test_monitor_workspace.py.patch",
+    "release-src/0023/17-tests-test_queue_workspace.py.patch",
+    "release-src/0023/18-tests-test_redesign_integration.py.patch",
+    "release-src/0023/19-tests-test_three_tool_ui_v431.py.patch",
+    "release-src/0023/20-tests-test_ui_theme.py.patch",
+    "release-src/0023/21-tests-test_v433_unified_monitor.py.patch",
+    "release-src/0023/22-tests-test_v435_tabbed_ui_eta.py.patch",
+    "release-src/0023/23-tests-test_v438_channels_ui_contract.py.patch",
+    "release-src/0023/24-tests-test_workspace_navigation.py.patch"
   ],
-  "notes": "0022: exposes the unfinished-send recovery button in the unified monitoring window actually used by the application. Version 0021 mistakenly added it only to the separate legacy layout. Existing confirmation, reservation scope, completed-history protections, account and upload behavior remain unchanged. Two native Tk regressions check both layouts, visible button geometry and selected-rule callback."
+  "notes": "0023: redesigned desktop workspace with nine persistent sidebar sections, saved light/dark/system appearance, shared collapsible journal, transfer summary and selected-rule details. Recovery actions stay visible at small window sizes and high DPI; rule rows update in place. The existing upload queue has a dedicated page; manual tasks/import remain accessible, pause controls synchronize across views, and account registration remains separate from monitoring participation. Long forms scroll with editor Save kept visible. Upload history, reservation confirmation, account selection, Premium routing and Telegram request policies are preserved."
 }

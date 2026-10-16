@@ -1,0 +1,38 @@
+--- a/app/tam_ui/task_editor.py
++++ b/app/tam_ui/task_editor.py
+@@ -11,8 +11,8 @@
+     def __init__(self, parent: tk.Misc, accounts: list[Any], task: dict[str, Any] | None = None):
+         super().__init__(parent)
+         self.title("Задание загрузки")
+-        self.geometry("920x930")
+-        self.minsize(820, 800)
++        self.geometry(f"920x{min(780, self.winfo_screenheight()-100)}")
++        self.minsize(760, 550)
+         self.transient(parent)
+         self.result: dict[str, Any] | None = None
+         self.accounts = accounts
+@@ -20,8 +20,11 @@
+ 
+         self.columnconfigure(0, weight=1)
+         self.rowconfigure(0, weight=1)
+-        body = ttk.Frame(self, padding=14)
+-        body.grid(row=0, column=0, sticky="nsew")
++        from tam_ui.scrollable import ScrollableFrame
++        scroll = ScrollableFrame(self)
++        scroll.grid(row=0, column=0, sticky='nsew')
++        body = scroll.content
++        body.configure(padding=14)
+         body.columnconfigure(1, weight=1)
+         body.rowconfigure(7, weight=1)
+ 
+@@ -201,8 +204,8 @@
+             text="Шаблоны: {filename}  {stem}  {index}  {total}  {task}",
+         ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+ 
+-        buttons = ttk.Frame(body)
+-        buttons.grid(row=11, column=0, columnspan=2, sticky="e", pady=(12, 0))
++        buttons = ttk.Frame(self, padding=(14, 8))
++        buttons.grid(row=1, column=0, sticky="ew")
+         ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side="right")
+         ttk.Button(buttons, text="Сохранить", command=self._save).pack(side="right", padx=(0, 8))
+ 

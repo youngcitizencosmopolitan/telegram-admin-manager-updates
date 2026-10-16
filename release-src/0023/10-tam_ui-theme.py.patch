@@ -1,0 +1,174 @@
+--- /dev/null
++++ b/app/tam_ui/theme.py
+@@ -0,0 +1,171 @@
++"""Application-owned colors; no upload or network dependencies."""
++from __future__ import annotations
++
++import tkinter as tk
++import weakref
++from tkinter import ttk
++
++PALETTES = {
++    'light': dict(background='#f3f6fb', surface='#ffffff', field='#f7f9fc',
++                  text='#172233', muted='#526278', border='#dce3ed',
++                  selected='#e6efff', accent='#225bc5', accent_text='#ffffff',
++                  success='#12623f', warning='#805000', warning_bg='#fff1d6',
++                  error='#a51c2b', error_bg='#ffedf0', uploading='#205ac1'),
++    'dark': dict(background='#111722', surface='#19212e', field='#121a27',
++                 text='#e8edf6', muted='#a9b6ca', border='#344257',
++                 selected='#293e5e', accent='#94baff', accent_text='#101c30',
++                 success='#7ed7ac', warning='#ffd18a', warning_bg='#382c1c',
++                 error='#ffb2bb', error_bg='#40212a', uploading='#94baff'),
++}
++
++
++def resolve_theme(preference: str, system_dark: bool) -> str:
++    return preference if preference in ('light', 'dark') else ('dark' if system_dark else 'light')
++
++
++def system_is_dark() -> bool:
++    try:
++        import winreg
++        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
++                            r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as key:
++            return not bool(winreg.QueryValueEx(key, 'AppsUseLightTheme')[0])
++    except (ImportError, OSError):
++        return False
++
++
++class ThemeManager:
++    def __init__(self, root, store):
++        self.root, self.store = root, store
++        self.roles = weakref.WeakKeyDictionary()
++        self.style = ttk.Style(root)
++        self.preference = str(store.data.get('ui_theme', 'system'))
++        if self.preference not in ('system', 'light', 'dark'):
++            self.preference = 'system'
++        self.current = resolve_theme(self.preference, system_is_dark())
++        self._apply_styles()
++        root.bind_all('<Map>', self._on_map, add='+')
++
++    @property
++    def colors(self):
++        return PALETTES[self.current]
++
++    def register(self, widget, role: str = 'default') -> None:
++        self.roles[widget] = role
++        self._style_widget(widget)
++
++    def apply(self, preference: str) -> None:
++        preference = preference if preference in ('system', 'light', 'dark') else 'system'
++        self.preference = preference
++        self.current = resolve_theme(preference, system_is_dark())
++        self._apply_styles()
++        self._walk(self.root)
++        for widget in list(self.roles):
++            self._style_widget(widget)
++        if self.store.data.get('ui_theme', 'system') != preference:
++            self.store.data['ui_theme'] = preference
++            self.store.save()
++        self.root.event_generate('<<AppThemeChanged>>', when='tail')
++
++    def _apply_styles(self):
++        s, c = self.style, self.colors
++        if s.theme_use() != 'clam':
++            s.theme_use('clam')
++        s.configure('.', background=c['background'], foreground=c['text'],
++                    font=('Segoe UI', 10), bordercolor=c['border'],
++                    lightcolor=c['surface'], darkcolor=c['border'],
++                    troughcolor=c['field'], selectbackground=c['selected'],
++                    selectforeground=c['text'])
++        s.configure('TFrame', background=c['background'])
++        s.configure('Surface.TFrame', background=c['surface'])
++        s.configure('TLabel', background=c['background'], foreground=c['text'])
++        s.configure('Surface.TLabel', background=c['surface'])
++        s.configure('Muted.TLabel', foreground=c['muted'])
++        s.configure('Title.TLabel', font=('Segoe UI', 20, 'bold'))
++        s.configure('Section.TLabel', font=('Segoe UI', 11, 'bold'))
++        s.configure('Value.TLabel', font=('Segoe UI', 20, 'bold'), background=c['surface'])
++        s.configure('Caption.TLabel', foreground=c['muted'], background=c['surface'])
++        s.configure('Warning.TLabel', foreground=c['warning'])
++        s.configure('Success.TLabel', foreground=c['success'])
++        s.configure('TLabelframe', background=c['background'], bordercolor=c['border'])
++        s.configure('TLabelframe.Label', foreground=c['muted'], background=c['background'])
++        s.configure('TButton', padding=(10, 7), background=c['surface'], bordercolor=c['border'])
++        s.map('TButton', background=[('active', c['selected']), ('pressed', c['selected'])],
++              foreground=[('disabled', c['muted'])])
++        s.configure('Primary.TButton', background=c['accent'], foreground=c['accent_text'])
++        s.map('Primary.TButton', background=[('active', c['accent']), ('pressed', c['accent'])],
++              foreground=[('disabled', c['muted']), ('!disabled', c['accent_text'])])
++        s.configure('Nav.TButton', anchor='w', padding=(12, 10), background=c['surface'], borderwidth=0, relief='flat')
++        s.configure('ActiveNav.TButton', anchor='w', padding=(12, 10), background=c['selected'], foreground=c['accent'], borderwidth=0, relief='flat')
++        s.map('ActiveNav.TButton', background=[('active', c['selected'])])
++        for name in ('TEntry', 'TSpinbox', 'TCombobox'):
++            s.configure(name, fieldbackground=c['field'], foreground=c['text'],
++                        insertcolor=c['text'], padding=6, bordercolor=c['border'])
++            s.map(name, fieldbackground=[('readonly', c['field']), ('disabled', c['background'])],
++                  foreground=[('readonly', c['text']), ('disabled', c['muted'])],
++                  selectbackground=[('!disabled', c['selected'])],
++                  selectforeground=[('!disabled', c['text'])])
++        s.configure('Treeview', background=c['surface'], fieldbackground=c['surface'],
++                    foreground=c['text'], rowheight=32, borderwidth=0)
++        s.map('Treeview', background=[('selected', c['selected'])],
++              foreground=[('selected', c['text'])])
++        s.configure('Treeview.Heading', background=c['field'], foreground=c['muted'],
++                    font=('Segoe UI', 9), padding=(9, 9))
++        s.map('Treeview.Heading', background=[('active', c['selected'])])
++        s.configure('TNotebook', background=c['background'], borderwidth=0)
++        s.configure('TNotebook.Tab', padding=(12, 8), background=c['field'])
++        s.map('TNotebook.Tab', background=[('selected', c['surface'])])
++        s.layout('Pages.TNotebook.Tab', [])
++        s.configure('Horizontal.TProgressbar', background=c['accent'], troughcolor=c['field'], borderwidth=0)
++        s.configure('TCheckbutton', background=c['background'], foreground=c['text'])
++        s.map('TCheckbutton', background=[('active', c['background'])])
++
++    def _on_map(self, event):
++        self._style_widget(event.widget)
++
++    def _walk(self, widget):
++        self._style_widget(widget)
++        try:
++            for child in widget.winfo_children():
++                self._walk(child)
++        except tk.TclError:
++            pass
++
++    def _style_widget(self, widget):
++        c = self.colors
++        try:
++            role = self.roles.get(widget, 'default')
++            if isinstance(widget, ttk.Treeview):
++                for tag, color in [('success', 'success'), ('done', 'success'), ('uploading', 'uploading'),
++                                   ('disabled', 'muted'), ('skipped', 'warning'), ('warning', 'warning'), ('blocked', 'warning')]:
++                    widget.tag_configure(tag, foreground=c[color])
++                widget.tag_configure('error', foreground=c['error'], background=c['error_bg'])
++            elif isinstance(widget, tk.Text):
++                widget.configure(bg=c['surface'], fg=c['text'], insertbackground=c['text'],
++                                 selectbackground=c['selected'], selectforeground=c['text'],
++                                 highlightbackground=c['border'], highlightcolor=c['accent'], bd=0)
++                widget.tag_configure('error', foreground=c['error'], background=c['error_bg'])
++            elif isinstance(widget, tk.Listbox):
++                widget.configure(bg=c['surface'], fg=c['text'], selectbackground=c['selected'],
++                                 selectforeground=c['text'], highlightbackground=c['border'], bd=0)
++            elif isinstance(widget, tk.Menu):
++                widget.configure(bg=c['surface'], fg=c['text'], activebackground=c['selected'],
++                                 activeforeground=c['text'], selectcolor=c['accent'])
++            elif isinstance(widget, (tk.Frame, tk.PanedWindow, tk.Toplevel, tk.Tk, tk.Canvas)):
++                widget.configure(bg=c['surface'] if role == 'surface' else c['background'])
++            elif isinstance(widget, (tk.Label, tk.Button, tk.Checkbutton, tk.Radiobutton)):
++                foreground = c.get(role, c['text'])
++                widget.configure(bg=c['surface'] if role == 'surface' else c['background'], fg=foreground)
++            elif isinstance(widget, (tk.Entry, tk.Spinbox)):
++                widget.configure(bg=c['field'], fg=c['text'], insertbackground=c['text'])
++            elif isinstance(widget, ttk.Label):
++                # Explicit old colors must not remain unreadable after a theme change.
++                old = str(widget.cget('foreground')).lower()
++                semantic = {'#b42318':'error', '#a51c2b':'error', '#1a7f37':'success', '#18794e':'success',
++                            '#666666':'muted', '#64748b':'muted', '#8a5a00':'warning'}
++                if role != 'default' or old:
++                    if role == 'default':
++                        role = semantic.get(old, 'text')
++                        self.roles[widget] = role
++                    widget.configure(foreground=c.get(role, c['text']))
++        except (tk.TclError, AttributeError, TypeError):
++            pass

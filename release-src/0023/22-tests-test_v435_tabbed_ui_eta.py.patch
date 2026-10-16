@@ -1,0 +1,34 @@
+--- a/app/tests/test_v435_tabbed_ui_eta.py
++++ b/app/tests/test_v435_tabbed_ui_eta.py
+@@ -4,6 +4,7 @@
+ import telegram_admin_manager as main_app
+ import batch_uploader
+ from batch_uploader import BatchUploaderPane, _fmt_eta
++from tam_ui.monitor_view import MonitorView
+ 
+ 
+ class MainTabbedUiTests(unittest.TestCase):
+@@ -17,8 +18,8 @@
+     def test_main_tab_labels_keep_primary_tools_visible(self):
+         self.assertTrue(hasattr(main_app, "MAIN_TAB_SPECS"))
+         labels = [label for _key, label in main_app.MAIN_TAB_SPECS]
+-        self.assertEqual(labels[:3], ["Создание групп", "Мониторинг", "Админы"])
+-        self.assertIn("Аккаунты / API", labels)
++        self.assertEqual(labels[:3], ["Мониторинг", "Очередь загрузок", "Аккаунты"])
++        self.assertIn("Настройки", labels)
+         self.assertIn("Twitter / X", labels)
+         self.assertIn("Обновления", labels)
+ 
+@@ -43,9 +44,9 @@
+         self.assertEqual(fn(1000, 1000, 2048), 0.0)
+ 
+     def test_monitor_rules_have_eta_column_next_to_speed(self):
+-        source = inspect.getsource(BatchUploaderPane._build_unified_monitor_ui)
+-        self.assertIn('"speed", "eta", "state"', source)
+-        self.assertIn('"eta": "Осталось"', source)
++        source = inspect.getsource(MonitorView)
++        self.assertIn("'speed', 'eta', 'state'", source)
++        self.assertIn("'eta':'Осталось'", source)
+ 
+     def test_monitor_refresh_calculates_and_renders_eta(self):
+         source = inspect.getsource(BatchUploaderPane.refresh_monitor_tab)

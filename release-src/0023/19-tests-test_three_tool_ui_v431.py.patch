@@ -1,0 +1,11 @@
+--- a/app/tests/test_three_tool_ui_v431.py
++++ b/app/tests/test_three_tool_ui_v431.py
+@@ -46,7 +46,7 @@
+ class SimplifiedWorkflowStructureTests(unittest.TestCase):
+     def test_root_builds_tabbed_workspace_instead_of_dashboard(self):
+         source = inspect.getsource(main_app.TelegramAdminManager._build_ui)
+-        self.assertIn("MAIN_TAB_SPECS", source)
++        self.assertIn("PAGE_SPECS", source)
+         self.assertIn("main_notebook", source)
+         self.assertNotIn("dashboard_metric_vars", source)
+         self.assertNotIn("Launcher.TButton", source)
