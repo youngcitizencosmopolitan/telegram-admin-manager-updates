@@ -1,0 +1,64 @@
+--- /dev/null
++++ b/app/tests/test_workspace_navigation.py
+@@ -0,0 +1,61 @@
++import tkinter as tk
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++from tam_ui.theme import ThemeManager
++from tam_ui.workspace import Workspace, PAGE_SPECS
++
++
++class WorkspaceTests(unittest.TestCase):
++    def setUp(self):
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            self.skipTest(str(exc))
++        self.addCleanup(self.root.destroy)
++        self.root.withdraw()
++        self.root.attributes('-alpha', 0)
++        self.root.geometry('1180x700')
++        self.store = SimpleNamespace(data={}, save=Mock())
++        self.theme = ThemeManager(self.root, self.store)
++        self.selected = []
++        self.view = Workspace(self.root, self.theme, self.selected.append)
++        self.view.pack(fill='both', expand=True)
++        self.frames = {key:self.view.add_page(key, title) for key,title in PAGE_SPECS}
++        self.view.select('monitor')
++        self.root.deiconify()
++        self.root.update()
++
++    def test_all_nine_pages_remain_same_objects_and_monitor_is_default(self):
++        self.assertEqual(len(PAGE_SPECS), 9)
++        self.assertEqual(self.view.current, 'monitor')
++        for key in self.frames:
++            self.view.select(key)
++            self.assertIs(self.view.pages[key], self.frames[key])
++            self.assertEqual(self.selected[-1], key)
++
++    def test_journal_toggle_preserves_text_and_saves_only_ui_preference(self):
++        text = tk.Text(self.view.journal_host)
++        text.pack()
++        text.insert('end', 'Не терять сообщение')
++        self.view.set_journal_expanded(True)
++        self.root.update()
++        self.assertTrue(text.winfo_ismapped())
++        self.view.set_journal_expanded(False)
++        self.assertEqual(text.get('1.0', 'end').strip(), 'Не терять сообщение')
++        self.assertFalse(text.winfo_ismapped())
++        self.assertFalse(self.store.data['ui_journal_expanded'])
++
++    def test_navigation_and_theme_controls_fit_small_window(self):
++        for pref in ('light', 'dark'):
++            self.theme.apply(pref)
++            self.root.update()
++            for button in list(self.view.nav_buttons.values()) + [self.view.journal_button]:
++                self.assertTrue(button.winfo_ismapped())
++                self.assertGreaterEqual(button.winfo_rootx(), self.root.winfo_rootx())
++                self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),
++                                     self.root.winfo_rootx()+self.root.winfo_width())
++
++
++if __name__ == '__main__': unittest.main()

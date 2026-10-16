@@ -1,0 +1,69 @@
+--- /dev/null
++++ b/app/tam_ui/scrollable.py
+@@ -0,0 +1,66 @@
++"""Scroll long existing forms without shrinking controls or changing their values."""
++import tkinter as tk
++from tkinter import ttk
++
++
++class ScrollableFrame(ttk.Frame):
++    def __init__(self, parent):
++        super().__init__(parent)
++        self.columnconfigure(0, weight=1); self.rowconfigure(0, weight=1)
++        self.canvas = tk.Canvas(self, bd=0, highlightthickness=0, width=1, height=1)
++        self.canvas.grid(row=0, column=0, sticky='nsew')
++        y = ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
++        y.grid(row=0, column=1, sticky='ns')
++        x = ttk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
++        x.grid(row=1, column=0, sticky='ew')
++        self.canvas.configure(yscrollcommand=lambda first, last: self._scrollbar(y, first, last),
++                              xscrollcommand=lambda first, last: self._scrollbar(x, first, last))
++        self.content = ttk.Frame(self.canvas)
++        self.item = self.canvas.create_window((0, 0), window=self.content, anchor='nw')
++        self.content.bind('<Configure>', self._resize)
++        self.canvas.bind('<Configure>', self._resize)
++        self._wheel_id = self.bind_all('<MouseWheel>', self._wheel, add='+')
++        self._focus_id = self.bind_all('<FocusIn>', self._focus, add='+')
++        self.bind('<Destroy>', self._cleanup, add='+')
++
++    @staticmethod
++    def _scrollbar(bar, first, last):
++        bar.set(first, last)
++        if float(first) <= 0 and float(last) >= 1:
++            bar.grid_remove()
++        else:
++            bar.grid()
++
++    def _resize(self, _event=None):
++        width = max(self.content.winfo_reqwidth(), self.canvas.winfo_width())
++        height = max(self.content.winfo_reqheight(), self.canvas.winfo_height())
++        self.canvas.itemconfigure(self.item, width=width, height=height)
++        self.canvas.configure(scrollregion=(0, 0, width, height))
++
++    def _contains(self, widget):
++        return isinstance(widget, tk.Misc) and str(widget).startswith(str(self.content)+'.')
++
++    def _wheel(self, event):
++        if self._contains(event.widget) and not isinstance(event.widget, (tk.Text, tk.Listbox, ttk.Treeview, ttk.Combobox, ttk.Spinbox)):
++            self.canvas.yview_scroll(-int(event.delta/120), 'units')
++
++    def _focus(self, event):
++        if not self._contains(event.widget):
++            return
++        try:
++            y = event.widget.winfo_rooty()-self.content.winfo_rooty()
++            top = self.canvas.canvasy(0)
++            bottom = top+self.canvas.winfo_height()
++            if y < top or y+event.widget.winfo_height() > bottom:
++                total = max(1, self.content.winfo_height())
++                self.canvas.yview_moveto(max(0, y-12)/total)
++        except tk.TclError:
++            pass
++
++    def _cleanup(self, event):
++        if event.widget is self:
++            for name, token in (('<MouseWheel>', self._wheel_id), ('<FocusIn>', self._focus_id)):
++                try:
++                    self._root()._unbind(('bind', 'all', name), token)
++                except tk.TclError:
++                    pass

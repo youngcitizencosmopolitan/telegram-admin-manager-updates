@@ -1,0 +1,39 @@
+--- a/app/tests/test_v433_unified_monitor.py
++++ b/app/tests/test_v433_unified_monitor.py
+@@ -9,6 +9,7 @@
+ import batch_uploader
+ import telegram_admin_manager as main_app
+ from batch_uploader import BatchUploaderPane
++from tam_ui.monitor_view import MonitorView
+ 
+ 
+ class _RuleRepo:
+@@ -101,20 +102,20 @@
+ 
+     def test_unified_monitor_has_rules_activity_and_direct_caption_action(self):
+         self.assertTrue(hasattr(BatchUploaderPane, "_build_unified_monitor_ui"))
+-        source = inspect.getsource(BatchUploaderPane._build_unified_monitor_ui)
+-        self.assertIn('orient="vertical"', source)
++        source = inspect.getsource(MonitorView)
++        self.assertIn("orient='vertical'", source)
+         self.assertIn("Правила мониторинга", source)
+         self.assertIn("Текущие / последние файлы", source)
+-        self.assertIn("Изменить подпись", source)
+-        self.assertIn("Загрузить сейчас", source)
++        self.assertIn("edit_monitor_caption", source)
++        self.assertIn("enqueue_selected_monitor_rule", source)
+         self.assertNotIn("Очередь загрузок", source)
+ 
+     def test_monitor_rule_table_surfaces_caption_progress_and_speed(self):
+-        build_source = inspect.getsource(BatchUploaderPane._build_unified_monitor_ui)
++        build_source = inspect.getsource(MonitorView)
+         refresh_source = inspect.getsource(BatchUploaderPane.refresh_monitor_tab)
+-        self.assertIn('"caption"', build_source)
+-        self.assertIn('"progress"', build_source)
+-        self.assertIn('"speed"', build_source)
++        self.assertIn("'caption'", build_source)
++        self.assertIn("'progress'", build_source)
++        self.assertIn("'speed'", build_source)
+         self.assertIn('_fmt_speed(speed)', refresh_source)
+ 
+ 

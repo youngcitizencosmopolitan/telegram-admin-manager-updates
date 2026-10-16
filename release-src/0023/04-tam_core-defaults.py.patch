@@ -1,0 +1,11 @@
+--- a/app/tam_core/defaults.py
++++ b/app/tam_core/defaults.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ DEFAULT_CONFIG: dict[str, object] = {
++    "ui_theme": "system",
++    "ui_journal_expanded": False,
+     "api_id": "",
+     "api_hash": "",
+     "controller_session": "",

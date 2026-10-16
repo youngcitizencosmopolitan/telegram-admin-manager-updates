@@ -1,0 +1,34 @@
+--- /dev/null
++++ b/app/tam_ui/monitor_presentation.py
+@@ -0,0 +1,31 @@
++"""Translate existing local state to UI text without querying Telegram."""
++
++
++def rule_presentation(rule: dict, runtime: dict, task_state: dict, *, running: bool, queued: bool) -> dict:
++    active = task_state.get('active', {}) or {}
++    total = int(task_state.get('total_bytes', 0) or 0)
++    done = int(task_state.get('processed_bytes', 0) or 0)
++    done += sum(int(x.get('current', 0) or 0) for x in active.values())
++    blocked = int(task_state.get('blocked', 0) or 0)
++    failed = int(task_state.get('failed', 0) or 0)
++    progress = f'{min(100, done/total*100):.0f}%' if total and not blocked else '—'
++    if blocked:
++        status = 'Загружается · нужен повтор' if active else 'Нужен повтор'
++        detail = f'Для {blocked} отправок результат прошлого запуска не подтвержден. Повтор может создать дубль, если Telegram уже принял файл.'
++    elif failed:
++        status, detail = 'Загрузка · есть ошибки' if active else 'Есть ошибки', f'Ошибок: {failed}. Подробности доступны в журнале.'
++    elif active:
++        status, detail = 'Загружается', 'Файлы обрабатываются выбранными аккаунтами. Текущий этап виден в таблице файлов.'
++    elif running:
++        status, detail = 'Обрабатывается', 'Правило запущено: идёт подготовка файлов или ожидание следующей отправки. Текущий этап виден в таблице файлов.'
++    elif queued:
++        status, detail = 'В очереди', 'Правило ожидает выполнения. Подробности пакета доступны в разделе «Очередь загрузок».'
++    elif not rule.get('monitor_folder', True):
++        status, detail = 'Мониторинг выключен', 'Автоматическая проверка папки выключена. Можно включить её или загрузить правило вручную.'
++    else:
++        status = str(runtime.get('state') or 'Ожидает изменений')
++        detail = status if runtime.get('state') else 'Новые изменения появятся в очереди после проверки папки.'
++    return dict(name=rule.get('name', 'Правило'), folder=rule.get('folder', ''),
++                target=rule.get('target', ''), status=status, progress=progress,
++                detail=detail, recovery_count=blocked, caption=rule.get('caption', ''),
++                interval=f"Проверка каждые {rule.get('monitor_interval', 60)} с")

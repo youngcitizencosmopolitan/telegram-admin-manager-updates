@@ -1,0 +1,14 @@
+--- a/app/tests/test_0008_remaining_summary.py
++++ b/app/tests/test_0008_remaining_summary.py
+@@ -12,8 +12,9 @@
+ 
+     def test_unified_monitor_shows_remaining_upload_summary_line(self):
+         source = inspect.getsource(BatchUploaderPane._build_unified_monitor_ui)
+-        self.assertIn('monitor_transfer_summary_var', source)
+-        self.assertIn('Осталось загрузить:', source)
++        self.assertIn('remaining_var', source)
++        self.assertIn('total_speed_var', source)
++        self.assertIn('eta_var', source)
+ 
+     def test_dashboard_updates_unified_monitor_summary_from_live_metrics(self):
+         source = inspect.getsource(BatchUploaderPane._set_dashboard)

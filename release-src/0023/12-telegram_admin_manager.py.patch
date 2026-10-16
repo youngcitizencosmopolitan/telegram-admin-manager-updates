@@ -1,0 +1,306 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -70,7 +70,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0022"
++APP_VERSION = "0023"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -81,15 +81,8 @@
+     ("admins", "Админы"),
+ )
+ 
+-MAIN_TAB_SPECS = (
+-    ("groups", "Создание групп"),
+-    ("monitor", "Мониторинг"),
+-    ("admins", "Админы"),
+-    ("channels", "Каналы"),
+-    ("accounts", "Аккаунты / API"),
+-    ("x", "Twitter / X"),
+-    ("updates", "Обновления"),
+-)
++from tam_ui.workspace import PAGE_SPECS
++MAIN_TAB_SPECS = PAGE_SPECS
+ 
+ 
+ ADMIN_POLICY_SCHEMA = 2
+@@ -512,99 +505,69 @@
+         return best_name, best_count, best_stamp
+ 
+     def _build_ui(self) -> None:
+-        """Build one persistent tabbed workspace with a shared log on the right."""
++        """Build persistent production pages; navigation never starts a workload."""
++        from tam_ui.theme import ThemeManager
++        from tam_ui.workspace import Workspace, PAGE_SPECS
+         self.geometry("1700x920")
+         self.minsize(1180, 700)
+-        self.configure(bg="#eef2f7")
+-        style = ttk.Style(self)
+-        try:
+-            style.theme_use("clam")
+-        except Exception:
+-            pass
+-        style.configure("Main.TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 8))
+-        style.configure("Quiet.TButton", font=("Segoe UI", 9), padding=(8, 6))
+-
+-        self.columnconfigure(0, weight=1)
+-        self.rowconfigure(0, weight=1)
+-        root = tk.Frame(self, bg="#eef2f7", padx=10, pady=10)
+-        root.grid(row=0, column=0, sticky="nsew")
+-        root.columnconfigure(0, weight=1)
+-        root.rowconfigure(1, weight=1)
+-
+-        header = tk.Frame(root, bg="#eef2f7")
+-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+-        header.columnconfigure(0, weight=1)
+-        tk.Label(
+-            header, text=f"{APP_NAME}  {APP_VERSION}", bg="#eef2f7", fg="#172033",
+-            font=("Segoe UI", 17, "bold"),
+-        ).grid(row=0, column=0, sticky="w")
+-        self.busy_label = tk.Label(
+-            header, text="Готово", bg="#e5eaf1", fg="#334155", padx=12, pady=6,
+-            font=("Segoe UI", 9, "bold"),
+-        )
+-        self.busy_label.grid(row=0, column=1, sticky="e")
+-
+-        self.main_workspace = tk.PanedWindow(
+-            root, orient="horizontal", sashwidth=7, bg="#d8dee8", bd=0, relief="flat"
+-        )
+-        self.main_workspace.grid(row=1, column=0, sticky="nsew")
+-        left = ttk.Frame(self.main_workspace, padding=0)
+-        right = ttk.Frame(self.main_workspace, padding=8)
+-        self.main_workspace.add(left, stretch="always", minsize=820)
+-        self.main_workspace.add(right, minsize=300)
+-        self._tool_panes = {"main_workspace": self.main_workspace}
+-        self.main_workspace.bind("<ButtonRelease-1>", self._save_tool_pane_sashes, add="+")
+-
+-        left.columnconfigure(0, weight=1)
+-        left.rowconfigure(0, weight=1)
+-        self.main_notebook = ttk.Notebook(left, style="Main.TNotebook")
+-        self.main_notebook.grid(row=0, column=0, sticky="nsew")
+-
+-        self.tab_group_factory = ttk.Frame(self.main_notebook, padding=10)
+-        self.monitor_workspace = ttk.Frame(self.main_notebook, padding=10)
+-        self.tab_group = ttk.Frame(self.main_notebook, padding=10)
+-        self.tab_channels = ttk.Frame(self.main_notebook, padding=10)
+-        self.tab_account_api = ttk.Frame(self.main_notebook, padding=10)
+-        self.tab_x_main = ttk.Frame(self.main_notebook, padding=14)
+-        self.tab_updates_main = ttk.Frame(self.main_notebook, padding=14)
+-        tab_frames = {
+-            "groups": self.tab_group_factory,
+-            "monitor": self.monitor_workspace,
+-            "admins": self.tab_group,
+-            "channels": self.tab_channels,
+-            "accounts": self.tab_account_api,
+-            "x": self.tab_x_main,
+-            "updates": self.tab_updates_main,
+-        }
+-        self._main_tabs = tab_frames
+-        for key, label in MAIN_TAB_SPECS:
+-            self.main_notebook.add(tab_frames[key], text=label)
+-
+-        # Shared right-side journal stays visible while switching tabs.
+-        self._build_log_panel(right, title="Журнал")
+-
+-        # Monitoring keeps its hidden compatibility host for the proven queue engine.
++        self.theme_manager = ThemeManager(self, self.store)
++        self.workspace = Workspace(self, self.theme_manager, self._workspace_selected)
++        self.workspace.pack(fill="both", expand=True)
++        pages = {key: self.workspace.add_page(key, title) for key, title in PAGE_SPECS}
++        self._main_tabs = pages
++        self.main_notebook = self.workspace.notebook
++        self.busy_label = self.workspace.busy_label
++        self.tab_group_factory = pages['groups']
++        self.monitor_workspace = pages['monitor']
++        self.queue_workspace = pages['queue']
++        self.tab_group = pages['admins']
++        self.tab_channels = pages['channels']
++        self.tab_account_api = pages['accounts']
++        self.tab_x_main = pages['x']
++        self.tab_updates_main = pages['updates']
++        self._tool_panes = {}
++        text = self._build_log_panel(self.workspace.journal_host, title="Журнал событий")
++        text.configure(height=7)
+         self.monitor_workspace.columnconfigure(0, weight=1)
+         self.monitor_workspace.rowconfigure(0, weight=1)
+-        self.tab_batch_uploader = ttk.Frame(self.monitor_workspace)
++        queue_page = pages['queue']
++        queue_page.columnconfigure(0, weight=1); queue_page.rowconfigure(0, weight=1)
++        self.queue_notebook = ttk.Notebook(queue_page)
++        self.queue_notebook.grid(row=0, column=0, sticky='nsew')
++        self.queue_workspace = ttk.Frame(self.queue_notebook)
++        self.tab_batch_uploader = ttk.Frame(self.queue_notebook, padding=8)
++        self.queue_notebook.add(self.queue_workspace, text='Очередь')
++        self.queue_notebook.add(self.tab_batch_uploader, text='Задания и импорт')
+         self.tab_monitor = self.monitor_workspace
+-
+-        # Accounts/API remain grouped inside one always-visible main tab.
+         self.tab_account_api.columnconfigure(0, weight=1)
+         self.tab_account_api.rowconfigure(0, weight=1)
+         self.advanced_notebook = ttk.Notebook(self.tab_account_api)
+         self.advanced_notebook.grid(row=0, column=0, sticky="nsew")
+-        self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=12)
+-        self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=12)
+-        self.tab_safety = ttk.Frame(self.advanced_notebook, padding=12)
+-        self.tab_statistics = ttk.Frame(self.advanced_notebook, padding=12)
+-        self.tab_settings = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=10)
++        self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=10)
+         self.advanced_notebook.add(self.tab_accounts, text="Аккаунты")
+         self.advanced_notebook.add(self.tab_uploader, text="Быстрая загрузка")
+-        self.advanced_notebook.add(self.tab_safety, text="Безопасность")
+-        self.advanced_notebook.add(self.tab_statistics, text="Статистика")
+-        self.advanced_notebook.add(self.tab_settings, text="Настройки API")
+-
++        settings = pages['settings']
++        settings.columnconfigure(0, weight=1)
++        settings.rowconfigure(1, weight=1)
++        appearance = ttk.Frame(settings, padding=(10, 8))
++        appearance.grid(row=0, column=0, sticky='ew')
++        ttk.Label(appearance, text='Оформление', style='Section.TLabel').pack(side='left')
++        from tam_ui.workspace import THEME_LABELS
++        self.settings_theme_var = tk.StringVar(value=self.workspace.theme_var.get())
++        theme_combo = ttk.Combobox(appearance, textvariable=self.settings_theme_var,
++                                   values=list(THEME_LABELS), state='readonly', width=17)
++        theme_combo.pack(side='left', padx=16)
++        theme_combo.bind('<<ComboboxSelected>>', lambda _e: self.theme_manager.apply(THEME_LABELS[self.settings_theme_var.get()]))
++        self.bind('<<AppThemeChanged>>', lambda _e: self.settings_theme_var.set(self.workspace.theme_var.get()), add='+')
++        self.settings_notebook = ttk.Notebook(settings)
++        self.settings_notebook.grid(row=1, column=0, sticky='nsew')
++        self.tab_safety = ttk.Frame(self.settings_notebook, padding=10)
++        self.tab_statistics = ttk.Frame(self.settings_notebook, padding=10)
++        self.tab_settings = ttk.Frame(self.settings_notebook, padding=10)
++        self.settings_notebook.add(self.tab_safety, text="Безопасность")
++        self.settings_notebook.add(self.tab_statistics, text="Статистика")
++        self.settings_notebook.add(self.tab_settings, text="API и данные")
+         self._build_group_factory_tab()
+         self._build_group_tab()
+         self._build_channels_tab()
+@@ -613,10 +576,18 @@
+         )
+         if hasattr(self.batch_uploader, "monitor_body_pane"):
+             self._tool_panes["monitor_body"] = self.batch_uploader.monitor_body_pane
++            self._tool_panes['monitor_details'] = self.batch_uploader.monitor_details_pane
++            self.batch_uploader.monitor_details_pane.bind('<ButtonRelease-1>', self._save_tool_pane_sashes, add='+')
+             self.batch_uploader.monitor_body_pane.bind(
+                 "<ButtonRelease-1>", self._save_tool_pane_sashes, add="+"
+             )
+         self._build_accounts_tab()
++        participation = ttk.Frame(self.tab_account_api, padding=(10, 8))
++        participation.grid(row=1, column=0, sticky='ew')
++        ttk.Label(participation, text='Регистрация аккаунта и участие в мониторинге настраиваются отдельно.',
++                  style='Muted.TLabel', wraplength=550).pack(side='left')
++        ttk.Button(participation, text='Аккаунты для всех правил…',
++                   command=self.batch_uploader.choose_monitor_accounts_for_all).pack(side='right', padx=8)
+         self._build_uploader_tab()
+         self._build_safety_tab()
+         self._build_statistics_tab()
+@@ -644,7 +615,17 @@
+             self.tab_updates_main, text="Проверить обновления", command=self._show_update_center
+         ).grid(row=2, column=0, sticky="w")
+ 
++        self.workspace.select('monitor')
++        self.theme_manager.apply(self.theme_manager.preference)
+         self.after(450, self._restore_tool_pane_sashes)
++
++    def _workspace_selected(self, key: str) -> None:
++        if key == 'monitor' and hasattr(self, 'batch_uploader'):
++            self.batch_uploader.refresh_monitor_tab(force=True)
++        elif key == 'admins' and hasattr(self, 'admin_accounts_list'):
++            self._refresh_admin_account_list()
++        elif key == 'groups' and hasattr(self, 'factory_creators_list'):
++            self._factory_refresh_account_boxes()
+ 
+     def _build_dashboard_ui_legacy(self) -> None:
+         """Build the v4 single-page dashboard.
+@@ -984,24 +965,17 @@
+             pass
+ 
+     def _open_advanced(self, section: str = "uploads") -> None:
+-        if section in {"groups", "admins", "monitor"}:
++        if section in {'groups', 'admins', 'monitor'}:
+             self._open_primary_tool(section)
+-            return
+-        if section == "uploads":
+-            self._open_primary_tool("monitor")
+-            return
+-        mapping = {
+-            "accounts": self.tab_accounts,
+-            "quick": self.tab_uploader,
+-            "safety": self.tab_safety,
+-            "settings": self.tab_settings,
+-        }
+-        try:
+-            self.main_notebook.select(self.tab_account_api)
+-            self.advanced_notebook.select(mapping.get(section, self.tab_accounts))
+-            self.focus_force()
+-        except Exception:
+-            pass
++        elif section == 'uploads':
++            self._open_primary_tool('queue')
++        elif section in {'safety', 'settings', 'statistics'}:
++            self.workspace.select('settings')
++            self.settings_notebook.select({'safety': self.tab_safety, 'statistics': self.tab_statistics,
++                                            'settings': self.tab_settings}[section])
++        else:
++            self.workspace.select('accounts')
++            self.advanced_notebook.select(self.tab_uploader if section == 'quick' else self.tab_accounts)
+ 
+     def _dashboard_toggle_monitor(self) -> None:
+         try:
+@@ -1244,7 +1218,11 @@
+             if automatic:
+                 self.after(5000, lambda: self.refresh_group_names(force=False, automatic=True))
+             else:
+-                self.dashboard_groups_status.set("Обновление названий отложено до освобождения Telegram-сессий")
++                status = "Обновление названий отложено до освобождения Telegram-сессий"
++                if hasattr(self, 'workspace'):
++                    self.busy_label.configure(text=status)
++                else:
++                    self.dashboard_groups_status.set(status)
+                 self.after(4000, lambda: self.refresh_group_names(force=force, automatic=True))
+             return
+         targets = self._collect_group_targets()
+@@ -2536,9 +2514,12 @@
+         sb2 = ttk.Scrollbar(status_box, orient="vertical", command=self.account_status_tree.yview)
+         sb2.grid(row=0, column=1, sticky="ns")
+         self.account_status_tree.configure(yscrollcommand=sb2.set)
++        status_x = ttk.Scrollbar(status_box, orient='horizontal', command=self.account_status_tree.xview)
++        status_x.grid(row=1, column=0, sticky='ew')
++        self.account_status_tree.configure(xscrollcommand=status_x.set)
+         self._register_sortable_tree(self.account_status_tree, "accounts.status", {"speed": "speed"}, first_descending={"speed"})
+ 
+-        status_buttons = ttk.Frame(status_box); status_buttons.grid(row=1, column=0, sticky="ew", pady=(6, 0))
++        status_buttons = ttk.Frame(status_box); status_buttons.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+         ttk.Label(status_buttons, text="Поле:").pack(side="left")
+         self.account_capability_var = tk.StringVar(value="Использовать вообще")
+         self.account_capability_combo = ttk.Combobox(
+@@ -3665,7 +3646,11 @@
+         upload_tree_sb.grid(row=0, column=1, sticky="ns")
+         self.upload_tree.configure(yscrollcommand=upload_tree_sb.set)
+     def _build_safety_tab(self) -> None:
+-        t = self.tab_safety
++        from tam_ui.scrollable import ScrollableFrame
++        host = self.tab_safety
++        scroll = ScrollableFrame(host)
++        scroll.pack(fill='both', expand=True)
++        t = scroll.content
+         t.columnconfigure(1, weight=1)
+ 
+         ttk.Label(t, text="Безопасный режим", font=("Segoe UI", 14, "bold")).grid(
+@@ -4002,7 +3987,11 @@
+             ))
+ 
+     def _build_settings_tab(self) -> None:
+-        t = self.tab_settings
++        from tam_ui.scrollable import ScrollableFrame
++        host = self.tab_settings
++        scroll = ScrollableFrame(host)
++        scroll.pack(fill='both', expand=True)
++        t = scroll.content
+         t.columnconfigure(1, weight=1)
+ 
+         ttk.Label(

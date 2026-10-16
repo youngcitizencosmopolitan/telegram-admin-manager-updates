@@ -1,0 +1,118 @@
+--- /dev/null
++++ b/app/tam_ui/workspace.py
+@@ -0,0 +1,115 @@
++"""Persistent pages with one sidebar and one journal."""
++from __future__ import annotations
++
++import tkinter as tk
++from tkinter import ttk
++
++PAGE_SPECS = (
++    ('monitor', 'Мониторинг'), ('queue', 'Очередь загрузок'),
++    ('accounts', 'Аккаунты'), ('channels', 'Каналы и группы'),
++    ('admins', 'Админы'), ('groups', 'Создание групп'),
++    ('x', 'Twitter / X'), ('settings', 'Настройки'), ('updates', 'Обновления'),
++)
++THEME_LABELS = {'Как в системе': 'system', 'Светлая': 'light', 'Тёмная': 'dark'}
++
++
++class Workspace(ttk.Frame):
++    def __init__(self, root, theme, on_select):
++        super().__init__(root)
++        self.theme, self.on_select = theme, on_select
++        self.pages, self.nav_buttons = {}, {}
++        self.current = None
++        self.columnconfigure(1, weight=1)
++        self.rowconfigure(0, weight=1)
++        sidebar = ttk.Frame(self, style='Surface.TFrame', padding=(14, 20))
++        sidebar.grid(row=0, column=0, sticky='ns')
++        sidebar.columnconfigure(0, weight=1)
++        ttk.Label(sidebar, text='Telegram Admin', style='Surface.TLabel',
++                  font=('Segoe UI', 13, 'bold')).grid(row=0, column=0, sticky='w', pady=(0, 4))
++        ttk.Label(sidebar, text='Рабочее пространство', style='Caption.TLabel').grid(row=1, column=0, sticky='w', pady=(0, 24))
++        for n, (key, title) in enumerate(PAGE_SPECS, 2):
++            b = ttk.Button(sidebar, text=title, style='Nav.TButton', command=lambda k=key: self.select(k))
++            b.grid(row=n, column=0, sticky='ew', pady=3)
++            self.nav_buttons[key] = b
++        sidebar.rowconfigure(len(PAGE_SPECS)+2, weight=1)
++        ttk.Label(sidebar, text='Настройки и история\nхранятся локально', style='Caption.TLabel').grid(
++            row=len(PAGE_SPECS)+3, column=0, sticky='sw', pady=(16, 0))
++
++        main = ttk.Frame(self, padding=(20, 16))
++        main.grid(row=0, column=1, sticky='nsew')
++        main.columnconfigure(0, weight=1)
++        main.rowconfigure(1, weight=1)
++        head = ttk.Frame(main)
++        head.grid(row=0, column=0, sticky='ew', pady=(0, 14))
++        head.columnconfigure(0, weight=1)
++        self.title_var = tk.StringVar(value='Мониторинг')
++        ttk.Label(head, textvariable=self.title_var, style='Title.TLabel').grid(row=0, column=0, sticky='w')
++        ttk.Label(head, text='Оформление', style='Muted.TLabel').grid(row=0, column=1, padx=(8, 6))
++        self.theme_var = tk.StringVar(value=next(k for k,v in THEME_LABELS.items() if v == theme.preference))
++        self.theme_combo = ttk.Combobox(head, values=list(THEME_LABELS), textvariable=self.theme_var,
++                                        state='readonly', width=15)
++        self.theme_combo.grid(row=0, column=2, sticky='e')
++        self.theme_combo.bind('<<ComboboxSelected>>', lambda _e: theme.apply(THEME_LABELS[self.theme_var.get()]))
++        root.bind('<<AppThemeChanged>>', self._theme_changed, add='+')
++        self.busy_label = ttk.Label(head, text='Готово', style='Muted.TLabel', wraplength=650)
++        self.busy_label.grid(row=1, column=0, columnspan=3, sticky='w', pady=(4, 0))
++        self.notebook = ttk.Notebook(main, style='Pages.TNotebook')
++        self.notebook.grid(row=1, column=0, sticky='nsew')
++        self.notebook.bind('<<NotebookTabChanged>>', self._tab_changed)
++        journal_bar = ttk.Frame(main)
++        journal_bar.grid(row=2, column=0, sticky='ew', pady=(9, 0))
++        self.journal_button = ttk.Button(journal_bar, text='Показать журнал', command=self.toggle_journal)
++        self.journal_button.pack(side='left')
++        self.error_var = tk.StringVar(value='')
++        ttk.Label(journal_bar, textvariable=self.error_var, style='Warning.TLabel').pack(side='left', padx=12)
++        self.journal_host = ttk.Frame(main, padding=(0, 8, 0, 0))
++        self.journal_host.grid(row=3, column=0, sticky='ew')
++        self.expanded = bool(theme.store.data.get('ui_journal_expanded', False))
++        if not self.expanded:
++            self.journal_host.grid_remove()
++        self.journal_button.configure(text='Скрыть журнал' if self.expanded else 'Показать журнал')
++
++    def add_page(self, key: str, title: str):
++        frame = ttk.Frame(self.notebook)
++        self.pages[key] = frame
++        self.notebook.add(frame, text=title)
++        return frame
++
++    def select(self, key: str) -> None:
++        if key in self.pages:
++            self.notebook.select(self.pages[key])
++            self._activate(key)
++
++    def _tab_changed(self, _event=None):
++        selected = self.notebook.select()
++        key = next((k for k, frame in self.pages.items() if str(frame) == selected), None)
++        if key:
++            self._activate(key)
++
++    def _activate(self, key):
++        changed = self.current != key
++        self.current = key
++        self.title_var.set(dict(PAGE_SPECS)[key])
++        for k, button in self.nav_buttons.items():
++            button.configure(style='ActiveNav.TButton' if k == key else 'Nav.TButton')
++        if changed:
++            self.on_select(key)
++
++    def _theme_changed(self, _event=None):
++        self.theme_var.set(next(k for k,v in THEME_LABELS.items() if v == self.theme.preference))
++
++    def toggle_journal(self):
++        self.set_journal_expanded(not self.expanded)
++
++    def set_journal_expanded(self, expanded: bool) -> None:
++        self.expanded = expanded
++        if expanded:
++            self.journal_host.grid()
++        else:
++            self.journal_host.grid_remove()
++        self.journal_button.configure(text='Скрыть журнал' if expanded else 'Показать журнал')
++        self.theme.store.data['ui_journal_expanded'] = expanded
++        self.theme.store.save()
++
++    def set_error_count(self, count: int):
++        self.error_var.set(f'Требуют внимания: {count}' if count else '')

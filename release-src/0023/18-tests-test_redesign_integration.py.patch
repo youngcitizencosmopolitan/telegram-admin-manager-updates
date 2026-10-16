@@ -1,0 +1,252 @@
+--- /dev/null
++++ b/app/tests/test_redesign_integration.py
+@@ -0,0 +1,249 @@
++import tempfile
++import tkinter as tk
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import telegram_admin_manager as main
++REAL_GROUP_NAME_REFRESH = main.TelegramAdminManager.refresh_group_names
++
++
++class RealApplicationFixture(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        root = Path(self.tmp.name)
++        for name, path in {'DATA_DIR':root, 'CONFIG_PATH':root/'config.json',
++                           'UPLOAD_DB_PATH':root/'uploads.db', 'GROUP_CACHE_PATH':root/'group_cache.json',
++                           'LOG_PATH':root/'app.log', 'UPLOAD_ERROR_LOG_PATH':root/'errors.log',
++                           'SESSIONS_DIR':root/'sessions', 'THUMB_CACHE_DIR':root/'thumb_cache'}.items():
++            p = patch.object(main, name, path)
++            p.start(); self.addCleanup(p.stop)
++        for name in ('_maybe_check_for_updates', 'refresh_group_names', '_refresh_group_catalog_ui', '_show_missing_dependency'):
++            p = patch.object(main.TelegramAdminManager, name)
++            p.start(); self.addCleanup(p.stop)
++        scale = {'test_scaled_125_monitor_actions_fit': 96/72*1.25,
++                 'test_scaled_150_monitor_actions_fit': 96/72*1.5}.get(self._testMethodName)
++        if scale:
++            build = main.TelegramAdminManager._build_ui
++            def scaled(app):
++                app.tk.call('tk', 'scaling', scale)
++                build(app)
++            p = patch.object(main.TelegramAdminManager, '_build_ui', scaled)
++            p.start(); self.addCleanup(p.stop)
++        try:
++            self.app = main.TelegramAdminManager()
++        except tk.TclError as exc:
++            if 'display' in str(exc).lower():
++                self.skipTest(str(exc))
++            raise
++        self.app.withdraw()
++        self.app.attributes('-alpha', 0)
++        self.addCleanup(self._destroy_app)
++
++    def _destroy_app(self):
++        for token in self.app.tk.splitlist(self.app.tk.call('after', 'info')):
++            self.app.after_cancel(token)
++        self.app.destroy()
++
++    def test_production_shell_starts_at_monitor_and_keeps_all_sections(self):
++        self.assertTrue(hasattr(self.app, 'workspace'))
++        self.assertEqual(self.app.workspace.current, 'monitor')
++        self.assertEqual(len(self.app.workspace.pages), 9)
++        for key in self.app.workspace.pages:
++            self.app.workspace.select(key)
++            self.assertEqual(self.app.workspace.current, key)
++        self.assertEqual(self.app.batch_uploader.pending_batches, [])
++        self.assertFalse(self.app.batch_uploader.queue_worker_active)
++
++    def test_full_application_theme_switch_keeps_rules_and_queue(self):
++        self.assertTrue(hasattr(self.app, 'theme_manager'))
++        before = self.app.monitor_rules.all()
++        for theme in ('dark', 'light'):
++            self.app.theme_manager.apply(theme)
++            self.app.update_idletasks()
++            self.assertEqual(self.app.monitor_rules.all(), before)
++            self.assertEqual(self.app.store.data['ui_theme'], theme)
++            self.assertFalse(self.app.batch_uploader.queue_worker_active)
++
++    def test_rule_editor_save_stays_visible_and_uses_current_theme(self):
++        from tam_ui.task_editor import TaskEditor
++        from tkinter import ttk
++        self.app.theme_manager.apply('dark')
++        editor = TaskEditor(self.app, [], {'name':'Test', 'folder':self.tmp.name, 'target':'@example'})
++        editor.attributes('-alpha', 0)
++        editor.geometry('800x600')
++        self.addCleanup(lambda: editor.destroy() if editor.winfo_exists() else None)
++        self.app.deiconify(); editor.deiconify(); self.app.update()
++        def walk(w):
++            for child in w.winfo_children():
++                yield child
++                yield from walk(child)
++        saves = [w for w in walk(editor) if isinstance(w, ttk.Button) and w.cget('text') == 'Сохранить']
++        self.assertEqual(len(saves), 1)
++        button = saves[0]
++        self.assertTrue(button.winfo_ismapped())
++        self.assertLessEqual(button.winfo_rooty()+button.winfo_height(), editor.winfo_rooty()+editor.winfo_height())
++        canvas = next(w for w in walk(editor) if isinstance(w, tk.Canvas))
++        self.assertEqual(canvas.cget('bg'), self.app.theme_manager.colors['background'])
++
++    def _assert_scaled_monitor(self):
++        self.app.geometry('1180x700'); self.app.deiconify()
++        view = self.app.batch_uploader.monitor_view
++        view.show_details({'name':'VIP 3 GHI', 'folder':self.tmp.name, 'target':'Группа',
++                           'accounts':'15 выбрано · Premium: 1', 'recovery_count':1,
++                           'detail':'Результат отправки прошлого запуска не подтверждён. Telegram мог принять файл перед сбоем.'})
++        self.app.update()
++        rx, ry = self.app.winfo_rootx(), self.app.winfo_rooty()
++        for w in list(self.app.workspace.nav_buttons.values()) + [view.monitor_button, view.recovery_button]:
++            self.assertTrue(w.winfo_ismapped(), str(w.cget('text')))
++            self.assertLessEqual(w.winfo_rootx()+w.winfo_width(), rx+self.app.winfo_width()+1)
++            self.assertLessEqual(w.winfo_rooty()+w.winfo_height(), ry+self.app.winfo_height()+1,
++                                 (str(w.cget('text')), w.winfo_rooty()-ry, w.winfo_height()))
++
++    def test_scaled_125_monitor_actions_fit(self):
++        self._assert_scaled_monitor()
++
++    def test_scaled_150_monitor_actions_fit(self):
++        self._assert_scaled_monitor()
++
++    def test_active_and_paused_upload_controls_stay_visible(self):
++        app = self.app
++        pane = app.batch_uploader
++        app.geometry('1180x700'); app.deiconify()
++        pane.running = True
++        pane._set_controls_running(True)
++        for paused in (False, True, False):
++            if paused == pane.pause_all_event.is_set():
++                pane.toggle_pause_all()
++            app.update()
++            for w in (pane.pause_all_btn, pane.stop_btn):
++                self.assertTrue(w.winfo_ismapped(), str(w.cget('text')))
++                self.assertLessEqual(w.winfo_rootx()+w.winfo_width(), app.winfo_rootx()+app.winfo_width())
++        self.assertEqual(str(pane.queue_view.pause_button.cget('text')), str(pane.pause_all_btn.cget('text')))
++        pane.running = False
++
++    def test_account_registration_and_usage_actions_stay_accessible(self):
++        from tkinter import ttk
++        self.app.geometry('1180x700'); self.app.deiconify()
++        self.app.workspace.select('accounts'); self.app.update()
++        def walk(widget):
++            for w in widget.winfo_children():
++                yield w
++                yield from walk(w)
++        buttons = {str(w.cget('text')): w for w in walk(self.app.tab_accounts) if isinstance(w, ttk.Button)}
++        for label in ('+ Войти по QR', '+ Войти по номеру', '✓ Разрешить', '✕ Отключить',
++                      'Снять отметку TG', 'Проверить TG'):
++            self.assertTrue(buttons[label].winfo_ismapped(), label)
++        self.assertTrue(str(self.app.account_status_tree.cget('xscrollcommand')))
++
++    def test_selected_rule_details_follow_edit_and_clear_after_deletion(self):
++        from unittest.mock import Mock
++        pane = self.app.batch_uploader
++        rule = dict(id='r1', name='Rule', folder=self.tmp.name, target='@old', monitor_folder=True)
++        self.app.monitor_rules.put(rule)
++        pane.task_states['r1'] = {'blocked':1, 'active':{}}
++        pane.refresh_monitor_tab(force=True)
++        pane.monitor_tree.selection_set('r1')
++        pane._update_monitor_details()
++        self.assertEqual(pane.monitor_view.details['name'].get(), 'Rule')
++        delete = Mock(wraps=pane.monitor_tree.delete)
++        pane.monitor_tree.delete = delete
++        self.app.monitor_rules.put({**rule, 'name':'Changed', 'target':'@new'})
++        pane.refresh_monitor_tab(force=True)
++        delete.assert_not_called()
++        self.assertEqual(pane.monitor_tree.selection(), ('r1',))
++        self.assertEqual(pane.monitor_view.details['name'].get(), 'Changed')
++        self.app.monitor_rules.delete('r1')
++        pane.refresh_monitor_tab(force=True)
++        self.assertIsNone(pane.monitor_view.selected)
++        self.assertEqual(str(pane.monitor_view.recovery_button.cget('state')), 'disabled')
++
++    def test_persisted_unfinished_sends_can_be_checked_before_any_upload(self):
++        import time
++        pane = self.app.batch_uploader
++        rule = dict(id='restarted', name='Restarted', folder=self.tmp.name,
++                    target='@example', monitor_folder=True)
++        self.app.monitor_rules.put(rule)
++        self.app.group_state_cache.mark_metadata('@example', peer_id=-1000000000123)
++        self.app.upload_history.claim_fingerprint('fingerprint', 'Channel:123',
++            Path(self.tmp.name)/'video.mp4', 'previous-run', 'previous-claim')
++        pane.refresh_monitor_tab(force=True)
++        pane.monitor_tree.selection_set('restarted')
++        pane._update_monitor_details()
++        self.assertEqual(pane.task_states, {})
++        button = pane.monitor_view.recovery_button
++        self.assertEqual(str(button.cget('state')), 'normal')
++        with patch.object(pane, '_confirm_unfinished_recovery') as confirm:
++            button.invoke()
++            deadline = time.monotonic()+2
++            while not confirm.called and time.monotonic()<deadline:
++                self.app.update()
++                time.sleep(.01)
++            confirm.assert_called_once()
++            self.assertEqual(len(confirm.call_args.args[1]), 1)
++
++    def test_busy_manual_group_name_refresh_uses_existing_status_and_defers(self):
++        self.app._busy = True
++        with patch.object(main, 'TelegramClient', object()), patch.object(self.app, 'after') as after:
++            REAL_GROUP_NAME_REFRESH(self.app, force=True, automatic=False)
++            after.assert_called_once()
++            self.assertEqual(after.call_args.args[0], 4000)
++        self.assertIn('отложено', str(self.app.busy_label.cget('text')))
++
++    def test_queue_page_owns_the_real_queue_and_navigation_does_not_start_it(self):
++        from unittest.mock import Mock
++        pane = self.app.batch_uploader
++        self.assertTrue(hasattr(pane, 'queue_view'))
++        self.assertIs(pane.queue_tree, pane.queue_view.tree)
++        pane._ensure_queue_worker = Mock()
++        pane._enqueue_batch([{'id':'test-rule', 'name':'VIP', 'folder':self.tmp.name,
++                              'target':'@example'}], source='Тест', notify=False)
++        pane._ensure_queue_worker.reset_mock()
++        before = [dict(x) for x in pane.pending_batches]
++        for key in ('queue', 'monitor', 'accounts', 'queue'):
++            self.app.workspace.select(key)
++        self.assertEqual(pane.pending_batches, before)
++        pane._ensure_queue_worker.assert_not_called()
++
++    def test_buttons_on_main_pages_fit_minimum_window_in_both_themes(self):
++        from tkinter import ttk
++        self.app.geometry('1180x700')
++        self.app.deiconify()
++        rule = dict(id='blocked', name='VIP с длинным названием', folder=self.tmp.name,
++                    target='@example', monitor_folder=True)
++        self.app.monitor_rules.put(rule)
++        pane = self.app.batch_uploader
++        pane.task_states['blocked'] = {'blocked': 2, 'active': {}}
++        pane.refresh_monitor_tab(force=True)
++        pane.monitor_tree.selection_set('blocked')
++        pane._update_monitor_details()
++        def children(widget):
++            for w in widget.winfo_children():
++                yield w
++                yield from children(w)
++        def inside_scroll_canvas(widget):
++            parent = widget.master
++            while parent is not None:
++                if isinstance(parent, tk.Canvas):
++                    return True
++                parent = parent.master
++            return False
++        for pref in ('dark', 'light'):
++            self.app.theme_manager.apply(pref)
++            for key in self.app.workspace.pages:
++                self.app.workspace.select(key)
++                self.app.update()
++                rx, ry = self.app.winfo_rootx(), self.app.winfo_rooty()
++                right, bottom = rx+self.app.winfo_width(), ry+self.app.winfo_height()
++                candidates = list(children(self.app.workspace.pages[key])) + list(self.app.workspace.nav_buttons.values())
++                clipped = [(str(w.cget('text')), w.winfo_rootx()-rx, w.winfo_rooty()-ry,
++                            w.winfo_width(), w.winfo_height()) for w in candidates
++                           if isinstance(w, (ttk.Button, ttk.Menubutton)) and w.winfo_ismapped()
++                           and not inside_scroll_canvas(w)
++                           and (w.winfo_rootx()+w.winfo_width()>right+1 or
++                                w.winfo_rooty()+w.winfo_height()>bottom+1)]
++                self.assertEqual(clipped, [], (pref, key, clipped))
++
++
++if __name__ == '__main__': unittest.main()

@@ -1,0 +1,32 @@
+--- /dev/null
++++ b/app/tests/test_monitor_presentation.py
+@@ -0,0 +1,29 @@
++import unittest
++from tam_ui.monitor_presentation import rule_presentation
++
++
++class RulePresentationTests(unittest.TestCase):
++    def test_blocked_is_not_completed_and_keeps_recovery_count(self):
++        row = rule_presentation({'name':'VIP'}, {}, {'blocked':2, 'processed_bytes':9999,
++                                'total_bytes':10000}, running=False, queued=False)
++        self.assertEqual(row['recovery_count'], 2)
++        self.assertEqual(row['progress'], '—')
++        self.assertIn('подтвержден', row['detail'].lower())
++
++    def test_queue_does_not_invent_premium_or_flood_cause(self):
++        row = rule_presentation({}, {}, {}, running=False, queued=True)
++        self.assertIn('очеред', row['status'].lower())
++        self.assertNotIn('Premium', row['detail'])
++        self.assertNotIn('Flood', row['detail'])
++
++    def test_active_and_disabled_and_failure_are_distinct(self):
++        active = rule_presentation({}, {}, {'total_bytes':100, 'processed_bytes':20,
++            'active':{'s':{'current':30}}}, running=True, queued=False)
++        self.assertEqual(active['progress'], '50%')
++        disabled = rule_presentation({'monitor_folder':False}, {}, {}, running=False, queued=False)
++        self.assertIn('выключ', disabled['status'].lower())
++        failed = rule_presentation({}, {}, {'failed':1}, running=False, queued=False)
++        self.assertIn('ошиб', failed['status'].lower())
++
++
++if __name__ == '__main__': unittest.main()

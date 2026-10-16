@@ -1,0 +1,206 @@
+--- /dev/null
++++ b/app/tam_ui/monitor_view.py
+@@ -0,0 +1,203 @@
++"""Production monitor layout. Commands belong to the existing controller."""
++from __future__ import annotations
++
++import tkinter as tk
++from tkinter import ttk
++
++
++class MonitorView:
++    COMMANDS = ('toggle_monitoring', 'refresh_monitor_tab', 'run_preflight',
++                'choose_monitor_accounts_for_all', 'add_monitor_rule', 'toggle_selected_monitor_rule',
++                'edit_monitor_rule', 'edit_monitor_caption', 'sync_selected_monitor_topics',
++                'enqueue_selected_monitor_rule', 'remove_selected_monitor_rule',
++                'retry_unfinished_uploads', 'clear_selected_group_cache', '_save_cache_ttl',
++                'resume_queue', 'toggle_pause_all', 'stop', 'clear_finished_activity')
++
++    def __init__(self, parent, commands: dict, metrics: dict | None = None, *, ttl='24', on_select=None, queue_var=None):
++        self.commands = commands
++        self.selected = None
++        self.frame = ttk.Frame(parent)
++        self.frame.columnconfigure(0, weight=1)
++        self.frame.rowconfigure(2, weight=1)
++        metrics = metrics or {}
++        self.metric_vars = {}
++        stats = ttk.Frame(self.frame)
++        stats.grid(row=0, column=0, sticky='ew', pady=(0, 12))
++        for n, (label, key, default) in enumerate((('Осталось загрузить', 'remaining', '0 Б'),
++                                                 ('Общая скорость', 'speed', '—'),
++                                                 ('До завершения', 'eta', '—'))):
++            stats.columnconfigure(n, weight=1, uniform='stat')
++            card = ttk.Frame(stats, style='Surface.TFrame', padding=(16, 10))
++            card.grid(row=0, column=n, sticky='nsew', padx=(0 if n == 0 else 7, 0))
++            ttk.Label(card, text=label, style='Caption.TLabel').pack(anchor='w')
++            self.metric_vars[key] = metrics.get(key) or tk.StringVar(value=default)
++            ttk.Label(card, textvariable=self.metric_vars[key], style='Value.TLabel').pack(anchor='w')
++            if key == 'remaining' and 'files' in metrics:
++                files_line = ttk.Frame(card, style='Surface.TFrame')
++                files_line.pack(anchor='w')
++                ttk.Label(files_line, text='Файлы: ', style='Caption.TLabel').pack(side='left')
++                ttk.Label(files_line, textvariable=metrics['files'], style='Caption.TLabel').pack(side='left')
++        top = ttk.Frame(self.frame)
++        top.grid(row=1, column=0, sticky='ew', pady=(0, 10))
++        self.state_var = tk.StringVar(value='Остановлен')
++        ttk.Label(top, textvariable=self.state_var, style='Success.TLabel').pack(side='left', padx=(0, 12))
++        self.monitor_button = ttk.Button(top, text='Включить мониторинг', command=commands['toggle_monitoring'])
++        self.monitor_button.pack(side='left')
++        ttk.Button(top, text='Аккаунты для всех правил…', command=commands['choose_monitor_accounts_for_all']).pack(side='left', padx=6)
++        ttk.Button(top, text='+ Правило', style='Primary.TButton', command=commands['add_monitor_rule']).pack(side='right')
++        more = ttk.Menubutton(top, text='Ещё')
++        more.pack(side='right', padx=6)
++        menu = tk.Menu(more, tearoff=False)
++        more.configure(menu=menu)
++        menu.add_command(label='Обновить', command=commands['refresh_monitor_tab'])
++        menu.add_command(label='Preflight — проверить готовность', command=commands['run_preflight'])
++
++        self.details_pane = tk.PanedWindow(self.frame, orient='horizontal', sashwidth=7, bd=0, relief='flat')
++        self.details_pane.grid(row=2, column=0, sticky='nsew')
++        self.body_pane = tk.PanedWindow(self.details_pane, orient='vertical', sashwidth=7, bd=0, relief='flat')
++        self.details_pane.add(self.body_pane, minsize=420, stretch='always')
++        details_width = max(280, round(parent.winfo_fpixels('1i')/96*280))
++        inspector = ttk.Frame(self.details_pane, padding=(12, 0, 0, 0), width=details_width)
++        self.details_pane.add(inspector, minsize=265, width=details_width, stretch='never')
++        inspector.columnconfigure(0, weight=1)
++        inspector.rowconfigure(3, weight=1)
++        wrap = details_width-35
++
++        rules = ttk.LabelFrame(self.body_pane, text='Правила мониторинга', padding=6)
++        rules.columnconfigure(0, weight=1); rules.rowconfigure(0, weight=1)
++        self.body_pane.add(rules, minsize=155, stretch='always')
++        cols = ('on', 'folder', 'target', 'caption', 'interval', 'new', 'queue', 'progress', 'speed', 'eta', 'state')
++        self.tree = ttk.Treeview(rules, columns=cols, displaycolumns=('queue', 'progress', 'speed', 'eta'),
++                                 show='tree headings', selectmode='browse', height=7)
++        headings = {'#0':'Правило', 'on':'Мон.', 'folder':'Папка', 'target':'Группа', 'caption':'Подпись',
++                    'interval':'Интервал', 'new':'Новые', 'queue':'Состояние', 'progress':'%', 'speed':'Скорость',
++                    'eta':'Осталось', 'state':'Подробности'}
++        widths = {'#0':155, 'queue':170, 'progress':60, 'speed':95, 'eta':85}
++        for key, label in headings.items():
++            self.tree.heading(key, text=label)
++            self.tree.column(key, width=widths.get(key, 130), minwidth=45, stretch=key in ('#0', 'queue'))
++        self.tree.grid(row=0, column=0, sticky='nsew')
++        y = ttk.Scrollbar(rules, orient='vertical', command=self.tree.yview)
++        y.grid(row=0, column=1, sticky='ns')
++        x = ttk.Scrollbar(rules, orient='horizontal', command=self.tree.xview)
++        x.grid(row=1, column=0, sticky='ew')
++        self.tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
++        if on_select:
++            self.tree.bind('<<TreeviewSelect>>', lambda _e: on_select())
++        self.summary_var = tk.StringVar(value='Правил: 0')
++        ttk.Label(rules, textvariable=self.summary_var, style='Muted.TLabel').grid(row=2, column=0, sticky='w')
++
++        self.details = {key:tk.StringVar(value='') for key in ('name', 'folder', 'target', 'accounts', 'detail', 'status', 'caption', 'interval')}
++        ttk.Label(inspector, textvariable=self.details['name'], font=('Segoe UI', 13, 'bold'),
++                  wraplength=wrap).grid(row=0, column=0, sticky='w', pady=(2, 6))
++        ttk.Label(inspector, textvariable=self.details['status'], style='Warning.TLabel',
++                  wraplength=wrap).grid(row=1, column=0, sticky='w', pady=(0, 6))
++        self.recovery_button = ttk.Button(inspector, text='Незавершённые отправки…',
++            command=commands['retry_unfinished_uploads'], state='disabled')
++        self.recovery_button.grid(row=2, column=0, sticky='ew', pady=(0, 8))
++        from tam_ui.scrollable import ScrollableFrame
++        details_scroll = ScrollableFrame(inspector)
++        details_scroll.grid(row=3, column=0, sticky='nsew', pady=(0, 8))
++        detail_host = details_scroll.content
++        detail_host.columnconfigure(0, weight=1)
++        for row, (label, key) in enumerate((('Папка', 'folder'), ('Группа', 'target'), ('Аккаунты', 'accounts')), 2):
++            block = ttk.Frame(detail_host)
++            block.grid(row=row, column=0, sticky='ew', pady=(0, 7)); block.columnconfigure(0, weight=1)
++            if key == 'folder':
++                ttk.Label(block, text=label, style='Muted.TLabel').grid(row=0, column=0, sticky='w')
++                ttk.Entry(block, textvariable=self.details[key], state='readonly', width=25).grid(row=1, column=0, sticky='ew')
++            else:
++                ttk.Label(block, textvariable=self.details[key], wraplength=wrap-20).grid(row=0, column=0, sticky='w')
++        ttk.Label(detail_host, textvariable=self.details['interval'], wraplength=wrap-20,
++                  style='Muted.TLabel').grid(row=5, column=0, sticky='w', pady=(0, 7))
++        caption = ttk.Frame(detail_host)
++        caption.grid(row=6, column=0, sticky='ew', pady=(0, 8)); caption.columnconfigure(0, weight=1)
++        ttk.Label(caption, text='Подпись', style='Muted.TLabel').grid(row=0, column=0, sticky='w')
++        ttk.Entry(caption, textvariable=self.details['caption'], state='readonly', width=25).grid(row=1, column=0, sticky='ew')
++        ttk.Label(detail_host, textvariable=self.details['detail'], wraplength=wrap-20,
++                  style='Warning.TLabel').grid(row=7, column=0, sticky='ew', pady=(0, 8))
++        actions = ttk.Frame(inspector)
++        actions.grid(row=4, column=0, sticky='ew')
++        actions.columnconfigure(0, weight=1); actions.columnconfigure(1, weight=1)
++        for n, (label, key) in enumerate((('Изменить', 'edit_monitor_rule'), ('Загрузить', 'enqueue_selected_monitor_rule'))):
++            ttk.Button(actions, text=label, command=commands[key]).grid(row=n//2, column=n%2, sticky='ew', padx=2, pady=2)
++        settings = ttk.Menubutton(inspector, text='Темы, кеш и действия…')
++        settings.grid(row=5, column=0, sticky='ew', pady=(6, 0))
++        context = tk.Menu(settings, tearoff=False); settings.configure(menu=context)
++        context.add_command(label='Включить / выключить правило', command=commands['toggle_selected_monitor_rule'])
++        context.add_command(label='Изменить подпись…', command=commands['edit_monitor_caption'])
++        context.add_command(label='Синхронизировать темы', command=commands['sync_selected_monitor_topics'])
++        context.add_command(label='Настроить кеш Telegram', command=self.toggle_cache)
++        context.add_command(label='Сбросить кеш выбранной группы', command=commands['clear_selected_group_cache'])
++        context.add_separator()
++        context.add_command(label='Удалить правило…', command=commands['remove_selected_monitor_rule'])
++        self.cache_frame = ttk.Frame(detail_host)
++        self.cache_frame.grid(row=8, column=0, sticky='ew', pady=5)
++        ttk.Label(self.cache_frame, text='Не перепроверять, часов\n0 = без срока', style='Muted.TLabel').pack(side='left')
++        self.cache_ttl_var = tk.StringVar(value=ttl)
++        spin = ttk.Spinbox(self.cache_frame, from_=0, to=720, width=5,
++                           textvariable=self.cache_ttl_var, command=commands['_save_cache_ttl'])
++        spin.pack(side='right'); spin.bind('<FocusOut>', lambda _e: commands['_save_cache_ttl']())
++        self.cache_frame.grid_remove()
++
++        files = ttk.LabelFrame(self.body_pane, text='Текущие / последние файлы', padding=6)
++        files.columnconfigure(0, weight=1); files.rowconfigure(1, weight=1)
++        self.body_pane.add(files, minsize=155, stretch='always')
++        file_tools = ttk.Frame(files); file_tools.grid(row=0, column=0, sticky='ew', pady=(0, 6))
++        self.resume_button = ttk.Button(file_tools, text='Продолжить', command=commands['resume_queue'], state='disabled')
++        self.resume_button.pack(side='left')
++        self.pause_button = ttk.Button(file_tools, text='Пауза', command=commands['toggle_pause_all'], state='disabled')
++        self.pause_button.pack(side='left', padx=4)
++        self.stop_button = ttk.Button(file_tools, text='Стоп', command=commands['stop'], state='disabled')
++        self.stop_button.pack(side='left')
++        ttk.Button(file_tools, text='Очистить завершённые', command=commands['clear_finished_activity']).pack(side='right')
++        acols = ('task', 'account', 'size', 'progress', 'speed', 'status')
++        self.activity = ttk.Treeview(files, columns=acols, show='tree headings', height=5, selectmode='browse')
++        self.activity_headings = {'#0':'Файл', 'task':'Правило', 'account':'Аккаунт', 'size':'Размер',
++                                 'progress':'%', 'speed':'Скорость', 'status':'Статус'}
++        for key, label in self.activity_headings.items():
++            self.activity.heading(key, text=label)
++            self.activity.column(key, width=210 if key == '#0' else 160 if key == 'status' else 95,
++                                 minwidth=55, stretch=key in ('#0', 'status'))
++        self.activity.grid(row=1, column=0, sticky='nsew')
++        ay = ttk.Scrollbar(files, orient='vertical', command=self.activity.yview); ay.grid(row=1, column=1, sticky='ns')
++        ax = ttk.Scrollbar(files, orient='horizontal', command=self.activity.xview); ax.grid(row=2, column=0, sticky='ew')
++        self.activity.configure(yscrollcommand=ay.set, xscrollcommand=ax.set)
++        self.queue_var = queue_var or tk.StringVar(value='Очередь пуста')
++        ttk.Label(files, textvariable=self.queue_var, style='Muted.TLabel').grid(row=3, column=0, sticky='w')
++        for tag, color in [('uploading','#205ac1'), ('success','#12623f'), ('error','#a51c2b'), ('skipped','#805000')]:
++            self.activity.tag_configure(tag, foreground=color)
++        self.show_details({})
++
++    def toggle_cache(self):
++        if self.cache_frame.winfo_manager():
++            self.cache_frame.grid_remove()
++        else:
++            self.cache_frame.grid()
++
++    def select_rule(self, tid: str | None):
++        self.selected = tid
++
++    def update_rule(self, tid: str, presentation: dict):
++        args = dict(text=presentation['name'], values=presentation['values'])
++        if self.tree.exists(tid):
++            self.tree.item(tid, **args)
++        else:
++            self.tree.insert('', 'end', iid=tid, **args)
++
++    def update_totals(self, values: dict):
++        for key, value in values.items():
++            if key in self.metric_vars:
++                self.metric_vars[key].set(value)
++
++    def show_details(self, data: dict):
++        for key, variable in self.details.items():
++            value = str(data.get(key) or ('Выбери правило' if key == 'name' else '—'))
++            if key in ('accounts', 'target'):
++                value = ('Аккаунты: ' if key == 'accounts' else 'Группа: ') + value
++            variable.set(value)
++        if not data.get('status'):
++            self.details['status'].set('Нужен повтор отправки' if data.get('recovery_count') else '')
++        # Reservations survive restarts; their transient display count does not.
++        # The scoped read and confirmation remain authoritative on invocation.
++        self.recovery_button.configure(state='normal' if self.selected and data else 'disabled')

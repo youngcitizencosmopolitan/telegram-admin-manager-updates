@@ -1,0 +1,11 @@
+--- a/app/tests/test_v438_channels_ui_contract.py
++++ b/app/tests/test_v438_channels_ui_contract.py
+@@ -7,7 +7,7 @@
+ class V438ChannelsUiContractTests(unittest.TestCase):
+     def test_tab_order_contains_channels_between_admins_and_accounts(self):
+         keys = [key for key, _label in app.MAIN_TAB_SPECS]
+-        self.assertEqual(keys, ['groups', 'monitor', 'admins', 'channels', 'accounts', 'x', 'updates'])
++        self.assertEqual(keys, ['monitor', 'queue', 'accounts', 'channels', 'admins', 'groups', 'x', 'settings', 'updates'])
+ 
+     def test_channel_column_guard_and_builder_exist(self):
+         self.assertIn('Название', app.CHANNEL_COLUMN_LABELS.values())
