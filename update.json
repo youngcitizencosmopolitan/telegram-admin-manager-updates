@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0021",
-  "display_version": "0021",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0021/TelegramAdminManager_v0021_update.zip",
-  "sha256": "d1879073a69b686553c98523a0ae3498737124dd2f049d33c3b601c7098d85cf",
-  "notes": "0021: interrupted uploads from previous runs appear as unconfirmed sends instead of completed duplicates. Scoped, explicitly confirmed recovery protects completed history and current claims, and queues a durable retry after any active batch. Monitoring keeps pending signatures for occupied rules and stops repeated unchanged submissions and false queue messages. Blocked progress cannot show 100%; account selection and Premium large-file priority remain unchanged. Includes 13 regression tests; 343 tests pass with application dependencies."
+  "version": "4.3.8.0022",
+  "display_version": "0022",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0022/TelegramAdminManager_v0022_update.zip",
+  "sha256": "87bfb2ddd659116256a4dcdf9e5b3b84bdf0c6450f0c874f16bae4ae618bcb7b",
+  "notes": "0022: exposes the unfinished-send recovery button in the unified monitoring window actually used by the application. Version 0021 mistakenly added it only to the separate legacy layout. Existing confirmation, reservation scope, completed-history protections, account and upload behavior remain unchanged. Two native Tk regressions check both layouts, visible button geometry and selected-rule callback."
 }
