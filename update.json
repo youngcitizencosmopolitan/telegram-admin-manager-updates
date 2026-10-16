@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0022",
-  "display_version": "0022",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0022/TelegramAdminManager_v0022_update.zip",
-  "sha256": "87bfb2ddd659116256a4dcdf9e5b3b84bdf0c6450f0c874f16bae4ae618bcb7b",
-  "notes": "0022: exposes the unfinished-send recovery button in the unified monitoring window actually used by the application. Version 0021 mistakenly added it only to the separate legacy layout. Existing confirmation, reservation scope, completed-history protections, account and upload behavior remain unchanged. Two native Tk regressions check both layouts, visible button geometry and selected-rule callback."
+  "version": "4.3.8.0023",
+  "display_version": "0023",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0023/TelegramAdminManager_v0023_update.zip",
+  "sha256": "a03998a61f61b8e3d4a1dcb102098858eefdac59f6a56f888e677520cfac927d",
+  "notes": "0023: redesigned desktop workspace with nine persistent sidebar sections, saved light/dark/system appearance, shared collapsible journal, transfer summary and selected-rule details. Recovery actions stay visible at small window sizes and high DPI; rule rows update in place. The existing upload queue has a dedicated page; manual tasks/import remain accessible, pause controls synchronize across views, and account registration remains separate from monitoring participation. Long forms scroll with editor Save kept visible. Upload history, reservation confirmation, account selection, Premium routing and Telegram request policies are preserved."
 }
