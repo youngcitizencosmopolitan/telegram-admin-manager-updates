@@ -1,0 +1,31 @@
+--- a/app/tests/test_redesign_integration.py
++++ b/app/tests/test_redesign_integration.py
+@@ -183,6 +183,28 @@
+             confirm.assert_called_once()
+             self.assertEqual(len(confirm.call_args.args[1]), 1)
+ 
++    def test_activity_opens_exact_rule_and_recovery_after_later_batch(self):
++        pane = self.app.batch_uploader
++        rule = dict(id='r1', name='Same name', folder=self.tmp.name, target='@example', monitor_folder=True)
++        self.app.monitor_rules.put(rule)
++        self.app.monitor_rules.put({**rule, 'id':'r2'})
++        path = Path(self.tmp.name)/'unfinished.mp4'
++        pane._activity_update(f'r1:{path}', 'Same name', path, 'account', 12, 0, 0,
++                              '⚠ Незавершённая отправка прошлого запуска')
++        self.assertTrue(pane.activity.bind('<Double-1>'), 'File rows need a route to their exact rule')
++        pane._remember_unconfirmed(rule, path, True)
++        pane.task_states = {'r2': {'total_files':226, 'processed_files':226}}
++        pane.refresh_monitor_tab(force=True)
++        self.assertIn('повтор', pane.monitor_tree.set('r1', 'queue').lower())
++        pane.activity.selection_set(next(iter(pane.activity_rows.values())))
++        pane._open_activity_rule()
++        self.assertEqual(pane.monitor_tree.selection(), ('r1',))
++        self.assertIn('1', pane.monitor_view.details['detail'].get())
++        self.assertEqual(str(pane.monitor_view.recovery_button.cget('state')), 'normal')
++        pane._set_dashboard(0, 226, 226, 0, None, 0, 100)
++        self.assertNotEqual(pane.remaining_var.get(), '0 Б')
++        self.assertIn('1', pane.remaining_var.get())
++
+     def test_busy_manual_group_name_refresh_uses_existing_status_and_defers(self):
+         self.app._busy = True
+         with patch.object(main, 'TelegramClient', object()), patch.object(self.app, 'after') as after:
