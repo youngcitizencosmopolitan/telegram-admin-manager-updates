@@ -1,0 +1,75 @@
+--- /dev/null
++++ b/app/tests/test_unconfirmed_status.py
+@@ -0,0 +1,72 @@
++import unittest
++from pathlib import Path
++
++from batch_uploader import BatchUploaderPane
++from tam_core.monitor_delta import monitor_identity
++
++
++class UnconfirmedStatusTests(unittest.TestCase):
++    def setUp(self):
++        self.pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        self.rule = {'id': 'r1', 'folder': '.', 'target': '@group'}
++        self.pane.task_states = {}
++        self.assertTrue(callable(getattr(self.pane, '_remember_unconfirmed', None)),
++                        'Unconfirmed sends need state independent of the current batch')
++
++    def test_later_batch_does_not_hide_previous_unconfirmed_file(self):
++        self.pane._remember_unconfirmed(self.rule, Path('old.mp4'), True)
++        self.pane.task_states = {'r2': {'processed_files': 226, 'total_files': 226}}
++        self.assertEqual(self.pane._monitor_display_state('r1', self.rule)['blocked'], 1)
++        self.assertEqual(self.pane._unconfirmed_count(), 1)
++
++    def test_delta_siblings_and_repeated_observation_do_not_clear_or_duplicate_warning(self):
++        old, new = Path('old.mp4'), Path('new.mp4')
++        for _ in range(3):
++            self.pane._remember_unconfirmed(self.rule, old, True)
++        self.pane._remember_unconfirmed(self.rule, new, False)
++        self.assertEqual(self.pane._unconfirmed_count(), 1)
++        self.pane._remember_unconfirmed(self.rule, old, False)
++        self.assertEqual(self.pane._unconfirmed_count(), 0)
++
++    def test_changed_rule_identity_does_not_inherit_old_warning(self):
++        self.pane._remember_unconfirmed(self.rule, Path('old.mp4'), True)
++        changed = {**self.rule, 'target': '@other'}
++        self.assertEqual(self.pane._monitor_display_state('r1', changed).get('blocked', 0), 0)
++
++    def test_current_batch_blocked_is_not_counted_twice(self):
++        self.pane._remember_unconfirmed(self.rule, Path('old.mp4'), True)
++        self.pane.task_states = {'r1': {'blocked': 1}}
++        self.assertEqual(self.pane._unconfirmed_count(), 1)
++
++    def test_distinct_files_from_separate_delta_batches_are_combined(self):
++        self.pane._remember_unconfirmed(self.rule, Path('one.mp4'), True)
++        self.pane.task_states = {'r1': {'blocked': 1}}
++        self.pane._remember_unconfirmed(self.rule, Path('two.mp4'), True)
++        self.assertEqual(self.pane._monitor_display_state('r1', self.rule)['blocked'], 2)
++
++    def test_pruning_changed_and_deleted_rules_removes_retained_files(self):
++        self.pane.tasks = lambda: []
++        self.pane._remember_unconfirmed(self.rule, Path('one.mp4'), True)
++        self.pane._prune_unconfirmed([{**self.rule, 'target':'@other'}])
++        self.assertEqual(self.pane._unconfirmed_count(), 0)
++        self.pane._remember_unconfirmed(self.rule, Path('one.mp4'), True)
++        self.pane._prune_unconfirmed([])
++        self.assertEqual(self.pane._unconfirmed_count(), 0)
++
++    def test_old_manual_snapshot_cannot_hide_warning_for_edited_monitor_rule(self):
++        self.pane.tasks = lambda: [{**self.rule, 'target':'@old'}]
++        self.pane._remember_unconfirmed(self.rule, Path('one.mp4'), True)
++        self.pane._prune_unconfirmed([self.rule])
++        self.assertEqual(self.pane._unconfirmed_count(), 1)
++
++    def test_changed_identity_drops_old_batch_count_from_dashboard_and_row_tags(self):
++        self.pane.tasks = lambda: []
++        self.pane._remember_unconfirmed(self.rule, Path('one.mp4'), True)
++        self.pane.task_states = {'r1': {'blocked':1, '_monitor_identity':monitor_identity(self.rule)}}
++        self.pane._prune_unconfirmed([{**self.rule, 'target':'@new'}])
++        self.assertEqual(self.pane._unconfirmed_count(), 0)
++        self.assertEqual(self.pane._monitor_display_state('r1').get('blocked', 0), 0)
++
++
++if __name__ == '__main__':
++    unittest.main()

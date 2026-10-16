@@ -1,0 +1,29 @@
+--- a/app/tests/test_prefetch_upload_boundary.py
++++ b/app/tests/test_prefetch_upload_boundary.py
+@@ -198,6 +198,11 @@
+         self.assertEqual(state['skipped'], 0)
+         self.assertEqual(state['processed_files'], 0)
+         self.assertFalse(any(r.get('progress') == '100%' for r in rows))
++        # A later wave resets task_states; the unresolved result must survive it.
++        self.assertTrue(callable(getattr(self.pane, '_monitor_display_state', None)),
++                        'Later waves erase the previous rule warning')
++        self.pane.task_states = {'other': {'total_files': 226, 'processed_files': 226}}
++        self.assertEqual(self.pane._monitor_display_state('r1', self.rule)['blocked'], 1)
+ 
+     async def test_small_blocked_tail_cannot_round_to_100_percent(self):
+         complete = self.file('complete.mp4', b'x' * 10000)
+@@ -210,6 +215,14 @@
+         self.pane._activity_update = lambda *a, **kw: None
+         await self.run_task()
+         self.assertFalse(str(rows[-1].get('progress', '')).startswith('100'))
++
++    async def test_confirmed_history_clears_only_its_old_warning(self):
++        path = self.file('confirmed.mp4', b'video')
++        self.pane._remember_unconfirmed(self.rule, path, True)
++        self.history.record_completed(path, 'group', b'video'.hex(), self.account, 1)
++        await self.run_task()
++        self.assertEqual(self.pane._unconfirmed_count(), 0)
++        self.assertEqual(self.sent, [])
+ 
+     async def test_batch_observes_entire_pending_set_before_small_lookahead_windows(self):
+         for i in range(10):

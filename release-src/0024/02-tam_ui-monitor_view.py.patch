@@ -1,0 +1,14 @@
+--- a/app/tam_ui/monitor_view.py
++++ b/app/tam_ui/monitor_view.py
+@@ -35,8 +35,10 @@
+             if key == 'remaining' and 'files' in metrics:
+                 files_line = ttk.Frame(card, style='Surface.TFrame')
+                 files_line.pack(anchor='w')
+-                ttk.Label(files_line, text='Файлы: ', style='Caption.TLabel').pack(side='left')
++                ttk.Label(files_line, text='Пакет: ', style='Caption.TLabel').pack(side='left')
+                 ttk.Label(files_line, textvariable=metrics['files'], style='Caption.TLabel').pack(side='left')
++        self.attention_var = tk.StringVar(value='')
++        ttk.Label(card, textvariable=self.attention_var, style='Warning.TLabel').pack(anchor='w')
+         top = ttk.Frame(self.frame)
+         top.grid(row=1, column=0, sticky='ew', pady=(0, 10))
+         self.state_var = tk.StringVar(value='Остановлен')

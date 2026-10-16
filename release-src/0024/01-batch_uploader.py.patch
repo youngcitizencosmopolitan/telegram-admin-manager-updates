@@ -1,0 +1,201 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -917,6 +917,7 @@
+         self.monitor_tree.bind('<Double-1>', lambda _e: self.edit_monitor_rule())
+         self.monitor_tree.bind('<Button-3>', self._show_monitor_context)
+         self.activity.bind('<Button-3>', self._show_activity_context)
++        self.activity.bind('<Double-1>', self._open_activity_rule)
+         for key in self.activity_heading_labels:
+             self.activity.heading(key, command=lambda c=key: self._sort_activity(c))
+ 
+@@ -931,7 +932,7 @@
+         if not rule:
+             self.monitor_view.show_details({})
+             return
+-        state = getattr(self, 'task_states', {}).get(tid, {})
++        state = self._monitor_display_state(tid, rule)
+         data = rule_presentation(rule, getattr(self, 'monitor_runtime', {}).get(tid, {}), state,
+             running=tid in getattr(self, 'live_tasks', {}), queued=tid in self._queued_task_ids())
+         accounts = self.app.store.accounts()
+@@ -945,7 +946,7 @@
+     def _upsert_monitor_row(self, parent, position, *, iid, text, values):
+         tree = self.monitor_tree
+         if hasattr(tree, 'exists'):
+-            state = self.task_states.get(iid, {})
++            state = self._monitor_display_state(iid)
+             tags = ('warning',) if state.get('blocked') else ('error',) if state.get('failed') else ()
+             args = dict(text=text, values=values, tags=tags)
+             if tree.exists(iid):
+@@ -1072,6 +1073,7 @@
+                 pass
+         selected = self._monitor_selected_tid()
+         rules = self.monitor_rules()
++        self._prune_unconfirmed(rules)
+         queued = self._queued_task_ids()
+         accounts = {a.session for a in self.app.store.accounts()}
+         with self._live_task_lock:
+@@ -1100,7 +1102,7 @@
+             base_state = "Наблюдается" if self.monitor_active and monitored else "Ожидает запуска" if monitored else "Выключен"
+             state_text = str(runtime.get("state") or base_state)
+ 
+-            task_state = self.task_states.get(tid, {})
++            task_state = self._monitor_display_state(tid, rule)
+             total = int(task_state.get("total_bytes", 0) or 0)
+             processed = int(task_state.get("processed_bytes", 0) or 0)
+             active = task_state.get("active", {}) or {}
+@@ -1142,7 +1144,7 @@
+                         f"{interval}с",
+                         str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
+                         presentation['status'],
+-                        f"{progress:.0f}%" if work_text != "—" and not blocked_count else "—",
++                        f"{progress:.0f}%" if tid in live_ids and not blocked_count else "—",
+                         _fmt_speed(speed),
+                         _fmt_eta(eta_seconds) if work_text == "Выполняется" else ("0с" if progress >= 100.0 and work_text == "—" else "—"),
+                         state_text,
+@@ -1176,8 +1178,75 @@
+         self._update_monitor_details()
+         workspace = getattr(self.app, 'workspace', None)
+         if workspace:
+-            workspace.set_error_count(sum(int(s.get('blocked', 0) or 0) + int(s.get('failed', 0) or 0)
++            workspace.set_error_count(self._unconfirmed_count() + sum(int(s.get('failed', 0) or 0)
+                                           for s in self.task_states.values()))
++
++    def _unconfirmed_store(self):
++        # Only unresolved file identities are retained, never the media catalog or
++        # active transfer objects. Batch counters remain local to each wave.
++        lock = getattr(self, '_unconfirmed_lock', None)
++        if lock is None:
++            lock = self.__dict__.setdefault('_unconfirmed_lock', threading.RLock())
++        return lock, self.__dict__.setdefault('_unconfirmed_by_rule', {})
++
++    def _remember_unconfirmed(self, task, path: Path, blocked: bool) -> bool:
++        tid, identity = str(task.get('id', '')), monitor_identity(task)
++        lock, entries = self._unconfirmed_store()
++        with lock:
++            entry = entries.get(tid)
++            if entry and entry[0] != identity:
++                entries.pop(tid, None)
++                entry = None
++            if blocked:
++                if entry is None:
++                    entry = entries[tid] = (identity, set())
++                entry[1].add(str(path))
++            elif entry:
++                removed = str(path) in entry[1]
++                entry[1].discard(str(path))
++                if not entry[1]:
++                    entries.pop(tid, None)
++                return removed
++        return False
++
++    def _prune_unconfirmed(self, rules) -> None:
++        identities = {str(r.get('id', '')): monitor_identity(r) for r in rules}
++        lock, entries = self._unconfirmed_store()
++        with lock:
++            if not entries:
++                self._unconfirmed_identities = identities
++                return
++        # Manual uploads share the controller, but are not monitoring rules.
++        # A linked legacy task may retain the old target after its rule is edited.
++        for task in self.tasks():
++            identities.setdefault(str(task.get('id', '')), monitor_identity(task))
++        with lock:
++            self._unconfirmed_identities = identities
++            for tid, (identity, _) in list(entries.items()):
++                if identities.get(tid) != identity:
++                    entries.pop(tid, None)
++
++    def _monitor_display_state(self, tid, rule=None):
++        state = dict(getattr(self, 'task_states', {}).get(tid, {}))
++        lock, entries = self._unconfirmed_store()
++        with lock:
++            identities = getattr(self, '_unconfirmed_identities', None)
++            identity = monitor_identity(rule) if rule is not None else (identities or {}).get(tid)
++            if (rule is not None or identities is not None) and state.get('_monitor_identity') not in (None, identity):
++                state = {}
++            entry = entries.get(tid)
++            if entry and (rule is None or entry[0] == monitor_identity(rule)):
++                state['blocked'] = max(int(state.get('blocked', 0) or 0), len(entry[1]))
++        return state
++
++    def _unconfirmed_count(self) -> int:
++        lock, entries = self._unconfirmed_store()
++        with lock:
++            counts = {tid: len(entry[1]) for tid, entry in entries.items()}
++        for tid in getattr(self, 'task_states', {}):
++            state = self._monitor_display_state(tid)
++            counts[tid] = max(counts.get(tid, 0), int(state.get('blocked', 0) or 0))
++        return sum(counts.values())
+ 
+     def _save_monitor_rule(self, rule: dict[str, Any]) -> None:
+         self.app.monitor_rules.put(rule)
+@@ -2049,6 +2118,7 @@
+         self.activity.selection_set(iid)
+         path = self.activity_paths.get(iid)
+         menu = tk.Menu(self.activity, tearoff=False)
++        menu.add_command(label='Открыть правило', command=self._open_activity_rule)
+         menu.add_command(label="Копировать имя файла", command=lambda: self._copy_text(str(self.activity.item(iid, "text"))))
+         if path is not None:
+             menu.add_command(label="Копировать полный путь", command=lambda p=path: self._copy_text(str(p)))
+@@ -2059,6 +2129,18 @@
+             menu.tk_popup(event.x_root, event.y_root)
+         finally:
+             menu.grab_release()
++
++    def _open_activity_rule(self, event=None) -> None:
++        iid = self.activity.identify_row(event.y) if event is not None else next(iter(self.activity.selection()), '')
++        # Keys are created by the uploader as '<task id>:<absolute path>'.
++        key = next((key for key, row in self.activity_rows.items() if row == iid), '')
++        tid = key.partition(':')[0]
++        if not tid or not self.monitor_tree.exists(tid):
++            return
++        self.monitor_tree.selection_set(tid)
++        self.monitor_tree.focus(tid)
++        self.monitor_tree.see(tid)
++        self._update_monitor_details()
+ 
+     def _copy_text(self, text: str) -> None:
+         try:
+@@ -4364,6 +4446,7 @@
+             return
+ 
+         state = {
++            '_monitor_identity': monitor_identity(task),
+             "name": name,
+             "target": str(task_target),
+             "total_bytes": total_bytes,
+@@ -4441,6 +4524,8 @@
+                         and self.app.upload_history.exact_completed_forum(path, str(target_key))
+                     )
+                 )):
++                    if self._remember_unconfirmed(task, path, False):
++                        self._queue_activity_update(f'{tid}:{path}', name, path, '—', size, 100.0, 0.0, 'Дубликат • отправка подтверждена')
+                     state["processed_bytes"] += size
+                     state["processed_files"] += 1
+                     state["skipped"] += 1
+@@ -4750,6 +4835,8 @@
+                             path,
+                         )
+                         claim_action = _dedup_claim_disposition(claim_status)
++                        if claim_action != 'defer':
++                            self._remember_unconfirmed(task, path, claim_action == 'blocked')
+                         if claim_action == 'blocked':
+                             state['blocked'] += 1
+                             self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0,
+@@ -5315,11 +5402,14 @@
+             self._ui_latest(('accounts',), self.app._refresh_account_status_panel)
+ 
+     def _set_dashboard(self, speed: float, done_files: int, total_files: int, remaining: int, eta: float | None, failures: int, pct: float, active_count: int = 0) -> None:
++        blocked = self._unconfirmed_count()
+         self.total_speed_var.set(_fmt_speed(speed))
+         self.done_var.set(f"{done_files} / {total_files}")
+-        self.remaining_var.set(_fmt_bytes(remaining) if remaining else "0 Б")
++        self.remaining_var.set(_fmt_bytes(remaining) if remaining else (f'Проверить: {blocked}' if blocked else '0 Б'))
+         self.eta_var.set(_fmt_eta(eta))
+-        self.errors_var.set(str(failures))
++        self.errors_var.set(str(failures + blocked))
++        if hasattr(self, 'monitor_view'):
++            self.monitor_view.attention_var.set(f'Неподтверждённые отправки: {blocked}' if blocked else '')
+         self.active_accounts_var.set(f"{active_count} / {self._running_account_total}")
+         self.overall_progress["value"] = max(0.0, min(100.0, pct))
+         if hasattr(self, "monitor_transfer_summary_var"):
