@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0026",
-  "display_version": "0026",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0026/TelegramAdminManager_v0026_update.zip",
-  "sha256": "8bb2d87b272fa1d9db059535d1b758f0f084ba813ad93ec777bc55d0d9f43ac5",
-  "notes": "0026: add Repeat QR login for an already saved account, allowing its ID while keeping other saved IDs excluded. Valid existing sessions are detected without issuing a QR. Expired sessions are reauthenticated with a fresh temporary auth key, verified against the selected owner, then installed under the stable session name so monitoring rules and usage settings are retained. Local session snapshots protect cancellation and failed saves. Register the token listener before showing or refreshing the QR; keep the Telegram event loop alive while awaiting Tk and 2FA prompts, and cancel pending waits on every exit. Classic interface and previous account-removal protections are preserved."
+  "version": "4.3.8.0027",
+  "display_version": "0027",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0027/TelegramAdminManager_v0027_update.zip",
+  "sha256": "5231c6840b2e020dcac514509b89de6fd8fc88fdca9a8b1b3c09d9b11c733a6c",
+  "notes": "0027: stop automatic reconnect loops for sessions requiring login; retain that state across monitor waves and exclude them from automatic account preparation. Temporary connection failures retry with a bounded pause, and successful explicit login releases the suppression. Show repeat-login status on the accounts tab. Preserves QR reauthentication, account removal protections, classic interface, caches and upload scheduling. Session recovery remains local and is never included in an update."
 }
