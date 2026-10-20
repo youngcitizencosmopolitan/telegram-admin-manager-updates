@@ -1,0 +1,17 @@
+--- a/app/tests/test_premium_global_priority.py
++++ b/app/tests/test_premium_global_priority.py
+@@ -151,7 +151,14 @@
+             def __init__(self, session):
+                 self.session = session
+ 
++            async def upload_file(self, path, **kwargs):
++                if self.session == 'regular':
++                    regular_started.set()
++                    await release_regular.wait()
++                return SimpleNamespace(path=path, name=Path(path).name)
++
+             async def send_file(self, entity, path, **kwargs):
++                path = getattr(path, 'path', path)
+                 sent.append((self.session, Path(path).name))
+                 if self.session == 'regular':
+                     regular_started.set()

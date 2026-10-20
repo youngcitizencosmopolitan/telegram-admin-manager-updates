@@ -1,0 +1,211 @@
+--- /dev/null
++++ b/app/tests/test_upload_publication_pacing.py
+@@ -0,0 +1,208 @@
++import asyncio
++import threading
++import time
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import batch_uploader as bu
++import test_prefetch_upload_boundary as fixture
++
++
++class PublicationPacingTests(unittest.IsolatedAsyncioTestCase):
++    async def test_short_files_keep_publication_gap_but_next_bytes_start_immediately(self):
++        pace = getattr(bu, '_publish_with_min_gap', None)
++        self.assertTrue(callable(pace), 'Waiting belongs at publication, not before the next byte upload')
++        now, events, state = [0.0], [], {}
++        async def gate(): return True
++        async def sleep(delay):
++            events.append(('wait', delay))
++            now[0] += delay
++            return True
++        async def publish(): events.append(('publish', now[0])); return 'message'
++        async def one_file():
++            events.append(('upload_start', now[0]))
++            now[0] += .25
++            return await pace(state, 's', 2, publish, gate, sleep, clock=lambda:now[0])
++        await one_file()
++        await one_file()
++        self.assertEqual(events, [('upload_start',0), ('publish',.25), ('upload_start',.25), ('wait',1.75), ('publish',2.25)])
++
++    async def test_stop_after_upload_prevents_publication(self):
++        pace = getattr(bu, '_publish_with_min_gap', None)
++        self.assertTrue(callable(pace))
++        async def gate(): return False
++        async def sleep(delay): return True
++        async def publish(): self.fail('A stopped upload must not publish its handle')
++        with self.assertRaises(bu.BatchUploadStopped):
++            await pace({}, 's', 2, publish, gate, sleep)
++
++    async def test_failed_publication_still_throttles_the_next_attempt_across_rules(self):
++        pace = getattr(bu, '_publish_with_min_gap', None)
++        self.assertTrue(callable(pace))
++        now, state, waits = [0.0], {}, []
++        async def gate(): return True
++        async def sleep(delay): waits.append(delay); now[0] += delay; return True
++        async def fail(): raise TimeoutError('unknown send result')
++        async def good(): return 'message'
++        with self.assertRaises(TimeoutError):
++            await pace(state, 's', 2, fail, gate, sleep, clock=lambda:now[0])
++        await pace(state, 'other-account', 2, good, gate, sleep, clock=lambda:now[0])
++        self.assertEqual(waits, [])
++        await pace(state, 's', .5, good, gate, sleep, clock=lambda:now[0])
++        self.assertEqual(waits, [2])
++
++
++class WorkerGapTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    read = fixture.PrefetchUploadTests.read
++    file = fixture.PrefetchUploadTests.file
++
++    async def test_real_worker_overlaps_long_upload_with_gap_without_exceeding_global_limit(self):
++        first, second = self.file('a.mp4',b'a'), self.file('b.mp4',b'b')
++        now, uploads, publications, waits = [0.0], [], [], []
++        self.rule['delay'] = 2
++        self.rule['video_preview_mode'] = 'off'
++        owner = self
++        sem = asyncio.Semaphore(1)
++        class Client:
++            async def upload_file(self, path, **kwargs):
++                owner.assertTrue(sem.locked(), 'Byte uploads must still own a global upload slot')
++                uploads.append((Path(path),now[0]))
++                now[0] += 3
++                return SimpleNamespace(name=Path(path).name, path=path)
++            async def send_file(self, entity, file, **kwargs):
++                if isinstance(file,str):  # model the existing one-step path
++                    file=await self.upload_file(file)
++                owner.assertTrue(sem.locked(), 'Final sends must still obey the global limit')
++                publications.append((Path(file.path),now[0]))
++                return SimpleNamespace(id=len(publications))
++        async def sleep(delay): waits.append(delay); now[0] += delay; return True
++        self.pane._sleep_stop = sleep
++        with patch.object(bu,'time',SimpleNamespace(monotonic=lambda:now[0],time=time.time)):
++            await self.pane._run_one_task(dict(self.rule),{'s1':(self.account,Client())},{'s1':False},
++                {'s1':self.account_lock},sem,asyncio.Semaphore(2),asyncio.Semaphore(2),preparation=self.pool)
++        self.assertEqual(uploads, [(first,0),(second,3)], 'The second upload must begin at the first publication, not two seconds later')
++        self.assertEqual(publications, [(first,3),(second,6)])
++        self.assertEqual(waits, [])
++        self.assertEqual(self.pane.task_states['r1']['success'],2)
++        self.assertEqual(self.errors,[])
++
++    async def test_stop_while_waiting_for_actual_upload_slot_sends_no_bytes(self):
++        self.file()
++        waiting, release = asyncio.Event(), asyncio.Event()
++        uploads=[]
++        class Slot(asyncio.Semaphore):
++            arrivals=0
++            async def __aenter__(self):
++                self.arrivals+=1
++                if self.arrivals==2:
++                    waiting.set()
++                    await release.wait()
++                return await super().__aenter__()
++        class Client:
++            async def upload_file(self,path,**kwargs): uploads.append(path);return path
++            async def send_file(self,*args,**kwargs): return SimpleNamespace(id=1)
++        running=asyncio.create_task(self.pane._run_one_task(dict(self.rule),{'s1':(self.account,Client())},{'s1':False},
++            {'s1':self.account_lock},Slot(1),asyncio.Semaphore(2),asyncio.Semaphore(2),preparation=self.pool))
++        try:
++            await asyncio.wait_for(waiting.wait(),2)
++            self.stop.set()
++            release.set()
++            await asyncio.wait_for(running,2)
++        finally:
++            release.set()
++            if not running.done():
++                running.cancel()
++                await asyncio.gather(running,return_exceptions=True)
++        self.assertEqual(uploads,[])
++        with self.history.db.session() as db:
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0],0)
++
++    async def test_short_file_pacing_releases_global_slot_and_records_only_confirmed_sends(self):
++        self.file('a.mp4',b'a')
++        self.file('b.mp4',b'b')
++        now, publications, waits = [0.0], [], []
++        self.rule['delay']=2
++        sem=asyncio.Semaphore(1)
++        owner=self
++        class Client:
++            async def upload_file(self,path,**kwargs):
++                now[0]+=.25
++                return SimpleNamespace(path=path,name=Path(path).name)
++            async def send_file(self,entity,file,**kwargs):
++                publications.append(now[0]);return SimpleNamespace(id=len(publications))
++        async def sleep(delay):
++            owner.assertFalse(sem.locked(),'Publication pacing must release the upload slot for other accounts')
++            with owner.history.db.session() as db:
++                owner.assertEqual(db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0],1)
++            waits.append(delay);now[0]+=delay;return True
++        self.pane._sleep_stop=sleep
++        with patch.object(bu,'time',SimpleNamespace(monotonic=lambda:now[0],time=time.time)):
++            await self.pane._run_one_task(dict(self.rule),{'s1':(self.account,Client())},{'s1':False},
++                {'s1':self.account_lock},sem,asyncio.Semaphore(2),asyncio.Semaphore(2),preparation=self.pool)
++        self.assertEqual(publications,[.25,2.25])
++        self.assertEqual(waits,[1.75])
++        self.assertEqual(self.errors,[])
++
++    async def test_stop_after_byte_upload_releases_claim_without_marking_file_completed(self):
++        self.file()
++        sent=[]
++        owner=self
++        class Client:
++            async def upload_file(self,path,**kwargs):
++                owner.stop.set()
++                return SimpleNamespace(path=path,name=Path(path).name)
++            async def send_file(self,*args,**kwargs): sent.append(True);return SimpleNamespace(id=1)
++        await self.pane._run_one_task(dict(self.rule),{'s1':(self.account,Client())},{'s1':False},
++            {'s1':self.account_lock},asyncio.Semaphore(1),asyncio.Semaphore(2),asyncio.Semaphore(2),preparation=self.pool)
++        self.assertEqual(sent,[])
++        with self.history.db.session() as db:
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0],0)
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM upload_reservations').fetchone()[0],0)
++
++    async def test_photo_hot_off_during_publication_gap_does_not_send_next_file(self):
++        self.file('a.jpg',b'a');self.file('b.jpg',b'b')
++        self.rule['send_photos']=True
++        now, allowed, sent = [0.0], [True], []
++        self.rule['delay']=2
++        self.pane.app.account_usage_allows=lambda *_:allowed[0]
++        self.pane._effective_task_sessions=lambda *_:['s1'] if allowed[0] else []
++        class Client:
++            async def send_file(self,entity,path,**kwargs):
++                sent.append(Path(path).name);return SimpleNamespace(id=len(sent))
++        async def sleep(delay):
++            allowed[0]=False;now[0]+=delay;return True
++        self.pane._sleep_stop=sleep
++        with patch.object(bu,'time',SimpleNamespace(monotonic=lambda:now[0],time=time.time)):
++            await asyncio.wait_for(self.pane._run_one_task(dict(self.rule),{'s1':(self.account,Client())},{'s1':False},
++                {'s1':self.account_lock},asyncio.Semaphore(1),asyncio.Semaphore(2),asyncio.Semaphore(2),preparation=self.pool),2)
++        self.assertEqual(sent,['a.jpg'],self.errors)
++
++
++class VideoHandleTests(unittest.IsolatedAsyncioTestCase):
++    async def test_metadata_prepared_off_loop_and_preserved_when_sending_uploaded_handle(self):
++        owner_thread=threading.get_ident()
++        handle=object()
++        sent=[]
++        class VideoAttribute:
++            duration=12; w=1080; h=1920; supports_streaming=False
++        attribute=VideoAttribute()
++        def attrs(path, **kwargs):
++            self.assertNotEqual(threading.get_ident(),owner_thread)
++            return [attribute], 'video/mp4'
++        class Client:
++            async def upload_file(self,path,**kwargs): return handle
++            async def send_file(self,entity,file,**kwargs):
++                sent.append((file,kwargs));return 'message'
++        with patch.object(bu,'telethon_utils',SimpleNamespace(get_attributes=attrs),create=True):
++            await bu._send_file_with_safe_parts(Client(),'group',Path('video.mp4'),1024,
++                {'supports_streaming':True,'caption':'caption','reply_to':7})
++        self.assertIs(sent[0][0],handle)
++        self.assertEqual(sent[0][1].get('mime_type'),'video/mp4')
++        self.assertEqual(sent[0][1]['attributes'][0].duration,12)
++        self.assertTrue(sent[0][1]['attributes'][0].supports_streaming)
++        self.assertFalse(attribute.supports_streaming,'Preparing one file must not mutate shared metadata')
++        self.assertEqual(sent[0][1]['reply_to'],7)

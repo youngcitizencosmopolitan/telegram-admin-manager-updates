@@ -1,0 +1,27 @@
+--- a/app/tests/test_0012_file_parts_invalid.py
++++ b/app/tests/test_0012_file_parts_invalid.py
+@@ -3,6 +3,8 @@
+ import asyncio
+ import unittest
+ from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
+ 
+ from batch_uploader import (
+     TELEGRAM_MAX_UPLOAD_PART_SIZE,
+@@ -72,13 +74,8 @@
+             "supports_streaming": True,
+         }
+         path = Path("movie.mp4")
+-        result = await _send_file_with_safe_parts(
+-            client,
+-            "target",
+-            path,
+-            123456789,
+-            kwargs,
+-        )
++        with patch('batch_uploader.telethon_utils', SimpleNamespace(get_attributes=lambda *a, **k:([], 'video/mp4'))):
++            result = await _send_file_with_safe_parts(client, "target", path, 123456789, kwargs)
+ 
+         self.assertEqual(result, "message")
+         self.assertEqual(len(client.upload_calls), 1)

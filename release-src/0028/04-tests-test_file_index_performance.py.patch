@@ -1,0 +1,13 @@
+--- a/app/tests/test_file_index_performance.py
++++ b/app/tests/test_file_index_performance.py
+@@ -284,7 +284,10 @@
+                 return True
+ 
+             class Client:
++                async def upload_file(self, path, **kwargs):
++                    return SimpleNamespace(path=path, name=Path(path).name)
+                 async def send_file(self, entity, path, **kwargs):
++                    path = getattr(path, 'path', path)
+                     sends.append(path)
+                     return SimpleNamespace(id=len(sends))
+ 

@@ -1,0 +1,18 @@
+--- a/app/tests/test_prefetch_upload_boundary.py
++++ b/app/tests/test_prefetch_upload_boundary.py
+@@ -75,10 +75,13 @@
+         owner = self
+ 
+         class Client:
+-            async def send_file(self, entity, path, **kwargs):
+-                owner.sent.append((path, kwargs))
++            async def upload_file(self, path, **kwargs):
+                 if sender:
+                     await sender(Path(path))
++                return SimpleNamespace(path=path, name=Path(path).name)
++            async def send_file(self, entity, path, **kwargs):
++                path = getattr(path, 'path', path)
++                owner.sent.append((path, kwargs))
+                 return SimpleNamespace(id=len(owner.sent))
+ 
+         await self.pane._run_one_task(dict(self.rule), {'s1': (self.account, Client())}, {'s1': False},
