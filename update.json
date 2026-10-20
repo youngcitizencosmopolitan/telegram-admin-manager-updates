@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0024",
-  "display_version": "0024",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0024/TelegramAdminManager_v0024_update.zip",
-  "sha256": "ad2cae19aaaee0ded27647b200f28560670f74955a0906c9414f7fd6c916bd46",
-  "notes": "0024: keep unconfirmed previous-run upload warnings across later queue waves and incremental batches. Display unresolved sends in the transfer summary and rule inspector; label file totals as the current batch. Double-click a file or use Open rule to select its exact monitoring rule and access scoped recovery. Confirmed duplicates clear their own warning; changed/deleted rules discard obsolete UI state. Upload reservations, confirmation before retry, history, account routing and Telegram request policies are preserved."
+  "version": "4.3.8.0025",
+  "display_version": "0025",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0025/TelegramAdminManager_v0025_update.zip",
+  "sha256": "b99c7c99a279f2af7bcf7b528def5e719b58641d025d6eba42a255b5b5ff6a29",
+  "notes": "0025: restore the classic top-tab interface and shared right-side journal while keeping current cache, scheduler and upload-history fixes. Correct account deletion by synchronizing both account selectors using stable session identities, removing implicit select-all on startup/refresh, showing exact count and names before confirmation, and rejecting conflicting selections. Account removal retains local session files and saves a recovery metadata snapshot before changing the list; backup failures abort removal. Preserve unresolved-send warnings in the classic monitoring summary."
 }
