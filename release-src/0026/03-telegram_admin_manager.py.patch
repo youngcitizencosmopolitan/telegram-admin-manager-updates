@@ -1,0 +1,285 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0025"
++APP_VERSION = "0026"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -2525,6 +2525,7 @@
+         buttons = ttk.Frame(t)
+         buttons.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+         ttk.Button(buttons, text="+ Войти по QR", command=self.add_account_qr).pack(side="left")
++        ttk.Button(buttons, text='Повторный вход по QR', command=self.reauthorize_selected_account).pack(side='left', padx=6)
+         ttk.Button(buttons, text="+ Войти по номеру", command=self.add_account).pack(side="left", padx=6)
+         ttk.Button(buttons, text="Обновить данные", command=self.refresh_accounts_from_telegram).pack(side="left", padx=6)
+         ttk.Button(buttons, text="Выбрать все", command=self.select_all_accounts).pack(side="left", padx=6)
+@@ -4480,6 +4481,42 @@
+         event.wait()
+         return box["value"]
+ 
++    async def ui_ask_async(self, func: Callable[[], Any]) -> Any:
++        """Keep the Telegram loop alive while Tk constructs a login prompt."""
++        loop = asyncio.get_running_loop()
++        result = loop.create_future()
++
++        def deliver(value, error):
++            if result.done():
++                return
++            if error is not None:
++                result.set_exception(error)
++            else:
++                result.set_result(value)
++
++        def callback():
++            if result.done():
++                return
++            try:
++                value, error = func(), None
++            except Exception as exc:
++                value, error = None, exc
++            try:
++                loop.call_soon_threadsafe(deliver, value, error)
++            except RuntimeError:
++                pass  # The login was cancelled before this UI callback ran.
++
++        try:
++            self.ui_call(callback)
++            while not result.done():
++                if getattr(self, '_closed', False):
++                    raise RuntimeError('Приложение закрыто; вход отменён.')
++                await asyncio.wait({result}, timeout=.1)
++            return await result
++        finally:
++            if not result.done():
++                result.cancel()
++
+     def _open_upload_error_log(self) -> None:
+         try:
+             UPLOAD_ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+@@ -4766,7 +4803,14 @@
+         self.ui_call(self._refresh_account_status_panel)
+ 
+     # ---------- account operations ----------
+-    def add_account_qr(self) -> None:
++    def reauthorize_selected_account(self) -> None:
++        selected = self.selected_accounts()
++        if len(selected) != 1:
++            messagebox.showinfo(APP_NAME, 'Выбери один аккаунт для повторного входа.', parent=self)
++            return
++        self.add_account_qr(existing_account=selected[0])
++
++    def add_account_qr(self, existing_account: Account | None = None) -> None:
+         if TelegramClient is None:
+             self._show_missing_dependency()
+             return
+@@ -4780,41 +4824,77 @@
+             messagebox.showerror(APP_NAME, str(exc))
+             return
+ 
+-        label = simpledialog.askstring(APP_NAME, "Название аккаунта в приложении (необязательно):", parent=self) or ""
++        label = existing_account.label if existing_account else (
++            simpledialog.askstring(APP_NAME, "Название аккаунта в приложении (необязательно):", parent=self) or '')
+ 
+         def work() -> None:
+-            asyncio.run(self._add_account_qr_async(label.strip()))
++            asyncio.run(self._add_account_qr_async(label.strip(), existing_account=existing_account))
+ 
+         self.run_worker(work, "QR-авторизация…")
+ 
+-    async def _add_account_qr_async(self, label: str) -> None:
++    async def _add_account_qr_async(self, label: str, existing_account: Account | None = None) -> None:
++        from tam_core.session_recovery import copy_session_database
+         api_id, api_hash = self._api_credentials()
+-        session_name = f"acc_qr_{int(time.time())}_{time.time_ns() % 1000000:06d}"
++        if existing_account and not any(a.session == existing_account.session and a.user_id == existing_account.user_id
++                                        for a in self.store.accounts()):
++            raise RuntimeError('Аккаунт изменён или удалён. Выбери его заново.')
++        session_name = existing_account.session if existing_account else f'acc_qr_{time.time_ns()}'
++        if not session_name or session_name in {'.', '..'} or '/' in session_name or '\\' in session_name:
++            raise RuntimeError('Некорректное имя локальной сессии.')
+         session_path = str(SESSIONS_DIR / session_name)
+-        client = TelegramClient(session_path, api_id, api_hash)
++        working_session_name = session_name
++        session_file = SESSIONS_DIR / f'{session_name}.session'
++        backup = None
++        if existing_account and session_file.exists():
++            backup = DATA_DIR / 'backups' / 'reauth' / f'{session_name}-{time.time_ns()}.session'
++            await asyncio.to_thread(copy_session_database, session_file, backup)
++        client = None
+         dialog: QRLoginDialog | None = None
+-        success = False
+-        failed = False
+-        try:
++        wait_task = None
++        saved = False
++        try:
++            client = TelegramClient(session_path, api_id, api_hash)
+             await client.connect()
+             if await client.is_user_authorized():
+-                raise RuntimeError("Новая QR-сессия неожиданно уже авторизована.")
+-
+-            ignored_ids = [a.user_id for a in self.store.accounts() if a.user_id]
++                if not existing_account:
++                    raise RuntimeError('Новая QR-сессия неожиданно уже авторизована.')
++                me = await client.get_me()
++                if not me or me.id != existing_account.user_id:
++                    raise RuntimeError('Локальная сессия принадлежит другому аккаунту.')
++                saved = True
++                self.ui_call(lambda: messagebox.showinfo(APP_NAME,
++                    'Сессия выбранного аккаунта уже авторизована. Повторно сканировать QR не требуется.'))
++                return
++
++            if existing_account:
++                # Never bind the old auth key to a newly scanned (possibly wrong)
++                # user. Install a fresh session only after its owner is checked.
++                await client.disconnect()
++                working_session_name = f'qr_reauth_{time.time_ns()}'
++                client = TelegramClient(str(SESSIONS_DIR / working_session_name), api_id, api_hash)
++                await client.connect()
++                if await client.is_user_authorized():
++                    raise RuntimeError('Новая QR-сессия неожиданно уже авторизована.')
++
++            ignored_ids = [a.user_id for a in self.store.accounts() if a.user_id
++                           and (existing_account is None or a.user_id != existing_account.user_id)]
+             self.log("Создаю QR-код для входа…")
+             qr_login = await client.qr_login(ignored_ids=ignored_ids)
+ 
+             # qr_login.wait() must already be running when the user scans the code.
+             wait_task = asyncio.create_task(qr_login.wait())
+-            dialog = self.ui_ask(lambda: QRLoginDialog(self, qr_login.url))
++            await asyncio.sleep(0)  # Register Telethon's UpdateLoginToken handler first.
++            def show_dialog():
++                result = QRLoginDialog(self, qr_login.url)
++                if existing_account:
++                    result.title(f'Повторный вход — {existing_account.display}')
++                return result
++            dialog = await self.ui_ask_async(show_dialog)
+ 
+             while True:
++                if getattr(self, '_closed', False):
++                    raise RuntimeError('Приложение закрыто; вход отменён.')
+                 if dialog.cancelled.is_set():
+-                    wait_task.cancel()
+-                    try:
+-                        await wait_task
+-                    except (asyncio.CancelledError, Exception):
+-                        pass
+                     raise RuntimeError("QR-авторизация отменена.")
+ 
+                 done, _ = await asyncio.wait({wait_task}, timeout=0.25)
+@@ -4823,7 +4903,6 @@
+ 
+                 try:
+                     await wait_task
+-                    success = True
+                     break
+                 except asyncio.TimeoutError:
+                     if dialog.cancelled.is_set():
+@@ -4831,11 +4910,12 @@
+                     self.log("QR-код истёк — создаю новый автоматически…")
+                     await qr_login.recreate()
+                     wait_task = asyncio.create_task(qr_login.wait())
+-                    self.ui_call(lambda url=qr_login.url: dialog.update_qr(url))
++                    await asyncio.sleep(0)
++                    await self.ui_ask_async(lambda url=qr_login.url: dialog.update_qr(url))
+                     continue
+                 except errors.SessionPasswordNeededError:
+                     self.ui_call(lambda: dialog.set_status("QR принят. Нужен пароль двухэтапной проверки (2FA)…"))
+-                    password = self.ui_ask(
++                    password = await self.ui_ask_async(
+                         lambda: simpledialog.askstring(
+                             APP_NAME,
+                             "На аккаунте включена двухэтапная проверка. Введи пароль 2FA:",
+@@ -4846,32 +4926,58 @@
+                     if not password:
+                         raise RuntimeError("Авторизация отменена: не введён пароль 2FA.")
+                     await client.sign_in(password=password)
+-                    success = True
+                     break
+ 
+             if not await client.is_user_authorized():
+                 raise RuntimeError("QR был принят, но Telegram не завершил авторизацию.")
+ 
+             me = await client.get_me()
++            if dialog.cancelled.is_set() or getattr(self, '_closed', False):
++                raise RuntimeError('QR-авторизация отменена.')
+             if not me:
+                 raise RuntimeError("Не удалось получить данные аккаунта после QR-входа.")
+-            account = self._account_from_me(me, session_name, label=label)
++            if existing_account:
++                if me.id != existing_account.user_id:
++                    raise RuntimeError('QR отсканирован другим аккаунтом. Выбери на телефоне тот же аккаунт, что и в программе.')
++                if not any(a.session == session_name and a.user_id == me.id for a in self.store.accounts()):
++                    raise RuntimeError('Аккаунт изменён или удалён во время входа.')
++            account = self._account_from_me(me, session_name, label=existing_account.label if existing_account else label)
++            if existing_account:
++                await client.disconnect()
++                await asyncio.to_thread(copy_session_database,
++                    SESSIONS_DIR / f'{working_session_name}.session', session_file)
++            if dialog.cancelled.is_set() or getattr(self, '_closed', False):
++                raise RuntimeError('QR-авторизация отменена.')
++            if existing_account and not any(a.session == session_name and a.user_id == me.id for a in self.store.accounts()):
++                raise RuntimeError('Аккаунт изменён или удалён во время входа.')
+             self._save_account(account)
++            saved = True
+             self.log(f"Добавлен по QR: {account.display} (ID {account.user_id})")
+             self.ui_call(lambda: self.refresh_account_list())
+             self.ui_call(lambda: messagebox.showinfo(APP_NAME, f"Аккаунт добавлен:\n{account.display}"))
+-        except Exception:
+-            failed = True
+-            raise
+         finally:
+-            if dialog is not None:
+-                if success:
+-                    self.ui_call(dialog.close_success)
+-                elif not dialog.cancelled.is_set():
+-                    self.ui_call(dialog.close_success)
+-            await client.disconnect()
+-            if failed:
+-                self._delete_session_files(session_name)
++            if wait_task is not None:
++                if not wait_task.done():
++                    wait_task.cancel()
++                try:
++                    await wait_task
++                except (asyncio.CancelledError, Exception):
++                    pass
++            if dialog is not None and not dialog.cancelled.is_set():
++                self.ui_call(dialog.close_success)
++            try:
++                if client is not None:
++                    await client.disconnect()
++            finally:
++                try:
++                    if not saved:
++                        if backup is not None:
++                            await asyncio.to_thread(copy_session_database, backup, session_file)
++                        else:
++                            self._delete_session_files(session_name)
++                finally:
++                    if working_session_name != session_name:
++                        self._delete_session_files(working_session_name)
+ 
+     @staticmethod
+     def _account_from_me(me: Any, session_name: str, label: str = "", fallback_phone: str = "") -> Account:
+@@ -4893,10 +4999,14 @@
+         )
+ 
+     def _save_account(self, account: Account) -> None:
++        previous = list(self.store.data.get('accounts', []))
+         accounts = [a for a in self.store.accounts() if a.user_id != account.user_id]
+         accounts.append(account)
+-        self.store.set_accounts(accounts)
+-        self.store.save()
++        try:
++            self.store.set_accounts(accounts)
++        except Exception:
++            self.store.data['accounts'] = previous
++            raise
+ 
+     @staticmethod
+     def _delete_session_files(session_name: str) -> None:

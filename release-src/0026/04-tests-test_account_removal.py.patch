@@ -1,0 +1,37 @@
+--- a/app/tests/test_account_removal.py
++++ b/app/tests/test_account_removal.py
+@@ -90,6 +90,34 @@
+         self.app.store.set_accounts(list(reversed(accounts)))
+         self.assertEqual([a.session for a in self.app.selected_accounts()], ['s1'])
+ 
++    def test_repeat_qr_button_uses_exact_selected_saved_account(self):
++        from tkinter import ttk
++        accounts = self.seed()
++        self.app.geometry('1180x700')
++        self.app.accounts_list.select_set(1)
++        self.app.accounts_list.event_generate('<<ListboxSelect>>')
++        self.app.update()
++        def walk(widget):
++            for child in widget.winfo_children():
++                yield child
++                yield from walk(child)
++        buttons = [w for w in walk(self.app.tab_accounts) if isinstance(w, ttk.Button)
++                   and w.cget('text') == 'Повторный вход по QR']
++        self.assertEqual(len(buttons), 1)
++        button = buttons[0]
++        self.assertTrue(button.winfo_ismapped())
++        self.assertLessEqual(button.winfo_rootx()+button.winfo_width(), self.app.winfo_rootx()+self.app.winfo_width())
++        with patch.object(self.app, 'add_account_qr') as login:
++            button.invoke()
++            login.assert_called_once_with(existing_account=accounts[1])
++
++    def test_repeat_qr_requires_one_selected_account(self):
++        self.seed()
++        with patch.object(main.messagebox, 'showinfo') as info, patch.object(self.app, 'add_account_qr') as login:
++            self.app.reauthorize_selected_account()
++        info.assert_called_once()
++        login.assert_not_called()
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
