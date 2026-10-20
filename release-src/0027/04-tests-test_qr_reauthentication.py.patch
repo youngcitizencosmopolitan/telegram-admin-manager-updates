@@ -1,0 +1,31 @@
+--- a/app/tests/test_qr_reauthentication.py
++++ b/app/tests/test_qr_reauthentication.py
+@@ -166,6 +166,28 @@
+         self.assertEqual(self.app.store.data['monitor_selected_sessions'], ['restored'])
+         self.assertFalse(self.app.store.db.account_usage_get('restored')['monitoring'])
+ 
++    async def test_successful_reauthentication_releases_connection_guard(self):
++        from batch_uploader import BatchUploaderPane
++        pane = object.__new__(BatchUploaderPane)
++        pane._auth_required_sessions = {'restored'}
++        pane._connection_retry_after = {'restored': float('inf')}
++        pane.account_health = {'restored': {'state': 'Нужен вход', 'disabled': True}}
++        self.app.batch_uploader = pane
++        await self.run_login(self.existing)
++        self.assertNotIn('restored', pane._auth_required_sessions)
++        self.assertNotIn('restored', pane._connection_retry_after)
++
++    async def test_valid_existing_login_also_releases_connection_guard(self):
++        from batch_uploader import BatchUploaderPane
++        pane = object.__new__(BatchUploaderPane)
++        pane._auth_required_sessions = {'restored'}
++        pane._connection_retry_after = {}
++        pane.account_health = {}
++        self.app.batch_uploader = pane
++        self.authorized = True
++        await self.run_login(self.existing)
++        self.assertNotIn('restored', pane._auth_required_sessions)
++
+     async def test_wrong_account_does_not_replace_saved_identity_or_session(self):
+         self.returned_id = 99
+         with self.assertRaises(RuntimeError):
