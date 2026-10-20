@@ -1,0 +1,185 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import copy
+ import hashlib
+ import json
+ import inspect
+@@ -37,11 +38,12 @@
+ from tkinter import filedialog, messagebox, simpledialog, ttk
+ 
+ try:
+-    from telethon import TelegramClient, errors
++    from telethon import TelegramClient, errors, utils as telethon_utils
+     from telethon.tl import functions as tl_functions
+ except ImportError:
+     TelegramClient = None
+     errors = None
++    telethon_utils = None
+     tl_functions = None
+ 
+ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+@@ -104,24 +106,63 @@
+     return "fail"
+ 
+ async def _send_file_with_safe_parts(
+-    client: Any, entity: Any, path: Path, size: int, send_kwargs: dict[str, Any]
++    client: Any, entity: Any, path: Path, size: int, send_kwargs: dict[str, Any],
++    *, publisher=None, uploader=None, before_upload=None,
+ ) -> Any:
+-    """Restart one upload from byte zero using fresh 512 KiB parts.
++    """Upload once with 512 KiB parts, then publish the returned handle.
+ 
+     Telethon generates a fresh random upload file_id for every upload_file call.
+     We pass the returned InputFile handle to send_file so the main file is not
+     uploaded twice. Thumbnail/caption/topic options remain in send_kwargs.
+     """
+-    progress_callback = send_kwargs.get("progress_callback")
+-    uploaded = await client.upload_file(
+-        str(path),
+-        part_size_kb=512,
+-        file_size=int(size),
+-        progress_callback=progress_callback,
+-    )
++    attributes, mime_type = None, None
++    if _media_kind(path) == 'video' and telethon_utils is not None:
++        # Passing only an InputFile handle loses duration/dimensions inferred
++        # from the original path. Read them off the Telegram event loop.
++        attributes, mime_type = await asyncio.to_thread(telethon_utils.get_attributes,
++            str(path), supports_streaming=bool(send_kwargs.get('supports_streaming', False)),
++            thumb=send_kwargs.get('thumb'))
++        attributes = [copy.copy(a) for a in attributes]
++        for attribute in attributes:
++            if hasattr(attribute, 'supports_streaming'):
++                attribute.supports_streaming = bool(send_kwargs.get('supports_streaming', False))
++
++    async def upload():
++        if before_upload is not None:
++            await before_upload()
++        return await client.upload_file(str(path), part_size_kb=512, file_size=int(size),
++            progress_callback=send_kwargs.get('progress_callback'))
++    uploaded = await uploader(upload) if uploader is not None else await upload()
+     final_kwargs = dict(send_kwargs)
+-    final_kwargs.pop("progress_callback", None)
+-    return await client.send_file(entity, uploaded, **final_kwargs)
++    final_kwargs.pop('progress_callback', None)
++    if attributes is not None:
++        final_kwargs.setdefault('attributes', attributes)
++        final_kwargs.setdefault('mime_type', mime_type)
++    async def send():
++        return await client.send_file(entity, uploaded, **final_kwargs)
++    return await publisher(send) if publisher is not None else await send()
++
++
++async def _publish_with_min_gap(state, session, delay, publish, gate, sleep, *, clock=None):
++    """Pace publications per account; byte uploads may overlap the interval.
++
++    Caller holds its account lock. State is shared across rules and waves,
++    and uncertain publication failures retain the interval as well.
++    """
++    clock = clock or time.monotonic
++    delay = max(0.0, float(delay))
++    while await gate():
++        previous = state.get(session)
++        remaining = max(delay, previous[1]) - (clock() - previous[0]) if previous else 0
++        if remaining > 0:
++            if not await sleep(remaining):
++                raise BatchUploadStopped()
++            continue
++        try:
++            return await publish()
++        finally:
++            state[session] = (clock(), delay)
++    raise BatchUploadStopped()
+ 
+ def _next_file_part_requeue_cycle(completed_cycles: int) -> int | None:
+     next_cycle = int(completed_cycles) + 1
+@@ -472,6 +513,7 @@
+         # releases an authorization failure during this application run.
+         self._auth_required_sessions: set[str] = set()
+         self._connection_retry_after: dict[str, float] = {}
++        self._publication_state: dict[str, tuple[float, float]] = {}
+         self.monitor_active = False
+         self.monitor_stop_event = threading.Event()
+         self.monitor_last_signatures: dict[str, str] = {}
+@@ -4506,6 +4548,8 @@
+     ) -> None:
+         tid = str(task.get("id", ""))
+         name = str(task.get("name", "Задание"))
++        if not hasattr(self, '_publication_state'):
++            self._publication_state = {}
+         self._queue_task_row(tid, status='Сканирование…')
+         async with scan_sem:
+             files, total_bytes = await asyncio.to_thread(self._scan_task_files, task)
+@@ -5133,10 +5177,49 @@
+                                         topic_id = topic_id_for_path(path)
+                                         if topic_id:
+                                             send_kwargs["reply_to"] = int(topic_id)
+-                                    if safe_parts_retry_used:
+-                                        message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs)
+-                                    else:
+-                                        message = await client.send_file(entity, str(path), **send_kwargs)
++                                delay = max(0.0, float(task.get('delay', 0) or 0))
++                                if policy['enabled']:
++                                    delay = max(delay, float(policy['min_file_delay']))
++
++                                async def bounded_action(action):
++                                    while await self._wait_gate(tid):
++                                        async with global_sem:
++                                            if self.stop_event.is_set():
++                                                raise BatchUploadStopped()
++                                            all_event = getattr(self, 'pause_all_event', None)
++                                            task_event = self.task_pause_events.get(tid)
++                                            if ((all_event is not None and not all_event.is_set())
++                                                    or (task_event is not None and not task_event.is_set())):
++                                                continue  # Release the slot before awaiting resume.
++                                            return await action()
++                                    raise BatchUploadStopped()
++
++                                async def before_upload():
++                                    if prepared is not None and (
++                                        await asyncio.to_thread(read_stamp, path) != prepared.stamp
++                                        or await asyncio.to_thread(has_active_writer, path)
++                                    ):
++                                        raise BatchUploadStopped()
++                                    if (self.stop_event.is_set() or health(session).get('disabled')
++                                            or not self._runtime_task_account_allowed(task, session)):
++                                        raise BatchUploadStopped()
++                                    send_kwargs['caption'] = self._render_live_caption(task, path, original_index, total_files, name)
++
++                                async def publish(send):
++                                    if media_kind == 'video':
++                                        transfer['speed'] = 0.0
++                                        self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, 'Видео • публикация')
++                                    return await _publish_with_min_gap(self._publication_state, session, delay,
++                                        lambda: bounded_action(send), lambda: self._wait_gate(tid), self._sleep_stop)
++
++                                if media_kind == 'video' or safe_parts_retry_used:
++                                    message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs,
++                                        publisher=publish, uploader=bounded_action, before_upload=before_upload)
++                                else:
++                                    async def send_direct():
++                                        await before_upload()
++                                        return await client.send_file(entity, str(path), **send_kwargs)
++                                    message = await publish(send_direct)
+                                 message_id = getattr(message, "id", None)
+                                 self.app.upload_history.record_completed(
+                                     path,
+@@ -5370,12 +5453,8 @@
+                                 self._emit_task_metrics(tid, force=True)
+                                 break
+ 
+-                delay = max(0.0, float(task.get("delay", 0) or 0))
+-                if policy["enabled"]:
+-                    delay = max(delay, float(policy["min_file_delay"]))
+-                if delay and not self.stop_event.is_set():
+-                    if not await self._sleep_stop(delay):
+-                        return
++                # The next byte upload can begin immediately. Publication of
++                # its handle observes the shared per-account interval above.
+ 
+         if start_after is not None and not start_after.is_set():
+             self._queue_task_row(tid, status='Ожидает свободные аккаунты…', speed='—', eta='—')

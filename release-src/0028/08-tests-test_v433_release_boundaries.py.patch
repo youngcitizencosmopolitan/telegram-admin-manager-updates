@@ -1,0 +1,10 @@
+--- a/app/tests/test_v433_release_boundaries.py
++++ b/app/tests/test_v433_release_boundaries.py
+@@ -136,6 +136,7 @@
+         pane.task_states = {}
+         pane.dedup_run_token = "test-run"
+         pane.stop_event = threading.Event()
++        pane.task_pause_events = {}
+         pane._emit_dashboard = _noop
+         pane._emit_task_metrics = _noop
+         pane._wait_gate = open_gate

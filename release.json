@@ -1,13 +1,17 @@
 {
-  "version": "0027",
-  "base_version": "0026",
-  "manifest_version": "4.3.8.0027",
-  "display_version": "0027",
+  "version": "0028",
+  "base_version": "0027",
+  "manifest_version": "4.3.8.0028",
+  "display_version": "0028",
   "patch_files": [
-    "release-src/0027/01-batch_uploader.py.patch",
-    "release-src/0027/02-telegram_admin_manager.py.patch",
-    "release-src/0027/03-tests-test_account_connection_retry.py.patch",
-    "release-src/0027/04-tests-test_qr_reauthentication.py.patch"
+    "release-src/0028/01-batch_uploader.py.patch",
+    "release-src/0028/02-telegram_admin_manager.py.patch",
+    "release-src/0028/03-tests-test_0012_file_parts_invalid.py.patch",
+    "release-src/0028/04-tests-test_file_index_performance.py.patch",
+    "release-src/0028/05-tests-test_prefetch_upload_boundary.py.patch",
+    "release-src/0028/06-tests-test_premium_global_priority.py.patch",
+    "release-src/0028/07-tests-test_upload_publication_pacing.py.patch",
+    "release-src/0028/08-tests-test_v433_release_boundaries.py.patch"
   ],
-  "notes": "0027: stop automatic reconnect loops for sessions requiring login; retain that state across monitor waves and exclude them from automatic account preparation. Temporary connection failures retry with a bounded pause, and successful explicit login releases the suppression. Show repeat-login status on the accounts tab. Preserves QR reauthentication, account removal protections, classic interface, caches and upload scheduling. Session recovery remains local and is never included in an update."
+  "notes": "0028: overlap the configured per-account publication interval with the next video upload instead of sleeping before its bytes start. Video uploads use 512 KiB parts and preserve duration, dimensions, MIME type, thumbnail, caption and forum topic when publishing the uploaded handle. Per-account publication pacing is shared across rules and waves, including failed attempts. Waiting for publication releases the global upload slot; actual upload and final send retain the configured global limit and recheck pause/stop at their boundaries. File identity, writer state, account usage and live caption are revalidated before actual uploads, including direct photo sends. FloodWait, Premium scheduling, claims and duplicate protection remain in place."
 }
