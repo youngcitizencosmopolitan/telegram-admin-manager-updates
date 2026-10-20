@@ -1,0 +1,422 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -12,6 +12,7 @@
+ import sys
+ import threading
+ import time
++import uuid
+ import traceback
+ import webbrowser
+ from pathlib import Path
+@@ -70,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0024"
++APP_VERSION = "0025"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -81,8 +82,15 @@
+     ("admins", "Админы"),
+ )
+ 
+-from tam_ui.workspace import PAGE_SPECS
+-MAIN_TAB_SPECS = PAGE_SPECS
++MAIN_TAB_SPECS = (
++    ("groups", "Создание групп"),
++    ("monitor", "Мониторинг"),
++    ("admins", "Админы"),
++    ("channels", "Каналы"),
++    ("accounts", "Аккаунты / API"),
++    ("x", "Twitter / X"),
++    ("updates", "Обновления"),
++)
+ 
+ 
+ ADMIN_POLICY_SCHEMA = 2
+@@ -353,7 +361,7 @@
+         self._build_ui()
+         self._install_keyboard_shortcuts()
+         self._load_config_into_ui()
+-        self.refresh_account_list(select_all=True)
++        self.refresh_account_list()
+         self.protocol("WM_DELETE_WINDOW", self.on_close)
+         self.after(50, self._drain_ui_queue)
+         self.after(1200, self._refresh_group_catalog_ui)
+@@ -505,69 +513,99 @@
+         return best_name, best_count, best_stamp
+ 
+     def _build_ui(self) -> None:
+-        """Build persistent production pages; navigation never starts a workload."""
+-        from tam_ui.theme import ThemeManager
+-        from tam_ui.workspace import Workspace, PAGE_SPECS
++        """Build one persistent tabbed workspace with a shared log on the right."""
+         self.geometry("1700x920")
+         self.minsize(1180, 700)
+-        self.theme_manager = ThemeManager(self, self.store)
+-        self.workspace = Workspace(self, self.theme_manager, self._workspace_selected)
+-        self.workspace.pack(fill="both", expand=True)
+-        pages = {key: self.workspace.add_page(key, title) for key, title in PAGE_SPECS}
+-        self._main_tabs = pages
+-        self.main_notebook = self.workspace.notebook
+-        self.busy_label = self.workspace.busy_label
+-        self.tab_group_factory = pages['groups']
+-        self.monitor_workspace = pages['monitor']
+-        self.queue_workspace = pages['queue']
+-        self.tab_group = pages['admins']
+-        self.tab_channels = pages['channels']
+-        self.tab_account_api = pages['accounts']
+-        self.tab_x_main = pages['x']
+-        self.tab_updates_main = pages['updates']
+-        self._tool_panes = {}
+-        text = self._build_log_panel(self.workspace.journal_host, title="Журнал событий")
+-        text.configure(height=7)
++        self.configure(bg="#eef2f7")
++        style = ttk.Style(self)
++        try:
++            style.theme_use("clam")
++        except Exception:
++            pass
++        style.configure("Main.TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 8))
++        style.configure("Quiet.TButton", font=("Segoe UI", 9), padding=(8, 6))
++
++        self.columnconfigure(0, weight=1)
++        self.rowconfigure(0, weight=1)
++        root = tk.Frame(self, bg="#eef2f7", padx=10, pady=10)
++        root.grid(row=0, column=0, sticky="nsew")
++        root.columnconfigure(0, weight=1)
++        root.rowconfigure(1, weight=1)
++
++        header = tk.Frame(root, bg="#eef2f7")
++        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
++        header.columnconfigure(0, weight=1)
++        tk.Label(
++            header, text=f"{APP_NAME}  {APP_VERSION}", bg="#eef2f7", fg="#172033",
++            font=("Segoe UI", 17, "bold"),
++        ).grid(row=0, column=0, sticky="w")
++        self.busy_label = tk.Label(
++            header, text="Готово", bg="#e5eaf1", fg="#334155", padx=12, pady=6,
++            font=("Segoe UI", 9, "bold"),
++        )
++        self.busy_label.grid(row=0, column=1, sticky="e")
++
++        self.main_workspace = tk.PanedWindow(
++            root, orient="horizontal", sashwidth=7, bg="#d8dee8", bd=0, relief="flat"
++        )
++        self.main_workspace.grid(row=1, column=0, sticky="nsew")
++        left = ttk.Frame(self.main_workspace, padding=0)
++        right = ttk.Frame(self.main_workspace, padding=8)
++        self.main_workspace.add(left, stretch="always", minsize=820)
++        self.main_workspace.add(right, minsize=300)
++        self._tool_panes = {"main_workspace": self.main_workspace}
++        self.main_workspace.bind("<ButtonRelease-1>", self._save_tool_pane_sashes, add="+")
++
++        left.columnconfigure(0, weight=1)
++        left.rowconfigure(0, weight=1)
++        self.main_notebook = ttk.Notebook(left, style="Main.TNotebook")
++        self.main_notebook.grid(row=0, column=0, sticky="nsew")
++
++        self.tab_group_factory = ttk.Frame(self.main_notebook, padding=10)
++        self.monitor_workspace = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_group = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_channels = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_account_api = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_x_main = ttk.Frame(self.main_notebook, padding=14)
++        self.tab_updates_main = ttk.Frame(self.main_notebook, padding=14)
++        tab_frames = {
++            "groups": self.tab_group_factory,
++            "monitor": self.monitor_workspace,
++            "admins": self.tab_group,
++            "channels": self.tab_channels,
++            "accounts": self.tab_account_api,
++            "x": self.tab_x_main,
++            "updates": self.tab_updates_main,
++        }
++        self._main_tabs = tab_frames
++        for key, label in MAIN_TAB_SPECS:
++            self.main_notebook.add(tab_frames[key], text=label)
++
++        # Shared right-side journal stays visible while switching tabs.
++        self._build_log_panel(right, title="Журнал")
++
++        # Monitoring keeps its hidden compatibility host for the proven queue engine.
+         self.monitor_workspace.columnconfigure(0, weight=1)
+         self.monitor_workspace.rowconfigure(0, weight=1)
+-        queue_page = pages['queue']
+-        queue_page.columnconfigure(0, weight=1); queue_page.rowconfigure(0, weight=1)
+-        self.queue_notebook = ttk.Notebook(queue_page)
+-        self.queue_notebook.grid(row=0, column=0, sticky='nsew')
+-        self.queue_workspace = ttk.Frame(self.queue_notebook)
+-        self.tab_batch_uploader = ttk.Frame(self.queue_notebook, padding=8)
+-        self.queue_notebook.add(self.queue_workspace, text='Очередь')
+-        self.queue_notebook.add(self.tab_batch_uploader, text='Задания и импорт')
++        self.tab_batch_uploader = ttk.Frame(self.monitor_workspace)
+         self.tab_monitor = self.monitor_workspace
++
++        # Accounts/API remain grouped inside one always-visible main tab.
+         self.tab_account_api.columnconfigure(0, weight=1)
+         self.tab_account_api.rowconfigure(0, weight=1)
+         self.advanced_notebook = ttk.Notebook(self.tab_account_api)
+         self.advanced_notebook.grid(row=0, column=0, sticky="nsew")
+-        self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=10)
+-        self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=10)
++        self.tab_accounts = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_uploader = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_safety = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_statistics = ttk.Frame(self.advanced_notebook, padding=12)
++        self.tab_settings = ttk.Frame(self.advanced_notebook, padding=12)
+         self.advanced_notebook.add(self.tab_accounts, text="Аккаунты")
+         self.advanced_notebook.add(self.tab_uploader, text="Быстрая загрузка")
+-        settings = pages['settings']
+-        settings.columnconfigure(0, weight=1)
+-        settings.rowconfigure(1, weight=1)
+-        appearance = ttk.Frame(settings, padding=(10, 8))
+-        appearance.grid(row=0, column=0, sticky='ew')
+-        ttk.Label(appearance, text='Оформление', style='Section.TLabel').pack(side='left')
+-        from tam_ui.workspace import THEME_LABELS
+-        self.settings_theme_var = tk.StringVar(value=self.workspace.theme_var.get())
+-        theme_combo = ttk.Combobox(appearance, textvariable=self.settings_theme_var,
+-                                   values=list(THEME_LABELS), state='readonly', width=17)
+-        theme_combo.pack(side='left', padx=16)
+-        theme_combo.bind('<<ComboboxSelected>>', lambda _e: self.theme_manager.apply(THEME_LABELS[self.settings_theme_var.get()]))
+-        self.bind('<<AppThemeChanged>>', lambda _e: self.settings_theme_var.set(self.workspace.theme_var.get()), add='+')
+-        self.settings_notebook = ttk.Notebook(settings)
+-        self.settings_notebook.grid(row=1, column=0, sticky='nsew')
+-        self.tab_safety = ttk.Frame(self.settings_notebook, padding=10)
+-        self.tab_statistics = ttk.Frame(self.settings_notebook, padding=10)
+-        self.tab_settings = ttk.Frame(self.settings_notebook, padding=10)
+-        self.settings_notebook.add(self.tab_safety, text="Безопасность")
+-        self.settings_notebook.add(self.tab_statistics, text="Статистика")
+-        self.settings_notebook.add(self.tab_settings, text="API и данные")
++        self.advanced_notebook.add(self.tab_safety, text="Безопасность")
++        self.advanced_notebook.add(self.tab_statistics, text="Статистика")
++        self.advanced_notebook.add(self.tab_settings, text="Настройки API")
++
+         self._build_group_factory_tab()
+         self._build_group_tab()
+         self._build_channels_tab()
+@@ -576,18 +614,10 @@
+         )
+         if hasattr(self.batch_uploader, "monitor_body_pane"):
+             self._tool_panes["monitor_body"] = self.batch_uploader.monitor_body_pane
+-            self._tool_panes['monitor_details'] = self.batch_uploader.monitor_details_pane
+-            self.batch_uploader.monitor_details_pane.bind('<ButtonRelease-1>', self._save_tool_pane_sashes, add='+')
+             self.batch_uploader.monitor_body_pane.bind(
+                 "<ButtonRelease-1>", self._save_tool_pane_sashes, add="+"
+             )
+         self._build_accounts_tab()
+-        participation = ttk.Frame(self.tab_account_api, padding=(10, 8))
+-        participation.grid(row=1, column=0, sticky='ew')
+-        ttk.Label(participation, text='Регистрация аккаунта и участие в мониторинге настраиваются отдельно.',
+-                  style='Muted.TLabel', wraplength=550).pack(side='left')
+-        ttk.Button(participation, text='Аккаунты для всех правил…',
+-                   command=self.batch_uploader.choose_monitor_accounts_for_all).pack(side='right', padx=8)
+         self._build_uploader_tab()
+         self._build_safety_tab()
+         self._build_statistics_tab()
+@@ -615,8 +645,6 @@
+             self.tab_updates_main, text="Проверить обновления", command=self._show_update_center
+         ).grid(row=2, column=0, sticky="w")
+ 
+-        self.workspace.select('monitor')
+-        self.theme_manager.apply(self.theme_manager.preference)
+         self.after(450, self._restore_tool_pane_sashes)
+ 
+     def _workspace_selected(self, key: str) -> None:
+@@ -965,17 +993,24 @@
+             pass
+ 
+     def _open_advanced(self, section: str = "uploads") -> None:
+-        if section in {'groups', 'admins', 'monitor'}:
++        if section in {"groups", "admins", "monitor"}:
+             self._open_primary_tool(section)
+-        elif section == 'uploads':
+-            self._open_primary_tool('queue')
+-        elif section in {'safety', 'settings', 'statistics'}:
+-            self.workspace.select('settings')
+-            self.settings_notebook.select({'safety': self.tab_safety, 'statistics': self.tab_statistics,
+-                                            'settings': self.tab_settings}[section])
+-        else:
+-            self.workspace.select('accounts')
+-            self.advanced_notebook.select(self.tab_uploader if section == 'quick' else self.tab_accounts)
++            return
++        if section == "uploads":
++            self._open_primary_tool("monitor")
++            return
++        mapping = {
++            "accounts": self.tab_accounts,
++            "quick": self.tab_uploader,
++            "safety": self.tab_safety,
++            "settings": self.tab_settings,
++        }
++        try:
++            self.main_notebook.select(self.tab_account_api)
++            self.advanced_notebook.select(mapping.get(section, self.tab_accounts))
++            self.focus_force()
++        except Exception:
++            pass
+ 
+     def _dashboard_toggle_monitor(self) -> None:
+         try:
+@@ -1219,7 +1254,7 @@
+                 self.after(5000, lambda: self.refresh_group_names(force=False, automatic=True))
+             else:
+                 status = "Обновление названий отложено до освобождения Telegram-сессий"
+-                if hasattr(self, 'workspace'):
++                if hasattr(self, 'busy_label'):
+                     self.busy_label.configure(text=status)
+                 else:
+                     self.dashboard_groups_status.set(status)
+@@ -2485,6 +2520,7 @@
+         sb = ttk.Scrollbar(frame, orient="vertical", command=self.accounts_list.yview)
+         sb.grid(row=0, column=1, sticky="ns")
+         self.accounts_list.configure(yscrollcommand=sb.set)
++        self.accounts_list.bind('<<ListboxSelect>>', lambda _e: self._sync_account_selection('list'))
+ 
+         buttons = ttk.Frame(t)
+         buttons.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+@@ -2511,6 +2547,7 @@
+             self.account_status_tree.heading(key, text=label)
+             self.account_status_tree.column(key, width=width, minwidth=45, stretch=key in {"account", "runtime", "detail"})
+         self.account_status_tree.grid(row=0, column=0, sticky="nsew")
++        self.account_status_tree.bind('<<TreeviewSelect>>', lambda _e: self._sync_account_selection('status'))
+         sb2 = ttk.Scrollbar(status_box, orient="vertical", command=self.account_status_tree.yview)
+         sb2.grid(row=0, column=1, sticky="ns")
+         self.account_status_tree.configure(yscrollcommand=sb2.set)
+@@ -4210,11 +4247,16 @@
+ 
+     # ---------- account UI ----------
+     def refresh_account_list(self, select_all: bool = False) -> None:
++        selected_sessions = {a.session for a in self.selected_accounts()}
+         accounts = self.store.accounts()
+         previous_upload_sessions = set(self.store.data.get("upload_selected_sessions", []) or [])
+         self.accounts_list.delete(0, tk.END)
++        self._account_list_sessions = [a.session for a in accounts]
+         for a in accounts:
+             self.accounts_list.insert(tk.END, a.display)
++        for i, a in enumerate(accounts):
++            if a.session in selected_sessions:
++                self.accounts_list.select_set(i)
+ 
+         self.upload_accounts_list.delete(0, tk.END)
+         for a in accounts:
+@@ -4251,17 +4293,37 @@
+         if hasattr(self, "batch_uploader"):
+             self.batch_uploader.refresh_tasks()
+         self._refresh_account_status_panel()
++        self._sync_account_selection('list')
+         if hasattr(self, "channels_tree"):
+             self.refresh_channels_from_cache()
+ 
+     def select_all_accounts(self) -> None:
+         if self.accounts_list.size():
+             self.accounts_list.select_set(0, tk.END)
++            self._sync_account_selection('list')
+ 
+     def selected_accounts(self) -> list[Account]:
+         accounts = self.store.accounts()
+         indices = list(self.accounts_list.curselection())
+-        return [accounts[i] for i in indices if 0 <= i < len(accounts)]
++        displayed = getattr(self, '_account_list_sessions', [a.session for a in accounts])
++        selected = {displayed[i] for i in indices if 0 <= i < len(displayed)}
++        return [a for a in accounts if a.session in selected]
++
++    def _sync_account_selection(self, source: str) -> None:
++        if not hasattr(self, 'account_status_tree'):
++            return
++        if source == 'list':
++            sessions = {a.session for a in self.selected_accounts()}
++            if set(self.account_status_tree.selection()) != sessions:
++                self.account_status_tree.selection_set([s for s in self._account_list_sessions
++                                                       if s in sessions and self.account_status_tree.exists(s)])
++        else:
++            sessions = set(self.account_status_tree.selection())
++            if {a.session for a in self.selected_accounts()} != sessions:
++                self.accounts_list.selection_clear(0, tk.END)
++                for i, session in enumerate(getattr(self, '_account_list_sessions', [])):
++                    if session in sessions:
++                        self.accounts_list.select_set(i)
+ 
+     def select_all_upload_accounts(self) -> None:
+         if self.upload_accounts_list.size():
+@@ -4796,7 +4858,7 @@
+             account = self._account_from_me(me, session_name, label=label)
+             self._save_account(account)
+             self.log(f"Добавлен по QR: {account.display} (ID {account.user_id})")
+-            self.ui_call(lambda: self.refresh_account_list(select_all=True))
++            self.ui_call(lambda: self.refresh_account_list())
+             self.ui_call(lambda: messagebox.showinfo(APP_NAME, f"Аккаунт добавлен:\n{account.display}"))
+         except Exception:
+             failed = True
+@@ -4949,7 +5011,7 @@
+             account = self._account_from_me(me, session_name, label=label, fallback_phone=phone)
+             self._save_account(account)
+             self.log(f"Добавлен аккаунт: {account.display} (ID {account.user_id})")
+-            self.ui_call(lambda: self.refresh_account_list(select_all=True))
++            self.ui_call(lambda: self.refresh_account_list())
+         except Exception:
+             failed = True
+             raise
+@@ -5001,34 +5063,47 @@
+             finally:
+                 await client.disconnect()
+         self.store.set_accounts(updated)
+-        self.ui_call(lambda: self.refresh_account_list(select_all=True))
++        self.ui_call(lambda: self.refresh_account_list())
+ 
+     def remove_selected_accounts(self) -> None:
+         selected = self.selected_accounts()
++        status_selected = self._selected_accounts_for_usage()
++        if selected and status_selected and {a.session for a in selected} != {a.session for a in status_selected}:
++            messagebox.showinfo(APP_NAME, 'Выделение в списках различается. Выбери нужные аккаунты заново.', parent=self)
++            return
++        selected = status_selected or selected
+         if not selected:
+             messagebox.showinfo(APP_NAME, "Выбери хотя бы один аккаунт.")
+             return
++        names = '\n'.join(a.display for a in selected[:10])
++        if len(selected) > 10:
++            names += f'\n… и ещё {len(selected) - 10}'
+         if not messagebox.askyesno(
+             APP_NAME,
+-            "Удалить выбранные аккаунты из приложения и удалить их локальные .session файлы?\n\n"
+-            "Это НЕ удалит Telegram-аккаунты, но приложение забудет авторизацию.",
++            f'Убрать из списка аккаунты: {len(selected)}?\n\n{names}\n\n'
++            'Файлы сессий сохранятся локально для восстановления. Telegram-аккаунты не удаляются.',
++            parent=self, default='no',
+         ):
+             return
+         selected_sessions = {a.session for a in selected}
+-        remaining = [a for a in self.store.accounts() if a.session not in selected_sessions]
+-        for a in selected:
+-            for suffix in [".session", ".session-journal"]:
+-                p = SESSIONS_DIR / f"{a.session}{suffix}"
+-                try:
+-                    if p.exists():
+-                        p.unlink()
+-                except Exception as exc:
+-                    self.log(f"Не удалось удалить {p.name}: {exc}")
+-        self.store.set_accounts(remaining)
++        original = self.store.accounts()
++        remaining = [a for a in original if a.session not in selected_sessions]
++        try:
++            backup_dir = DATA_DIR / 'backups' / 'removed-accounts'
++            backup_dir.mkdir(parents=True, exist_ok=True)
++            backup = backup_dir / f'accounts-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json'
++            backup.write_text(json.dumps({'accounts':[a.to_dict() for a in original],
++                'removed_sessions':[a.session for a in selected], 'created_at':time.time()},
++                ensure_ascii=False, indent=2), encoding='utf-8')
++            self.store.set_accounts(remaining)
++        except Exception as exc:
++            self.store.data['accounts'] = [a.to_dict() for a in original]
++            messagebox.showerror(APP_NAME, f'Не удалось безопасно убрать аккаунты. Список сохранён.\n{exc}', parent=self)
++            return
+         if self.store.data.get("controller_session") in selected_sessions:
+             self.store.data["controller_session"] = remaining[0].session if remaining else ""
+             self.store.save()
+-        self.refresh_account_list(select_all=True)
++        self.refresh_account_list()
+ 
+     # ---------- group / promotion ----------
+     def start_promote(self, force_recheck: bool = False) -> None:
