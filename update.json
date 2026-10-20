@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0028",
-  "display_version": "0028",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0028/TelegramAdminManager_v0028_update.zip",
-  "sha256": "36a8d356b1955d020e4925b1469b5cbc9543a9a0dbc3c7a8275c8732cd1758be",
-  "notes": "0028: overlap the configured per-account publication interval with the next video upload instead of sleeping before its bytes start. Video uploads use 512 KiB parts and preserve duration, dimensions, MIME type, thumbnail, caption and forum topic when publishing the uploaded handle. Per-account publication pacing is shared across rules and waves, including failed attempts. Waiting for publication releases the global upload slot; actual upload and final send retain the configured global limit and recheck pause/stop at their boundaries. File identity, writer state, account usage and live caption are revalidated before actual uploads, including direct photo sends. FloodWait, Premium scheduling, claims and duplicate protection remain in place."
+  "version": "4.3.8.0029",
+  "display_version": "0029",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0029/TelegramAdminManager_v0029_update.zip",
+  "sha256": "eae6308026152f631c8d65b824d0fe4de36a3c42accc1b8a221e3606beb9f0ed",
+  "notes": "0029: add Repeat login by phone for a selected saved account. Prefill its phone number and request the code using the delivery method returned by Telegram, including Telegram Desktop service messages; support the 2FA password when required. Probe valid sessions without requesting a code. Reauthenticate expired sessions with a fresh temporary key, verify the selected owner and saved account identity, then install under the unchanged session name so rules and usage settings remain intact. Local snapshots protect cancellation, incorrect codes, wrong owners and failed saves; temporary sessions are cleaned even after rollback errors. QR login and the existing new-account phone flow remain available."
 }
