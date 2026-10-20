@@ -1,0 +1,21 @@
+--- a/app/tam_ui/qr_dialog.py
++++ b/app/tam_ui/qr_dialog.py
+@@ -34,7 +34,8 @@
+             body,
+             text=(
+                 "На телефоне: Telegram → Настройки → Устройства → Подключить устройство.\n"
+-                "Если код истечёт, приложение обновит его автоматически."
++                "Если код истечёт, приложение обновит его автоматически.\n"
++                "Для аккаунта из списка используй «Повторный вход по QR»."
+             ),
+             justify="center",
+         ).grid(row=1, column=0, pady=(0, 10))
+@@ -55,6 +56,8 @@
+         self.focus_force()
+ 
+     def update_qr(self, url: str) -> None:
++        if not self.winfo_exists():
++            return
+         if qrcode is None or ImageTk is None:
+             self.status_var.set("Не установлен модуль QR. Запусти setup.bat ещё раз.")
+             return

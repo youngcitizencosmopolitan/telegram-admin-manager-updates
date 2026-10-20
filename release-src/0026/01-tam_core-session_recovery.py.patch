@@ -1,0 +1,21 @@
+--- /dev/null
++++ b/app/tam_core/session_recovery.py
+@@ -0,0 +1,18 @@
++"""Local SQLite session snapshots; never expose or log authentication data."""
++from contextlib import closing
++from pathlib import Path
++import sqlite3
++import time
++
++
++def copy_session_database(source: Path, destination: Path) -> Path:
++    source, destination = Path(source), Path(destination)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    deadline = time.monotonic() + 10
++    def progress(_status, _remaining, _total):
++        if time.monotonic() >= deadline:
++            raise TimeoutError('Локальная сессия занята. Заверши другую операцию и повтори вход.')
++    with closing(sqlite3.connect(source.resolve().as_uri()+'?mode=ro', uri=True)) as src:
++        with closing(sqlite3.connect(destination)) as dst:
++            src.backup(dst, progress=progress, sleep=.05)
++    return destination
