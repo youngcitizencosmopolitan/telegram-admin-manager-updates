@@ -1,0 +1,180 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0028"
++APP_VERSION = "0029"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -2526,6 +2526,7 @@
+         buttons.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+         ttk.Button(buttons, text="+ Войти по QR", command=self.add_account_qr).pack(side="left")
+         ttk.Button(buttons, text='Повторный вход по QR', command=self.reauthorize_selected_account).pack(side='left', padx=6)
++        ttk.Button(buttons, text='Повторный вход по номеру', command=self.reauthorize_selected_account_phone).pack(side='left', padx=6)
+         ttk.Button(buttons, text="+ Войти по номеру", command=self.add_account).pack(side="left", padx=6)
+         ttk.Button(buttons, text="Обновить данные", command=self.refresh_accounts_from_telegram).pack(side="left", padx=6)
+         ttk.Button(buttons, text="Выбрать все", command=self.select_all_accounts).pack(side="left", padx=6)
+@@ -4813,6 +4814,13 @@
+             return
+         self.add_account_qr(existing_account=selected[0])
+ 
++    def reauthorize_selected_account_phone(self) -> None:
++        selected = self.selected_accounts()
++        if len(selected) != 1:
++            messagebox.showinfo(APP_NAME, 'Выбери один аккаунт для повторного входа.', parent=self)
++            return
++        self.add_account(existing_account=selected[0])
++
+     def add_account_qr(self, existing_account: Account | None = None) -> None:
+         if TelegramClient is None:
+             self._show_missing_dependency()
+@@ -5060,7 +5068,7 @@
+             human += "; " + "; ".join(extra)
+         return human
+ 
+-    def add_account(self) -> None:
++    def add_account(self, existing_account: Account | None = None) -> None:
+         if TelegramClient is None:
+             self._show_missing_dependency()
+             return
+@@ -5075,15 +5083,135 @@
+             APP_NAME,
+             "Номер телефона Telegram в международном формате, например +48123456789:",
+             parent=self,
++            initialvalue=(existing_account.phone or '') if existing_account else '',
+         )
+         if not phone:
+             return
+-        label = simpledialog.askstring(APP_NAME, "Название аккаунта в приложении (необязательно):", parent=self) or ""
++        label = existing_account.label if existing_account else (
++            simpledialog.askstring(APP_NAME, "Название аккаунта в приложении (необязательно):", parent=self) or '')
+ 
+         def work() -> None:
+-            asyncio.run(self._add_account_async(phone.strip(), label.strip()))
++            if existing_account:
++                asyncio.run(self._reauthorize_account_phone_async(existing_account, phone.strip()))
++            else:
++                asyncio.run(self._add_account_async(phone.strip(), label.strip()))
+ 
+         self.run_worker(work, "Авторизация аккаунта…")
++
++    async def _reauthorize_account_phone_async(self, existing_account: Account, phone: str) -> None:
++        from tam_core.session_recovery import copy_session_database
++        phone = re.sub(r'[\s()\-]', '', phone.strip())
++        if phone.startswith('00'):
++            phone = '+' + phone[2:]
++        if not re.fullmatch(r'\+[1-9][0-9]{4,14}', phone):
++            raise RuntimeError('Введи номер в международном формате, начиная с + и кода страны.')
++        session_name = existing_account.session
++        if (not session_name or session_name in {'.', '..'}
++                or not re.fullmatch(r'[A-Za-z0-9_.-]+', session_name)):
++            raise RuntimeError('Некорректное имя локальной сессии.')
++
++        def check_current():
++            if getattr(self, '_closed', False):
++                raise RuntimeError('Приложение закрыто; вход отменён.')
++            if not any(a.session == session_name and a.user_id == existing_account.user_id for a in self.store.accounts()):
++                raise RuntimeError('Аккаунт изменён или удалён во время входа.')
++
++        check_current()
++        api_id, api_hash = self._api_credentials()
++        session_file = SESSIONS_DIR / f'{session_name}.session'
++        backup = None
++        if session_file.exists():
++            backup = DATA_DIR / 'backups' / 'reauth' / f'{session_name}-{time.time_ns()}.session'
++            await asyncio.to_thread(copy_session_database, session_file, backup)
++        client, working_session_name, saved = None, None, False
++        try:
++            client = TelegramClient(str(SESSIONS_DIR / session_name), api_id, api_hash)
++            try:
++                await client.connect()
++                authorized = await client.is_user_authorized()
++            except Exception as exc:
++                if exc.__class__.__name__ not in {
++                    'AuthKeyUnregisteredError', 'AuthKeyInvalidError', 'AuthKeyDuplicatedError',
++                    'SessionRevokedError', 'SessionExpiredError',
++                }:
++                    raise
++                authorized = False
++            if authorized:
++                me = await client.get_me()
++                if not me or me.id != existing_account.user_id:
++                    raise RuntimeError('Локальная сессия принадлежит другому аккаунту.')
++                check_current()
++                saved = True
++                uploader = getattr(self, 'batch_uploader', None)
++                if uploader is not None:
++                    uploader.clear_session_auth_required(session_name)
++                self.ui_call(self.refresh_account_list)
++                self.ui_call(lambda: messagebox.showinfo(APP_NAME,
++                    'Сессия выбранного аккаунта уже авторизована. Повторный вход не требуется.'))
++                return
++
++            await client.disconnect()
++            working_session_name = f'phone_reauth_{time.time_ns()}'
++            client = TelegramClient(str(SESSIONS_DIR / working_session_name), api_id, api_hash)
++            await client.connect()
++            if await client.is_user_authorized():
++                raise RuntimeError('Новая сессия неожиданно уже авторизована.')
++            check_current()
++            self.log('Повторный вход: запрашиваю код Telegram…')
++            sent = await client.send_code_request(phone)
++            delivery = self._sent_code_description(sent)
++            self.log(f'Telegram сообщает: код отправлен {delivery}.')
++            code = await self.ui_ask_async(lambda: simpledialog.askstring(APP_NAME,
++                f'Код отправлен {delivery}.\n\nЕсли аккаунт открыт на ПК, проверь служебный чат Telegram.\nВведи код для {phone}:',
++                parent=self))
++            check_current()
++            if not code:
++                raise RuntimeError('Повторный вход отменён.')
++            try:
++                await client.sign_in(phone=phone, code=code.strip(), phone_code_hash=sent.phone_code_hash)
++            except errors.SessionPasswordNeededError:
++                password = await self.ui_ask_async(lambda: simpledialog.askstring(APP_NAME,
++                    'Включена двухэтапная проверка. Введи пароль 2FA:', parent=self, show='*'))
++                check_current()
++                if not password:
++                    raise RuntimeError('Повторный вход отменён: не введён пароль 2FA.')
++                await client.sign_in(password=password)
++            if not await client.is_user_authorized():
++                raise RuntimeError('Telegram не завершил авторизацию.')
++            me = await client.get_me()
++            check_current()
++            if not me or me.id != existing_account.user_id:
++                raise RuntimeError('Вход выполнен в другой аккаунт. Используй номер выбранного аккаунта.')
++            account = self._account_from_me(me, session_name, label=existing_account.label, fallback_phone=phone)
++            await client.disconnect()
++            check_current()
++            await asyncio.to_thread(copy_session_database,
++                SESSIONS_DIR / f'{working_session_name}.session', session_file)
++            def commit():
++                nonlocal saved
++                # Account removal also runs on Tk's thread. Validate and save
++                # together there so a concurrent removal cannot be undone.
++                check_current()
++                self._save_account(account)
++                saved = True
++            await self.ui_ask_async(commit)
++            self.log('Повторный вход по номеру выполнен; правила и настройки аккаунта сохранены.')
++            self.ui_call(self.refresh_account_list)
++            self.ui_call(lambda: messagebox.showinfo(APP_NAME, f'Повторный вход выполнен:\n{account.display}'))
++        finally:
++            try:
++                if client is not None:
++                    await client.disconnect()
++            finally:
++                try:
++                    if not saved:
++                        if backup is not None:
++                            await asyncio.to_thread(copy_session_database, backup, session_file)
++                        else:
++                            self._delete_session_files(session_name)
++                finally:
++                    if working_session_name is not None:
++                        self._delete_session_files(working_session_name)
+ 
+     async def _add_account_async(self, phone: str, label: str) -> None:
+         api_id, api_hash = self._api_credentials()

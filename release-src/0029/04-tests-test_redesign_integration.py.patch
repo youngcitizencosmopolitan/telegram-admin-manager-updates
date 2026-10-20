@@ -1,0 +1,24 @@
+--- a/app/tests/test_redesign_integration.py
++++ b/app/tests/test_redesign_integration.py
+@@ -1,4 +1,5 @@
+ import tempfile
++import gc
+ import tkinter as tk
+ import unittest
+ from pathlib import Path
+@@ -42,9 +43,15 @@
+         self.addCleanup(self._destroy_app)
+ 
+     def _destroy_app(self):
++        if self.app is None:
++            return
+         for token in self.app.tk.splitlist(self.app.tk.call('after', 'info')):
+             self.app.after_cancel(token)
+         self.app.destroy()
++        # Release Tk variables/cycles on the thread that owns Tcl, before
++        # subsequent async tests can trigger cyclic GC in a worker thread.
++        self.app = None
++        gc.collect()
+ 
+     def test_classic_tabs_and_shared_journal_are_restored(self):
+         from tkinter import ttk

@@ -1,0 +1,47 @@
+--- a/app/tests/test_account_removal.py
++++ b/app/tests/test_account_removal.py
+@@ -118,6 +118,44 @@
+         info.assert_called_once()
+         login.assert_not_called()
+ 
++    def test_repeat_phone_button_uses_selected_saved_account(self):
++        from tkinter import ttk
++        accounts=self.seed()
++        self.app.geometry('1180x700')
++        self.app.accounts_list.select_set(1)
++        self.app.accounts_list.event_generate('<<ListboxSelect>>');self.app.update()
++        def walk(widget):
++            for child in widget.winfo_children():
++                yield child
++                yield from walk(child)
++        buttons=[w for w in walk(self.app.tab_accounts) if isinstance(w,ttk.Button)
++            and w.cget('text')=='Повторный вход по номеру']
++        self.assertEqual(len(buttons),1)
++        button=buttons[0]
++        self.assertTrue(button.winfo_ismapped())
++        self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),
++            button.master.winfo_rootx()+button.master.winfo_width())
++        with patch.object(self.app,'add_account') as login:
++            button.invoke()
++        login.assert_called_once_with(existing_account=accounts[1])
++
++    def test_repeat_phone_requires_one_selected_account(self):
++        self.seed()
++        method=getattr(self.app,'reauthorize_selected_account_phone',None)
++        self.assertTrue(callable(method))
++        with patch.object(main.messagebox,'showinfo') as info,patch.object(self.app,'add_account') as login:
++            method()
++        info.assert_called_once();login.assert_not_called()
++
++    def test_repeat_phone_prefills_number_and_cancel_starts_no_worker(self):
++        account=self.seed()[1]
++        account.phone='+48123456789'
++        with (patch.object(self.app,'save_api_settings'),patch.object(self.app,'_api_credentials',return_value=(1,'synthetic')),
++                patch.object(main.simpledialog,'askstring',return_value=None) as ask,patch.object(self.app,'run_worker') as worker):
++            self.app.add_account(existing_account=account)
++        self.assertEqual(ask.call_args.kwargs['initialvalue'],'+48123456789')
++        worker.assert_not_called()
++
+ 
+ if __name__ == '__main__':
+     unittest.main()

@@ -1,0 +1,202 @@
+--- /dev/null
++++ b/app/tests/test_phone_reauthentication.py
+@@ -0,0 +1,199 @@
++import asyncio
++from contextlib import closing
++from pathlib import Path
++import sqlite3
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++import telegram_admin_manager as main
++from tam_core.models import Account
++from tam_core.repositories import ConfigStore
++
++
++class PasswordNeeded(Exception):
++    pass
++
++
++class PhoneReauthenticationTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        self.tmp=tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root=Path(self.tmp.name)
++        self.sessions=self.root/'sessions';self.sessions.mkdir()
++        self.account=Account(session='stable',label='Saved',phone='+48123456789',user_id=7)
++        self.other=Account(session='other',label='Other',phone='+48987654321',user_id=8)
++        self.store=ConfigStore(self.root/'config.json')
++        self.store.set_accounts([self.account,self.other])
++        self.store.db.account_usage_set('stable',{'monitoring':False})
++        self.store.data['monitor_selected_sessions']=['stable']
++        self.old=self.sessions/'stable.session'
++        with closing(sqlite3.connect(self.old)) as db,db:
++            db.execute('CREATE TABLE auth(value TEXT)');db.execute("INSERT INTO auth VALUES('old')")
++        self.clients=[];self.codes=[];self.logs=[];self.signins=[]
++        self.original_authorized=False;self.returned_id=7
++        self.password_needed=self.probe_revoked=False
++        self.prompt_values=['12345','synthetic-password']
++        self.close_on_prompt=False
++        self.app=SimpleNamespace(store=self.store,_closed=False,_api_credentials=lambda:(1,'synthetic-api-hash'),
++            log=self.logs.append,ui_call=lambda fn:fn(),refresh_account_list=lambda:None)
++        self.app._account_from_me=main.TelegramAdminManager._account_from_me
++        self.app._save_account=lambda a:main.TelegramAdminManager._save_account(self.app,a)
++        self.app._delete_session_files=main.TelegramAdminManager._delete_session_files
++        self.app._sent_code_description=main.TelegramAdminManager._sent_code_description
++        self.app.ui_ask_async=lambda fn:main.TelegramAdminManager.ui_ask_async(self.app,fn)
++        owner=self
++        class Client:
++            def __init__(self,path,*args,**kwargs):
++                self.path=Path(str(path)+'.session')
++                self.authorized=owner.original_authorized if self.path==owner.old else False
++                if not self.path.exists():
++                    with closing(sqlite3.connect(self.path)) as db,db:
++                        db.execute('CREATE TABLE auth(value TEXT)');db.execute("INSERT INTO auth VALUES('fresh')")
++                self.disconnected=False
++                owner.clients.append(self)
++            async def connect(self):
++                if owner.probe_revoked and self.path==owner.old:
++                    raise type('AuthKeyUnregisteredError',(Exception,),{})('synthetic revoked key')
++            async def disconnect(self):self.disconnected=True
++            async def is_user_authorized(self):return self.authorized
++            async def get_me(self):return SimpleNamespace(id=owner.returned_id,phone='48123456789',first_name='Synthetic')
++            async def send_code_request(self,phone):
++                owner.assertNotEqual(self.path,owner.old,'An expired original key must not be authorized as another owner')
++                owner.codes.append(phone)
++                return SimpleNamespace(type=type('SentCodeTypeApp',(),{})(),phone_code_hash='synthetic-hash')
++            async def sign_in(self,**kwargs):
++                owner.signins.append(kwargs)
++                if 'code' in kwargs:
++                    if kwargs['code']!='12345':raise ValueError('synthetic invalid code')
++                    if owner.password_needed:raise PasswordNeeded()
++                self.authorized=True
++                with closing(sqlite3.connect(self.path)) as db,db:db.execute("UPDATE auth SET value='new login'")
++        def ask(*args,**kwargs):
++            if owner.close_on_prompt:owner.app._closed=True
++            return owner.prompt_values.pop(0)
++        for name,value in [('DATA_DIR',self.root),('SESSIONS_DIR',self.sessions),('TelegramClient',Client),
++                ('errors',SimpleNamespace(SessionPasswordNeededError=PasswordNeeded))]:
++            p=patch.object(main,name,value);p.start();self.addCleanup(p.stop)
++        p=patch.object(main.simpledialog,'askstring',side_effect=ask);p.start();self.addCleanup(p.stop)
++        p=patch.object(main.messagebox,'showinfo');p.start();self.addCleanup(p.stop)
++
++    async def login(self,phone=None):
++        method=getattr(main.TelegramAdminManager,'_reauthorize_account_phone_async',None)
++        self.assertTrue(callable(method),'Saved accounts need repeat phone login that retains their stable session identity')
++        return await asyncio.wait_for(method(self.app,self.account,phone or self.account.phone),3)
++
++    def assert_old_preserved(self):
++        with closing(sqlite3.connect(self.old)) as db:
++            self.assertEqual(db.execute('SELECT value FROM auth').fetchone()[0],'old')
++        self.assertEqual({a.session for a in self.store.accounts()},{'stable','other'})
++        self.assertFalse(any(p.name.startswith('phone_reauth_') for p in self.sessions.iterdir()))
++
++    async def test_success_retains_stable_identity_rules_and_usage(self):
++        await self.login()
++        self.assertEqual(self.codes,['+48123456789'])
++        self.assertEqual({a.session for a in self.store.accounts()},{'stable','other'})
++        self.assertEqual(self.store.data['monitor_selected_sessions'],['stable'])
++        self.assertFalse(self.store.db.account_usage_get('stable')['monitoring'])
++        self.assertEqual(next(a for a in self.store.accounts() if a.session=='stable').label,'Saved')
++        with closing(sqlite3.connect(self.old)) as db:
++            self.assertEqual(db.execute('SELECT value FROM auth').fetchone()[0],'new login')
++        self.assertTrue(all(c.disconnected for c in self.clients))
++        self.assertFalse(any(p.name.startswith('phone_reauth_') for p in self.sessions.iterdir()))
++        self.assertFalse(any('12345' in msg or 'synthetic-password' in msg or 'synthetic-hash' in msg for msg in self.logs))
++
++    async def test_already_authorized_owner_needs_no_code(self):
++        self.original_authorized=True
++        await self.login()
++        self.assertEqual(self.codes,[])
++        self.assertEqual(len(self.clients),1)
++        self.assert_old_preserved()
++
++    async def test_wrong_owner_keeps_original_session(self):
++        self.returned_id=99
++        with self.assertRaises(RuntimeError):await self.login()
++        self.assert_old_preserved()
++
++    async def test_cancelled_code_keeps_original_session(self):
++        self.prompt_values=[None]
++        with self.assertRaises(RuntimeError):await self.login()
++        self.assert_old_preserved()
++
++    async def test_invalid_code_keeps_original_session(self):
++        self.prompt_values=['wrong-code']
++        with self.assertRaises(ValueError):await self.login()
++        self.assert_old_preserved()
++
++    async def test_two_factor_login_completes(self):
++        self.password_needed=True
++        await self.login()
++        self.assertEqual(self.signins[-1],{'password':'synthetic-password'})
++
++    async def test_cancelled_password_keeps_original_session(self):
++        self.password_needed=True;self.prompt_values=['12345',None]
++        with self.assertRaises(RuntimeError):await self.login()
++        self.assert_old_preserved()
++
++    async def test_closing_app_after_code_does_not_sign_in(self):
++        self.close_on_prompt=True
++        with self.assertRaises(RuntimeError):await self.login()
++        self.assertEqual(self.signins,[])
++        self.assert_old_preserved()
++
++    async def test_storage_failure_rolls_back_local_session(self):
++        with patch.object(self.store.db,'save_config',side_effect=sqlite3.OperationalError('synthetic disk error')):
++            with self.assertRaises(sqlite3.OperationalError):await self.login()
++        self.assert_old_preserved()
++
++    async def test_revoked_original_key_can_be_replaced_by_fresh_login(self):
++        self.probe_revoked=True
++        await self.login()
++        self.assertEqual(len(self.clients),2)
++        self.assertEqual(len(self.codes),1)
++
++    async def test_invalid_phone_is_rejected_before_connecting(self):
++        with self.assertRaises(RuntimeError):await self.login('not-a-phone')
++        self.assertEqual(self.clients,[])
++
++    async def test_success_releases_authorization_guard(self):
++        from batch_uploader import BatchUploaderPane
++        pane=object.__new__(BatchUploaderPane)
++        pane._auth_required_sessions={'stable'};pane._connection_retry_after={};pane.account_health={}
++        self.app.batch_uploader=pane
++        await self.login()
++        self.assertFalse(pane.session_auth_required('stable'))
++
++    async def test_removed_account_is_not_resurrected_after_code_prompt(self):
++        def remove(*args,**kwargs):
++            self.store.set_accounts([self.other]);return '12345'
++        with patch.object(main.simpledialog,'askstring',side_effect=remove):
++            with self.assertRaises(RuntimeError):await self.login()
++        self.assertEqual({a.session for a in self.store.accounts()},{'other'})
++        with closing(sqlite3.connect(self.old)) as db:
++            self.assertEqual(db.execute('SELECT value FROM auth').fetchone()[0],'old')
++        self.assertFalse(any(p.name.startswith('phone_reauth_') for p in self.sessions.iterdir()))
++
++    async def test_failed_snapshot_restore_still_removes_temporary_authorization(self):
++        from tam_core.session_recovery import copy_session_database
++        self.returned_id=99
++        def copy(source,destination):
++            if source.parent.name=='reauth':raise OSError('synthetic rollback failure')
++            return copy_session_database(source,destination)
++        with patch('tam_core.session_recovery.copy_session_database',side_effect=copy):
++            with self.assertRaises(OSError):await self.login()
++        self.assertFalse(self.clients[-1].path.exists())
++
++    async def test_account_removed_before_ui_commit_is_not_readded(self):
++        ui=self.app.ui_ask_async
++        calls=[]
++        async def before_callback(fn):
++            calls.append(fn)
++            if len(calls)==2:
++                self.store.set_accounts([self.other])
++            return await ui(fn)
++        self.app.ui_ask_async=before_callback
++        with self.assertRaises(RuntimeError):await self.login()
++        self.assertEqual({a.session for a in self.store.accounts()},{'other'})
++        with closing(sqlite3.connect(self.old)) as db:
++            self.assertEqual(db.execute('SELECT value FROM auth').fetchone()[0],'old')
