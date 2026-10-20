@@ -1,0 +1,155 @@
+--- /dev/null
++++ b/app/tests/test_account_connection_retry.py
+@@ -0,0 +1,152 @@
++import asyncio
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import batch_uploader as bu
++import telegram_admin_manager as main
++
++
++class AccountConnectionRetryTests(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        self.accounts = [SimpleNamespace(session=s, display=s) for s in ('expired', 'working')]
++        self.attempts = []
++        self.disconnected = []
++        self.logs = []
++        self.now = 100.0
++        self.failure = None
++        self.authorized = False
++        self.pane = object.__new__(bu.BatchUploaderPane)
++        self.pane.app = SimpleNamespace(
++            store=SimpleNamespace(accounts=lambda: self.accounts),
++            account_usage_allows=lambda *_: True, account_is_restricted=lambda *_: False,
++            _friendly_error=str, log=self.logs.append, refresh_safety_health_table=lambda: None,
++            ui_call=lambda fn: fn())
++        self.pane.sessions_dir = Path('synthetic-sessions')
++        self.pane.stop_event = threading.Event()
++        self.pane.account_health = {}
++        self.pane._ui_latest = lambda *args: None
++        self.clients, self.premium, self.locks = {}, {}, {}
++        self.tasks = [{'use_all_accounts': True, 'monitor_folder': True}]
++        owner = self
++
++        class Client:
++            def __init__(self, path, *args, **kwargs):
++                self.session = Path(path).name
++                owner.attempts.append(self.session)
++            async def connect(self):
++                if self.session == 'expired' and owner.failure:
++                    raise owner.failure
++            async def disconnect(self): owner.disconnected.append(self.session)
++            async def is_user_authorized(self):
++                return self.session == 'working' or owner.authorized
++            async def get_me(self): return SimpleNamespace(premium=False)
++
++        for target, value in [('TelegramClient', Client), ('time', SimpleNamespace(monotonic=lambda: self.now))]:
++            p = patch.object(bu, target, value)
++            p.start()
++            self.addCleanup(p.stop)
++
++    async def reconcile(self):
++        return await self.pane._connect_hot_batch_accounts_once(
++            self.tasks, self.clients, self.premium, self.locks, 1, 'synthetic-hash')
++
++    async def test_expired_session_is_not_retried_while_working_accounts_continue(self):
++        self.assertEqual(await self.reconcile(), ['working'])
++        await self.reconcile()
++        self.assertEqual(self.attempts, ['expired', 'working'])
++        self.assertEqual(self.disconnected, ['expired'])
++        self.assertEqual(self.pane.account_health['expired']['state'], 'Нужен вход')
++
++    async def test_auth_required_survives_new_batch_health_reset_and_filters_preflight(self):
++        await self.reconcile()
++        self.pane.account_health = {}
++        self.clients.clear()
++        available = self.pane._effective_task_sessions(self.tasks[0], {a.session:a for a in self.accounts})
++        self.assertEqual(available, ['working'])
++        await self.reconcile()
++        self.assertEqual(self.attempts.count('expired'), 1)
++
++    async def test_network_failure_waits_before_retrying_then_recovers(self):
++        self.failure = ConnectionError('synthetic network failure')
++        await self.reconcile()
++        await self.reconcile()
++        self.assertEqual(self.attempts.count('expired'), 1)
++        self.failure = None
++        self.authorized = True
++        self.now += 31
++        self.assertEqual(await self.reconcile(), ['expired'])
++        self.assertEqual(self.pane.account_health['expired']['state'], 'OK')
++
++    async def test_successful_explicit_login_releases_auth_guard(self):
++        await self.reconcile()
++        clear = getattr(self.pane, 'clear_session_auth_required', None)
++        self.assertTrue(callable(clear), 'Successful QR login must release automatic connection suppression')
++        clear('expired')
++        self.authorized = True
++        self.assertEqual(await self.reconcile(), ['expired'])
++        self.assertEqual(self.attempts.count('expired'), 2)
++
++    async def test_revoked_auth_rpc_is_not_treated_as_temporary_network_failure(self):
++        self.failure = type('SessionRevokedError', (Exception,), {})('synthetic revoked session')
++        await self.reconcile()
++        self.now += 3600
++        await self.reconcile()
++        self.assertEqual(self.attempts.count('expired'), 1)
++
++    async def test_connection_reporting_preserves_api_safety_stop(self):
++        self.pane.account_health['expired'] = {'state': 'СТОП API', 'disabled': True}
++        self.pane._record_connection_failure('expired', ValueError('synthetic API failure'))
++        self.assertEqual(self.pane.account_health['expired']['state'], 'СТОП API')
++
++    async def test_new_wave_preflight_respects_network_backoff(self):
++        self.failure = ConnectionError('synthetic network failure')
++        await self.reconcile()
++        accounts = {a.session:a for a in self.accounts}
++        self.assertEqual(self.pane._effective_task_sessions(self.tasks[0], accounts), ['working'])
++        self.now += 31
++        self.assertEqual(self.pane._effective_task_sessions(self.tasks[0], accounts), ['expired', 'working'])
++
++    def controller_fixture(self, cached='expired'):
++        app = self.pane.app
++        app.batch_uploader = self.pane
++        app._api_credentials = lambda: (1, 'synthetic-hash')
++        app.accounts_for = lambda capability: self.accounts
++        app.store.data = {}
++        app.group_state_cache = SimpleNamespace(cached_controller=lambda *_:cached, mark_admins=lambda *_args, **_kwargs:None)
++        app._admin_safety_disabled_sessions = set()
++        app.state_db = object()
++        app.safety_policy = lambda: {'enabled':False}
++        app._account_connection_ready = lambda s: main.TelegramAdminManager._account_connection_ready(app, s)
++        app._remember_account_auth_failure = lambda s, exc=None: main.TelegramAdminManager._remember_account_auth_failure(app, s, exc)
++        async def resolve(*args, **kwargs): return SimpleNamespace(creator=True, title='synthetic')
++        app._resolve_or_join_target = resolve
++        attempts = []
++        class OwnerClient:
++            def __init__(self, path, *args, **kwargs):
++                self.session = Path(path).name
++                attempts.append(self.session)
++            async def connect(self): pass
++            async def disconnect(self): pass
++            async def is_user_authorized(self): return self.session != 'expired'
++            async def get_entity(self, entity): return entity
++            async def get_permissions(self, *args): return SimpleNamespace(is_creator=True)
++        return app, OwnerClient, attempts
++
++    async def test_cached_controller_requiring_login_is_skipped_for_working_owner(self):
++        await self.reconcile()
++        app, OwnerClient, attempts = self.controller_fixture()
++        with patch.object(main, 'TelegramClient', OwnerClient), patch.object(main, 'admin_flood_remaining', return_value=0):
++            account = await main.TelegramAdminManager._auto_controller_for_target(app, 'synthetic-target')
++        self.assertEqual(account.session, 'working')
++        self.assertEqual(attempts, ['working'])
++
++    async def test_discovered_unauthorized_controller_is_not_probed_for_next_target(self):
++        app, OwnerClient, attempts = self.controller_fixture(cached=None)
++        with patch.object(main, 'TelegramClient', OwnerClient), patch.object(main, 'admin_flood_remaining', return_value=0):
++            for target in ('first-target', 'next-target'):
++                account = await main.TelegramAdminManager._auto_controller_for_target(app, target)
++                self.assertEqual(account.session, 'working')
++        self.assertEqual(attempts, ['expired', 'working', 'working'])

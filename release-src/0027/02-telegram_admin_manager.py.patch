@@ -1,0 +1,129 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0026"
++APP_VERSION = "0027"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -4710,6 +4710,9 @@
+         restriction = self.account_restriction(account.session)
+         cooldown = admin_flood_remaining(self.state_db, account.session)
+         parts: list[str] = []
++        uploader = getattr(self, 'batch_uploader', None)
++        if uploader is not None and uploader.session_auth_required(account.session):
++            parts.append("Нужен повторный вход")
+         if restriction:
+             parts.append("⚠ Ограничен Telegram")
+         if cooldown > 0:
+@@ -4862,6 +4865,10 @@
+                 if not me or me.id != existing_account.user_id:
+                     raise RuntimeError('Локальная сессия принадлежит другому аккаунту.')
+                 saved = True
++                uploader = getattr(self, 'batch_uploader', None)
++                if uploader is not None:
++                    uploader.clear_session_auth_required(session_name)
++                self.ui_call(self.refresh_account_list)
+                 self.ui_call(lambda: messagebox.showinfo(APP_NAME,
+                     'Сессия выбранного аккаунта уже авторизована. Повторно сканировать QR не требуется.'))
+                 return
+@@ -5007,6 +5014,9 @@
+         except Exception:
+             self.store.data['accounts'] = previous
+             raise
++        uploader = getattr(self, 'batch_uploader', None)
++        if uploader is not None:
++            uploader.clear_session_auth_required(account.session)
+ 
+     @staticmethod
+     def _delete_session_files(session_name: str) -> None:
+@@ -5409,6 +5419,8 @@
+         api_id, api_hash = self._api_credentials()
+         policy = self.safety_policy()
+         if controller is not None:
++            if not self._account_connection_ready(controller.session):
++                raise RuntimeError('Главный аккаунт ожидает повторного входа или следующей попытки подключения.')
+             cooldown = admin_flood_remaining(self.state_db, controller.session)
+             if cooldown > 0:
+                 raise RuntimeError(
+@@ -5419,6 +5431,9 @@
+         # First, selected accounts join (or at least resolve) the target one by one.
+         join_results: dict[int, bool] = {}
+         for i, account in enumerate(selected, start=1):
++            if not self._account_connection_ready(account.session):
++                join_results[account.user_id] = False
++                continue
+             if self.account_is_restricted(account.session):
+                 join_results[account.user_id] = False
+                 self.log(f"[{i}/{len(selected)}] {account.display}: ⚠ пропуск — аккаунт помечен «Ограничен Telegram»; risky write-действие не выполняется")
+@@ -5439,6 +5454,7 @@
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
++                    self._remember_account_auth_failure(account.session)
+                     self.log(f"[{i}/{len(selected)}] {account.display}: сессия не авторизована — пропуск")
+                     join_results[account.user_id] = False
+                     continue
+@@ -5451,6 +5467,7 @@
+                 join_results[account.user_id] = True
+             except Exception as exc:
+                 join_results[account.user_id] = False
++                self._remember_account_auth_failure(account.session, exc)
+                 friendly = self._friendly_error(exc)
+                 if policy["enabled"] and self._is_api_credential_error(exc):
+                     self._admin_stop_event.set()
+@@ -5501,6 +5518,7 @@
+         try:
+             await controller_client.connect()
+             if not await controller_client.is_user_authorized():
++                self._remember_account_auth_failure(effective_controller.session)
+                 raise RuntimeError("Главный аккаунт больше не авторизован.")
+ 
+             target_entity = await self._resolve_or_join_target(controller_client, target, should_join=False)
+@@ -5595,6 +5613,7 @@
+         except Exception as exc:
+             # Cover every controller RPC, including connection, entity lookup,
+             # participant discovery and granular-right fallback operations.
++            self._remember_account_auth_failure(effective_controller.session, exc)
+             if isinstance(exc, errors.FloodWaitError):
+                 seconds = max(1, int(getattr(exc, "seconds", 1)))
+                 remember_admin_flood_wait(self.state_db, effective_controller.session, seconds)
+@@ -5628,10 +5647,18 @@
+         self.log(f"Группа завершена. Назначено/обновлено: {promoted}; ошибок/пропусков: {failed}.")
+         return promoted, failed
+ 
++    def _account_connection_ready(self, session: str) -> bool:
++        uploader = self.__dict__.get('batch_uploader')
++        return uploader is None or uploader.session_connection_ready(session)
++
++    def _remember_account_auth_failure(self, session: str, exc: Exception | None = None) -> bool:
++        uploader = self.__dict__.get('batch_uploader')
++        return uploader is not None and uploader.remember_session_auth_failure(session, exc)
++
+     async def _auto_controller_for_target(self, target: str) -> Account:
+         """Pick the best saved account for this target: owner first, then admin with add_admins."""
+         api_id, api_hash = self._api_credentials()
+-        accounts = self.accounts_for("admins")
++        accounts = [a for a in self.accounts_for("admins") if self._account_connection_ready(a.session)]
+         if not accounts:
+             raise RuntimeError("Нет разрешённых аккаунтов для автоматического выбора главного.")
+ 
+@@ -5665,6 +5692,7 @@
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
++                    self._remember_account_auth_failure(account.session)
+                     continue
+                 entity = await self._resolve_or_join_target(client, target, should_join=False)
+                 entity = await client.get_entity(entity)
+@@ -5707,6 +5735,7 @@
+                         best_admin = account
+             except Exception as exc:
+                 # This account may simply not have access to a private target.
++                self._remember_account_auth_failure(account.session, exc)
+                 if policy["enabled"] and self._is_api_credential_error(exc):
+                     self._admin_stop_event.set()
+                     self._admin_safety_disabled_sessions.add(account.session)

@@ -1,0 +1,160 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -47,6 +47,17 @@
+ TELETHON_WAIT_ERRORS = telethon_wait_types(errors)
+ 
+ FILE_PART_REQUEUE_LIMIT = 2
++
++
++class _SessionLoginRequired(RuntimeError):
++    pass
++
++
++def _requires_session_login(exc: Exception) -> bool:
++    return isinstance(exc, _SessionLoginRequired) or exc.__class__.__name__ in {
++        'AuthKeyUnregisteredError', 'AuthKeyInvalidError', 'AuthKeyDuplicatedError',
++        'SessionRevokedError', 'SessionExpiredError',
++    }
+ 
+ # Telegram limits the *number* of upload.saveBigFilePart chunks, not just the
+ # advertised file size. With the largest legal/recommended 512 KiB chunk, the
+@@ -457,6 +468,10 @@
+         self._last_sort_refresh = 0.0
+         self._last_dashboard_emit = 0.0
+         self.account_health: dict[str, dict[str, Any]] = {}
++        # Keep connection failures across monitor waves; only explicit login
++        # releases an authorization failure during this application run.
++        self._auth_required_sessions: set[str] = set()
++        self._connection_retry_after: dict[str, float] = {}
+         self.monitor_active = False
+         self.monitor_stop_event = threading.Event()
+         self.monitor_last_signatures: dict[str, str] = {}
+@@ -1842,10 +1857,49 @@
+         else:
+             requested = [s for s in task.get("account_sessions", []) or [] if s in accounts_by_session]
+         capability = "monitoring" if bool(task.get("monitor_folder", False)) else "uploads"
+-        return [s for s in requested if self.app.account_usage_allows(s, capability)]
++        return [s for s in requested if self.session_connection_ready(s)
++                and self.app.account_usage_allows(s, capability)]
++
++    def session_auth_required(self, session: str) -> bool:
++        return session in getattr(self, '_auth_required_sessions', set())
++
++    def session_connection_ready(self, session: str) -> bool:
++        return not self.session_auth_required(session) and time.monotonic() >= getattr(self, '_connection_retry_after', {}).get(session, 0)
++
++    def clear_session_auth_required(self, session: str) -> None:
++        getattr(self, '_auth_required_sessions', set()).discard(session)
++        getattr(self, '_connection_retry_after', {}).pop(session, None)
++        self.account_health.pop(session, None)
++
++    def remember_session_auth_failure(self, session: str, exc: Exception | None = None) -> bool:
++        if exc is not None and not _requires_session_login(exc):
++            return False
++        self._record_connection_failure(session, exc or _SessionLoginRequired('Требуется повторный вход по QR.'))
++        return True
++
++    def _record_connection_failure(self, session: str, exc: Exception) -> None:
++        auth_required = _requires_session_login(exc)
++        if not hasattr(self, '_auth_required_sessions'):
++            self._auth_required_sessions = set()
++            self._connection_retry_after = {}
++        health = self.account_health.setdefault(session, {})
++        if auth_required or not health.get('disabled'):
++            health.update(state='Нужен вход' if auth_required else 'Недоступен',
++                          reason='Требуется повторный вход по QR.' if auth_required else self.app._friendly_error(exc))
++        if auth_required:
++            self._auth_required_sessions.add(session)
++            health['disabled'] = True
++        else:
++            # Network outages and Telegram waits are recoverable, but polling
++            # them every 750 ms opens a new client and floods the log.
++            delay = max(30.0, float(getattr(exc, 'seconds', 0) or 0))
++            self._connection_retry_after[session] = time.monotonic() + delay
++        self._ui_latest(('health',), self.app.refresh_safety_health_table)
+ 
+     def _runtime_task_account_allowed(self, task: dict[str, Any], session: str) -> bool:
+         """Read account usage live so running monitor jobs react to hot ON/OFF."""
++        if self.session_auth_required(session):
++            return False
+         checker = getattr(self.app, "account_usage_allows", None)
+         if not callable(checker):
+             return True
+@@ -2754,12 +2808,13 @@
+                 try:
+                     await client.connect()
+                     if not await client.is_user_authorized():
+-                        raise RuntimeError("сессия не авторизована")
++                        raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+                     entity = await self.app._resolve_or_join_target(client, str(task.get("target", "")), bool(task.get("join_if_needed", False)))
+                     entity = await client.get_entity(entity)
+                     clients[session] = (account, client)
+                     resolved[session] = entity
+-                except Exception:
++                except Exception as exc:
++                    self._record_connection_failure(session, exc)
+                     try:
+                         await client.disconnect()
+                     except Exception:
+@@ -3607,6 +3662,8 @@
+         for session in candidates:
+             if self.stop_event.is_set() or session in clients:
+                 continue
++            if not self.session_connection_ready(session):
++                continue
+             account = accounts_by_session[session]
+             client = TelegramClient(
+                 str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD
+@@ -3614,7 +3671,7 @@
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+-                    raise RuntimeError("сессия не авторизована")
++                    raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+                 me = await client.get_me()
+                 is_premium = bool(getattr(me, "premium", False))
+                 clients[session] = (account, client)
+@@ -3633,6 +3690,7 @@
+                     premium_text += " (2–4 ГБ отключены)"
+                 self.app.log(f"Пакет: hot-add {account.display} подключён — {premium_text}")
+             except Exception as exc:
++                self._record_connection_failure(session, exc)
+                 self.app.log(f"Пакет: hot-add {account.display} не подключён — {self.app._friendly_error(exc)}")
+                 try:
+                     await client.disconnect()
+@@ -3667,7 +3725,7 @@
+         premium_by_session: dict[str, bool] = {}
+         preparation = None
+         policy = self.app.safety_policy()
+-        self.account_health = {
++        self.account_health = {s: h for s, h in self.account_health.items() if self.session_auth_required(s)} | {
+             session: {"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": "", "disabled": False}
+             for session in needed_sessions
+         }
+@@ -3681,6 +3739,8 @@
+ 
+             # One Telethon client per session, shared across all tasks.
+             for session in needed_sessions:
++                if not self.session_connection_ready(session):
++                    continue
+                 account = accounts_by_session[session]
+                 client = TelegramClient(
+                     str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD
+@@ -3688,7 +3748,7 @@
+                 try:
+                     await client.connect()
+                     if not await client.is_user_authorized():
+-                        raise RuntimeError("сессия не авторизована")
++                        raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+                     me = await client.get_me()
+                     is_premium = bool(getattr(me, "premium", False))
+                     clients[session] = (account, client)
+@@ -3710,7 +3770,7 @@
+                     elif policy["enabled"] and policy["stop_serious"] and self.app._is_serious_account_error(exc):
+                         h["disabled"] = True
+                         h["state"] = "Отключён"
+-                    self._ui_latest(('health',), self.app.refresh_safety_health_table)
++                    self._record_connection_failure(session, exc)
+                     self.app.log(f"Пакет: {account.display} недоступен — {friendly}")
+                     try:
+                         await client.disconnect()
