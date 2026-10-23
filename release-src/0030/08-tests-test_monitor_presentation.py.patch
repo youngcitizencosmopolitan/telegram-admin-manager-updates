@@ -1,0 +1,17 @@
+--- a/app/tests/test_monitor_presentation.py
++++ b/app/tests/test_monitor_presentation.py
+@@ -3,6 +3,14 @@
+ 
+ 
+ class RulePresentationTests(unittest.TestCase):
++    def test_deferred_empty_file_is_visible_without_false_completion(self):
++        row = rule_presentation({}, {'state': 'Без изменений'}, {'deferred': 1,
++            'total_bytes': 100, 'processed_bytes': 100}, running=False, queued=False)
++        self.assertIn('отлож', row['status'].lower())
++        self.assertIn('0 Б', row['detail'])
++        self.assertEqual(row['progress'], '—')
++        self.assertEqual(row['recovery_count'], 0)
++
+     def test_blocked_is_not_completed_and_keeps_recovery_count(self):
+         row = rule_presentation({'name':'VIP'}, {}, {'blocked':2, 'processed_bytes':9999,
+                                 'total_bytes':10000}, running=False, queued=False)

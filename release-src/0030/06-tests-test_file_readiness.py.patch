@@ -1,0 +1,44 @@
+--- a/app/tests/test_file_readiness.py
++++ b/app/tests/test_file_readiness.py
+@@ -6,7 +6,7 @@
+ from pathlib import Path
+ 
+ try:
+-    from tam_core.file_readiness import FileReadiness, PreparationStopped, read_stamp
++    from tam_core.file_readiness import EmptyFilePending, FileReadiness, PreparationStopped, read_stamp
+ except ImportError:
+     FileReadiness = None
+ 
+@@ -74,3 +74,32 @@
+             path = Path(td) / 'video.mp4'
+             path.write_bytes(b'video')
+             asyncio.run(exercise(path))
++
++    def test_source_emptied_during_stability_wait_releases_waiter(self):
++        async def exercise(path):
++            checked = threading.Event()
++            tracker = FileReadiness(quiet=60)
++            check = tracker.check
++
++            def observe(*args, **kwargs):
++                result = check(*args, **kwargs)
++                checked.set()
++                return result
++
++            tracker.check = observe
++            waiting = asyncio.create_task(tracker.wait(path, lambda: False, interval=0.01))
++            try:
++                self.assertTrue(await asyncio.wait_for(asyncio.to_thread(checked.wait, 1), 2))
++                path.write_bytes(b'')
++                with self.assertRaises(EmptyFilePending):
++                    await asyncio.wait_for(waiting, 1)
++                # The folder index still tracks the path as pending for later changes.
++                self.assertIsNone(FileReadiness(quiet=0).check(path))
++            finally:
++                waiting.cancel()
++                await asyncio.gather(waiting, return_exceptions=True)
++
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'video.mp4'
++            path.write_bytes(b'copying')
++            asyncio.run(exercise(path))

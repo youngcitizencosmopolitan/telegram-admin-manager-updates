@@ -1,0 +1,34 @@
+--- a/app/tam_core/file_readiness.py
++++ b/app/tam_core/file_readiness.py
+@@ -18,6 +18,10 @@
+ 
+ class PreparationStopped(Exception):
+     pass
++
++
++class EmptyFilePending(Exception):
++    """An empty source must wait for a later scan, without holding a worker."""
+ 
+ 
+ class FileReadiness:
+@@ -45,8 +49,10 @@
+             except OSError:
+                 continue  # The upload boundary will report a still-missing file.
+ 
+-    def check(self, path: Path) -> FileStamp | None:
++    def check(self, path: Path, *, defer_empty: bool = False) -> FileStamp | None:
+         stamp = read_stamp(path)
++        if stamp[0] <= 0 and defer_empty:
++            raise EmptyFilePending()
+         since = self.observe(path, stamp)
+         now = self.clock()
+         if stamp[0] <= 0 or now - since < self.quiet or has_active_writer(path):
+@@ -55,7 +61,7 @@
+ 
+     async def wait(self, path: Path, stopped: Callable[[], bool], interval: float = 0.25) -> FileStamp:
+         while not stopped():
+-            stamp = await asyncio.to_thread(self.check, path)
++            stamp = await asyncio.to_thread(self.check, path, defer_empty=True)
+             if stamp is not None:
+                 return stamp
+             await asyncio.sleep(interval)
