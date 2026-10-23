@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0029",
-  "display_version": "0029",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0029/TelegramAdminManager_v0029_update.zip",
-  "sha256": "eae6308026152f631c8d65b824d0fe4de36a3c42accc1b8a221e3606beb9f0ed",
-  "notes": "0029: add Repeat login by phone for a selected saved account. Prefill its phone number and request the code using the delivery method returned by Telegram, including Telegram Desktop service messages; support the 2FA password when required. Probe valid sessions without requesting a code. Reauthenticate expired sessions with a fresh temporary key, verify the selected owner and saved account identity, then install under the unchanged session name so rules and usage settings remain intact. Local snapshots protect cancellation, incorrect codes, wrong owners and failed saves; temporary sessions are cleaned even after rollback errors. QR login and the existing new-account phone flow remain available."
+  "version": "4.3.8.0030",
+  "display_version": "0030",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0030/TelegramAdminManager_v0030_update.zip",
+  "sha256": "fad2eda0e7cf509f4ed98196af195d29d78603c9895f79e6d2f6a6ea948accf2",
+  "notes": "0030: fix uploads stuck at Preparation / waiting for write when folders contain empty media files. Zero-byte photos and videos are deferred immediately so workers can upload the remaining files and continue other rules. The same check handles files emptied while waiting for stability. Deferred files create no upload records, fingerprints or reservations; monitoring detects them again when data appears and the source becomes stable. Show a separate deferred count and a clear zero-byte file status instead of reporting every file as uploaded. Existing account authorization, rules and upload history are preserved."
 }
