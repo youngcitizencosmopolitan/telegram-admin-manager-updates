@@ -1,0 +1,22 @@
+--- a/app/tam_ui/monitor_presentation.py
++++ b/app/tam_ui/monitor_presentation.py
+@@ -8,7 +8,8 @@
+     done += sum(int(x.get('current', 0) or 0) for x in active.values())
+     blocked = int(task_state.get('blocked', 0) or 0)
+     failed = int(task_state.get('failed', 0) or 0)
+-    progress = f'{min(100, done/total*100):.0f}%' if total and not blocked else '—'
++    deferred = int(task_state.get('deferred', 0) or 0)
++    progress = f'{min(100, done/total*100):.0f}%' if total and not blocked and not deferred else '—'
+     if blocked:
+         status = 'Загружается · нужен повтор' if active else 'Нужен повтор'
+         detail = f'Для {blocked} отправок результат прошлого запуска не подтвержден. Повтор может создать дубль, если Telegram уже принял файл.'
+@@ -22,6 +23,9 @@
+         status, detail = 'В очереди', 'Правило ожидает выполнения. Подробности пакета доступны в разделе «Очередь загрузок».'
+     elif not rule.get('monitor_folder', True):
+         status, detail = 'Мониторинг выключен', 'Автоматическая проверка папки выключена. Можно включить её или загрузить правило вручную.'
++    elif deferred:
++        status = f'Отложено пустых файлов: {deferred}'
++        detail = 'Файлы размером 0 Б не мешают остальным. Мониторинг вернётся к ним после появления данных.'
+     else:
+         status = str(runtime.get('state') or 'Ожидает изменений')
+         detail = status if runtime.get('state') else 'Новые изменения появятся в очереди после проверки папки.'

@@ -1,0 +1,128 @@
+--- /dev/null
++++ b/app/tests/test_empty_file_deferral.py
+@@ -0,0 +1,125 @@
++import asyncio
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++import test_prefetch_upload_boundary as fixture
++from tam_core.folder_events import FolderSnapshotIndex
++from test_folder_events import FakeEvents
++
++
++class EmptyFileDeferralTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    file = fixture.PrefetchUploadTests.file
++    read = fixture.PrefetchUploadTests.read
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    async def capture_run(self):
++        rows, activity = [], []
++        self.pane.app.ui_call = lambda callback: callback()
++        self.pane._set_task_row = lambda *args, **kw: rows.append(kw)
++        self.pane._activity_update = lambda *args: activity.append(args)
++        try:
++            await asyncio.wait_for(self.run_task(), 2)
++        except TimeoutError:
++            self.stop.set()
++            self.fail('An empty file blocked the upload worker instead of being deferred')
++        return rows, activity
++
++    async def test_many_empty_photos_do_not_block_the_video_behind_them(self):
++        self.rule['send_photos'] = True
++        empty = [self.file(f'a-{i:03d}.mp4.jpg', b'') for i in range(20)]
++        video = self.file('z-video.mp4', b'video')
++        rows, activity = await self.capture_run()
++        state = self.pane.task_states['r1']
++        self.assertEqual([Path(path) for path, _ in self.sent], [video])
++        self.assertEqual(self.reads, [video])
++        self.assertEqual(state.get('deferred'), len(empty))
++        self.assertEqual(state['success'], 1)
++        self.assertEqual(state['failed'], 0)
++        self.assertEqual(state['skipped'], 0)
++        self.assertIn('отлож', rows[-1]['status'].lower())
++        self.assertNotEqual(rows[-1].get('progress'), '100%')
++        for path in empty:
++            status = [row[-1] for row in activity if row[2] == path][-1]
++            self.assertIn('0 Б', status)
++            self.assertIn('отлож', status.lower())
++        self.assertEqual(self.errors, [])
++        with self.history.db.session() as db:
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0], 1)
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM upload_reservations').fetchone()[0], 0)
++
++    async def test_only_empty_files_finish_without_hash_or_upload_history(self):
++        self.file('empty.mp4', b'')
++        rows, _ = await self.capture_run()
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.reads, [])
++        self.assertEqual(self.errors, [])
++        self.assertIn('отлож', rows[-1]['status'].lower())
++        self.assertEqual(self.pane.task_states['r1']['success'], 0)
++        with self.history.db.session() as db:
++            for table in ('uploads', 'upload_reservations', 'file_fingerprints'):
++                self.assertEqual(db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0], 0)
++
++    async def test_empty_file_is_deferred_without_the_preparation_pool_too(self):
++        self.rule['send_photos'] = True
++        self.file('a.jpg', b'')
++        ready = self.file('z.jpg', b'photo')
++        sent = []
++
++        class Client:
++            async def send_file(self, entity, path, **kwargs):
++                sent.append(Path(path))
++                return SimpleNamespace(id=1)
++
++        await self.pane._run_one_task(dict(self.rule), {'s1': (self.account, Client())}, {'s1': False},
++            {'s1': self.account_lock}, asyncio.Semaphore(1), asyncio.Semaphore(2), asyncio.Semaphore(2))
++        self.assertEqual(sent, [ready])
++        self.assertEqual(self.pane.task_states['r1'].get('deferred'), 1)
++        self.assertEqual(self.errors, [])
++
++    async def test_file_emptied_after_scan_is_also_deferred(self):
++        path = self.file('a.mp4', b'video')
++        ready = self.file('z.mp4', b'next')
++        observe = self.pool.observe_files
++
++        async def truncate_after_scan(paths):
++            path.write_bytes(b'')
++            await observe(paths)
++
++        self.pool.observe_files = truncate_after_scan
++        await self.capture_run()
++        self.assertEqual([Path(path) for path, _ in self.sent], [ready])
++        self.assertEqual(self.pane.task_states['r1'].get('deferred'), 1)
++        self.assertEqual(self.errors, [])
++
++    async def test_filled_file_is_detected_and_uploaded_after_deferral(self):
++        self.rule['send_photos'] = True
++        empty = self.file('a.mp4.jpg', b'')
++        video = self.file('z.mp4', b'video')
++        index = FolderSnapshotIndex(self.rule, self.pane._scan_task_files, lambda size: 'small',
++                                   quiet=0, event_factory=FakeEvents)
++        try:
++            before, _ = index.snapshot()
++            self.pane._folder_indexes = {'r1': index}
++            self.rule['_monitor_delta'] = index.work_snapshot()
++            await self.capture_run()
++            index.ack_work(self.rule['_monitor_delta']['cutoff'])
++            self.assertFalse(index.has_work)
++            empty.write_bytes(b'photo data')
++            index.events.notify(empty)
++            after, _ = index.snapshot()
++            self.assertNotEqual(before, after)
++            self.assertEqual(index.work_snapshot()['files'], [empty.name])
++            self.rule['_monitor_delta'] = index.work_snapshot()
++            await self.capture_run()
++            self.assertEqual([Path(path) for path, _ in self.sent], [video, empty])
++            self.assertEqual(self.pane.task_states['r1'].get('deferred', 0), 0)
++            self.assertEqual(self.errors, [])
++        finally:
++            index.close()
++
++
++if __name__ == '__main__':
++    unittest.main()

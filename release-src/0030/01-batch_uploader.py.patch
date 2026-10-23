@@ -1,0 +1,114 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -22,7 +22,7 @@
+ from tam_core.monitor_delta import MonitorSeenState, monitor_identity, selected_delta_files, task_for_dispatch
+ from tam_core.preparation import PreparationPool
+ from tam_core.repositories import HISTORY_CHECK_BATCH_SIZE
+-from tam_core.file_readiness import PreparationStopped, read_stamp
++from tam_core.file_readiness import EmptyFilePending, PreparationStopped, read_stamp
+ from tam_core.media import FREE_FILE_LIMIT, PREMIUM_FILE_LIMIT, PHOTO_EXTENSIONS, VIDEO_EXTENSIONS, media_kind as _media_kind
+ from tam_core.preflight import build_preflight_report, format_preflight_report
+ from tam_core.table_sort import TreeviewSortController
+@@ -3517,7 +3517,8 @@
+                             if target:
+                                 self.monitor_prepared_targets.add(target)
+                             runtime = self.monitor_runtime.setdefault(tid, {})
+-                            runtime["state"] = "✅ Синхронизировано"
++                            deferred = int(state.get('deferred', 0) or 0)
++                            runtime["state"] = f"Отложено пустых файлов: {deferred}" if deferred else "✅ Синхронизировано"
+                 for tid in tids:
+                     self.monitor_pending_signatures.pop(tid, None)
+             if any((x.get("monitor_signatures", {}) or {}) for x in active_items):
+@@ -3895,9 +3896,11 @@
+                 total_limit_skipped = sum(int(s.get("limit_skipped", 0)) for s in self.task_states.values())
+                 total_failed = sum(int(s.get("failed", 0)) for s in self.task_states.values()) + hard_errors
+                 total_blocked = sum(int(s.get('blocked', 0)) for s in self.task_states.values())
++                total_deferred = sum(int(s.get('deferred', 0)) for s in self.task_states.values())
+                 self.app.log(
+                     f"Пакет завершён: отправлено {total_success}, пропущено {total_skipped} "
+-                    f"(по лимиту {total_limit_skipped}), ошибок {total_failed}, неподтверждённых резервов {total_blocked}"
++                    f"(по лимиту {total_limit_skipped}), отложено пустых файлов {total_deferred}, "
++                    f"ошибок {total_failed}, неподтверждённых резервов {total_blocked}"
+                 )
+                 if notify:
+                     self.app.ui_call(lambda: messagebox.showinfo(
+@@ -3905,6 +3908,7 @@
+                         f"Пакет завершён.\n\nОтправлено: {total_success}\n"
+                         f"Пропущено всего: {total_skipped}\n"
+                         f"Из них по лимиту размера/Premium: {total_limit_skipped}\n"
++                        f"Отложено пустых файлов: {total_deferred}\n"
+                         f"Ошибки: {total_failed}\nТребуют проверки резервов: {total_blocked}",
+                         parent=self.app,
+                     ))
+@@ -4653,6 +4657,7 @@
+             "limit_skipped": 0,
+             "failed": 0,
+             "blocked": 0,
++            "deferred": 0,
+             "active": {},
+             "started": time.monotonic(),
+         }
+@@ -4901,6 +4906,16 @@
+ 
+         fill_preparation()
+ 
++        def defer_empty_file(path, account_name, size):
++            # Count this pass as handled, never as an upload or a duplicate.
++            # No fingerprint/claim is created; a later content change is new work.
++            state['deferred'] += 1
++            state['processed_files'] += 1
++            state['processed_bytes'] += size
++            self._queue_activity_update(f'{tid}:{path}', name, path, account_name, 0, 0.0, 0.0,
++                                        'Отложено • пустой файл (0 Б), ожидает записи')
++            self._emit_task_metrics(tid, force=True)
++
+         async def worker(session: str) -> None:
+             account, client = clients[session]
+             entity = resolved[session]
+@@ -4944,6 +4959,9 @@
+                     return
+ 
+                 prepared = None
++                if size <= 0 and preparation is None:
++                    defer_empty_file(path, account_name, size)
++                    continue
+                 if preparation is not None:
+                     consumed.add(path)
+                     fill_preparation()
+@@ -4951,6 +4969,9 @@
+                     self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Подготовка / ожидание записи')
+                     try:
+                         prepared = await preparation.take(preparation_key(path), preparation_factory(path))
++                    except EmptyFilePending:
++                        defer_empty_file(path, account_name, size)
++                        continue
+                     except PreparationStopped:
+                         queue_for_path(path).put_nowait(item)
+                         return
+@@ -5547,12 +5568,15 @@
+                 status = f"⚠ Нужен повтор: резервов {state['blocked']}"
+             elif state["failed"]:
+                 status = f"Готово, ошибок {state['failed']}"
++            elif state.get('deferred', 0):
++                status = f"Отложено пустых файлов: {state['deferred']}"
+             elif state.get("limit_skipped", 0):
+                 status = f"✅ Готово, лимит: {state['limit_skipped']}"
+             else:
+                 status = "✅ Готово"
+-            progress = '—' if state.get('blocked') else '100%'
+-            self._queue_task_row(tid, status=status, progress=progress, speed='—', eta='—' if state.get('blocked') else '0с')
++            incomplete = state.get('blocked') or state.get('deferred')
++            progress = '—' if incomplete else '100%'
++            self._queue_task_row(tid, status=status, progress=progress, speed='—', eta='—' if incomplete else '0с')
+ 
+     @staticmethod
+     def _render_caption(template: str, path: Path, index: int, total: int, task_name: str) -> str | None:
+@@ -5598,7 +5622,7 @@
+         pct = (done_bytes / total * 100.0) if total else 100.0
+         remaining = max(0, total - done_bytes)
+         eta = remaining / speed if speed > 1024 else None
+-        self._queue_task_row(tid, status='Загрузка', progress='—' if state.get('blocked') else f'{pct:.1f}%', speed=_fmt_speed(speed), eta=_fmt_eta(eta))
++        self._queue_task_row(tid, status='Загрузка', progress='—' if state.get('blocked') or state.get('deferred') else f'{pct:.1f}%', speed=_fmt_speed(speed), eta=_fmt_eta(eta))
+         if self.unified_monitor and hasattr(self, "monitor_tree"):
+             self._ui_latest(('monitor',), lambda: self.refresh_monitor_tab(force=True))
+         self._emit_dashboard(force=force)

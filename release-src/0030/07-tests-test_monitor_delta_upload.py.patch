@@ -1,0 +1,32 @@
+--- a/app/tests/test_monitor_delta_upload.py
++++ b/app/tests/test_monitor_delta_upload.py
+@@ -73,7 +73,7 @@
+         self.pane._ack_monitor_work(wrong)
+         self.assertTrue(self.index.has_work)
+ 
+-    def run_queue(self, failed=False, later=False, source='Мониторинг', blocked=False):
++    def run_queue(self, failed=False, later=False, source='Мониторинг', blocked=False, deferred=False):
+         from tam_core.repositories import MonitorRuleStore
+         from tam_core.state_db import StateDatabase
+         db = StateDatabase(self.root / 'state.db')
+@@ -97,7 +97,7 @@
+ 
+         async def batch(tasks, *args, **kwargs):
+             captured.extend(tasks)
+-            pane.task_states = {'r1': {'failed': int(failed), 'blocked': int(blocked)}}
++            pane.task_states = {'r1': {'failed': int(failed), 'blocked': int(blocked), 'deferred': int(deferred)}}
+             if later:
+                 path = self.root / 'later.mp4'
+                 path.write_bytes(b'later')
+@@ -131,6 +131,11 @@
+         self.assertTrue(self.index.has_work)
+         self.assertEqual(self.pane.monitor_blocked_signatures['r1'], ('queued-sig', 0))
+ 
++    def test_deferral_acknowledges_scan_without_claiming_every_file_is_uploaded(self):
++        self.run_queue(deferred=True)
++        self.assertFalse(self.index.has_work)
++        self.assertIn('Отложено', self.pane.monitor_runtime['r1']['state'])
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
