@@ -1,0 +1,271 @@
+--- /dev/null
++++ b/app/tests/test_auto_admin_links.py
+@@ -0,0 +1,268 @@
++import asyncio
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import telegram_admin_manager as main
++import test_redesign_integration as fixture
++from tam_core.models import Account
++
++
++class AutoAdminLinkTests(unittest.TestCase):
++    setUp = fixture.RealApplicationFixture.setUp
++    _destroy_app = fixture.RealApplicationFixture._destroy_app
++
++    def configure(self):
++        app = self.app
++        accounts = [Account(session='a', label='A', phone='', user_id=1),
++                    Account(session='b', label='B', phone='', user_id=2)]
++        app.store.set_accounts(accounts)
++        app.refresh_account_list()
++        app.admin_accounts_list.select_set(0, 'end')
++        app._api_credentials = lambda: (123, 'test')
++        app.save_api_settings = lambda **kw: None
++        app.save_safety_settings = lambda **kw: None
++        app.safety_policy = lambda: {'enabled': False}
++        self.plans = []
++        self.workers = []
++        async def promote(**kw):
++            self.plans.append(kw)
++        app._promote_many_async = promote
++        def worker(fn, text):
++            self.workers.append(fn)
++            app.set_busy(True, text)
++        app.run_worker = worker
++        return app
++
++    def flush(self):
++        app = self.app
++        flush = getattr(app, '_flush_admin_auto_queue', None)
++        self.assertTrue(callable(flush), 'Added links never trigger automatic administrator assignment')
++        token = getattr(app, '_admin_auto_after', None)
++        if token:
++            app.after_cancel(token)
++        flush()
++
++    def add(self, text):
++        self.app.admin_targets_text.insert('end', text)
++        self.app.update()
++
++    def finish(self):
++        fn = self.workers.pop(0)
++        fn()
++        self.app.set_busy(False)
++
++    def test_paste_button_automatically_processes_all_selected_accounts(self):
++        app = self.configure()
++        with patch.object(app, 'clipboard_get', return_value='https://t.me/+TestInviteHash12345'):
++            app._paste_admin_targets()
++        app.update()
++        self.flush()
++        self.assertEqual(len(self.workers), 1)
++        self.finish()
++        plan = self.plans[0]
++        self.assertEqual([target for target, _ in plan['work_plan']], ['https://t.me/+TestInviteHash12345'])
++        self.assertEqual([a.session for a in plan['work_plan'][0][1]], ['a', 'b'])
++        self.assertFalse(plan['notify'])
++
++    def test_added_links_wait_for_active_batch_and_continue_after_it(self):
++        app = self.configure()
++        self.add('@group_one\n')
++        self.flush()
++        self.add('@group_two\n@group_three\n')
++        self.flush()
++        self.assertEqual(len(self.workers), 1, 'An active batch must not be started twice')
++        self.finish()
++        self.flush()
++        self.assertEqual(len(self.workers), 1)
++        self.finish()
++        self.assertEqual([[target for target, _ in p['work_plan']] for p in self.plans],
++                         [['@group_one'], ['@group_two', '@group_three']])
++
++    def test_removing_pending_link_cancels_it_and_duplicate_does_not_repeat(self):
++        app = self.configure()
++        self.add('@group_one\n')
++        self.flush()
++        self.add('@group_two\n')
++        app.admin_targets_text.delete('2.0', 'end')
++        app.update()
++        self.finish()
++        self.flush()
++        self.assertEqual(self.workers, [])
++        self.add('\n@group_one\n')
++        self.flush()
++        self.assertEqual(self.workers, [])
++
++    def test_loading_saved_links_does_not_start_telegram_work(self):
++        app = self.configure()
++        app.store.data['admin_targets'] = '@saved_group'
++        app._load_config_into_ui()
++        app.update()
++        self.flush()
++        self.assertEqual(self.workers, [])
++
++    def test_stop_cancels_pending_automatic_batches(self):
++        app = self.configure()
++        self.add('@group_one\n')
++        self.flush()
++        self.add('@group_two\n')
++        app.stop_admin_batch()
++        self.finish()
++        self.flush()
++        self.assertEqual(self.workers, [])
++        self.assertTrue(app._admin_stop_event.is_set())
++
++    def test_new_links_use_incremental_cache_without_touching_old_targets(self):
++        app = self.configure()
++        policy = main.build_admin_policy_key('full_add_admins', app.title_var.get().strip(),
++            bool(app.store.data.get('admin_anonymous', True)), app._requested_admin_flags('full_add_admins'))
++        app.group_state_cache.mark_admins('@group_one', {'a', 'b'}, policy_key=policy)
++        with patch.object(main.messagebox, 'showinfo') as info:
++            self.add('@group_one\n@group_two\n')
++            self.flush()
++            self.finish()
++        self.assertEqual([target for target, _ in self.plans[0]['work_plan']], ['@group_two'])
++        info.assert_not_called()
++
++    def test_waiting_links_resume_when_accounts_are_selected(self):
++        app = self.configure()
++        app.admin_accounts_list.selection_clear(0, 'end')
++        self.add('@group_one\n')
++        self.flush()
++        self.assertEqual(self.workers, [])
++        app.admin_accounts_list.select_set(1)
++        app._save_admin_selection()
++        self.flush()
++        self.finish()
++        self.assertEqual([a.session for a in self.plans[0]['work_plan'][0][1]], ['b'])
++
++    def test_background_upload_yields_before_automatic_promotions(self):
++        app = self.configure()
++        yields, resumes = [], []
++        app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
++            request_background_yield=lambda: yields.append(True) or True,
++            resume_queue=lambda: resumes.append(True))
++        app._busy = True
++        self.add('@group_one\n')
++        self.flush()
++        self.assertEqual(yields, [True])
++        self.assertEqual(self.workers, [])
++        self.assertTrue(app._foreground_takeover_pending)
++        app.set_busy(False)
++        self.assertEqual(self.workers, [])
++        # Simulate the existing handoff's UI callback when the upload releases its sessions.
++        app._foreground_takeover_pending = False
++        self.flush()
++        self.assertEqual(len(self.workers), 1)
++        self.finish()
++
++    def test_manual_processing_consumes_pending_links_without_a_second_batch(self):
++        app = self.configure()
++        self.add('@group_one\n')
++        app.start_promote()
++        self.finish()
++        self.flush()
++        self.assertEqual(self.workers, [])
++        self.assertEqual(len(self.plans), 1)
++
++    def test_incomplete_text_does_not_start_telegram_work(self):
++        self.configure()
++        self.add('https://t.me/+\n@ab\nnotes are not a group\n')
++        self.flush()
++        self.assertEqual(self.workers, [])
++
++    def test_fully_cached_paste_is_silent_and_does_not_launch_worker(self):
++        app = self.configure()
++        policy = main.build_admin_policy_key('full_add_admins', app.title_var.get().strip(),
++            bool(app.store.data.get('admin_anonymous', True)), app._requested_admin_flags('full_add_admins'))
++        app.group_state_cache.mark_admins('@group_one', {'a', 'b'}, policy_key=policy)
++        with patch.object(main.messagebox, 'showinfo') as info:
++            self.add('@group_one\n')
++            self.flush()
++        self.assertEqual(self.workers, [])
++        info.assert_not_called()
++
++    def test_failed_automatic_batch_is_not_retried_forever(self):
++        app = self.configure()
++        async def failed(**kw):
++            raise RuntimeError('synthetic network failure')
++        app._promote_many_async = failed
++        self.add('@group_one\n')
++        self.flush()
++        with self.assertRaisesRegex(RuntimeError, 'synthetic'):
++            self.workers.pop(0)()
++        app.set_busy(False)
++        self.flush()
++        self.assertEqual(self.workers, [])
++
++    def test_cancelled_handoff_resumes_background_queue_without_admin_worker(self):
++        app = self.configure()
++        callbacks, resumes = [], []
++        app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
++            request_background_yield=lambda: True, resume_queue=lambda: resumes.append(True))
++        self.add('@group_one\n')
++        app._busy = True
++        with patch.object(app, 'after', side_effect=lambda delay, callback: callbacks.append(callback) or 'fake'), \
++             patch.object(app, 'after_cancel'):
++            self.flush()
++            self.assertTrue(app._foreground_takeover_pending)
++            app.set_busy(False)
++            app.admin_targets_text.delete('1.0', 'end')
++            app.update()
++            for _ in range(5):
++                if not callbacks:
++                    break
++                callbacks.pop(0)()
++        self.assertEqual(self.workers, [])
++        self.assertEqual(resumes, [True], 'Cancelled admin work left monitoring halted')
++        self.assertFalse(app._resume_background_queue_after_busy)
++
++    def test_invalid_preflight_does_not_interrupt_background_upload(self):
++        app = self.configure()
++        yields = []
++        app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
++            request_background_yield=lambda: yields.append(True) or True)
++        app.admin_accounts_list.selection_clear(0, 'end')
++        self.add('@group_one\n')
++        app._busy = True
++        self.flush()
++        self.assertEqual(yields, [], 'No selected accounts means there is no work to take sessions for')
++        app.admin_accounts_list.select_set(0)
++        app.delay_var.set('not a delay')
++        self.flush()
++        self.assertEqual(yields, [])
++
++    def test_force_recheck_during_running_batch_does_not_drop_pending_links(self):
++        app = self.configure()
++        self.add('@group_one\n')
++        self.flush()
++        self.add('@group_two\n')
++        # Use the real busy check while retaining the fake already-running worker.
++        app.run_worker = main.TelegramAdminManager.run_worker.__get__(app)
++        with patch.object(main.messagebox, 'showwarning'):
++            app.start_promote(force_recheck=True)
++        self.assertIn('@group_two', app._admin_auto_pending)
++
++    def test_manual_handoff_cancelled_by_empty_list_also_resumes_uploads(self):
++        app = self.configure()
++        callbacks, resumes = [], []
++        app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
++            request_background_yield=lambda: True, resume_queue=lambda: resumes.append(True))
++        self.add('@group_one\n')
++        app._busy = True
++        with patch.object(app, 'after', side_effect=lambda delay, callback: callbacks.append(callback) or 'fake'), \
++             patch.object(app, 'after_cancel'), patch.object(main.messagebox, 'showerror'):
++            app.start_promote()
++            app.set_busy(False)
++            app.admin_targets_text.delete('1.0', 'end')
++            app.update()
++            for _ in range(5):
++                if not callbacks:
++                    break
++                callbacks.pop(0)()
++        self.assertEqual(self.workers, [])
++        self.assertEqual(resumes, [True])
++
++
++if __name__ == '__main__':
++    unittest.main()

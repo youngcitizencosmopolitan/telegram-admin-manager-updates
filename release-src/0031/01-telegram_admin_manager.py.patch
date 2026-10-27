@@ -1,0 +1,251 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0030"
++APP_VERSION = "0031"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -337,6 +337,9 @@
+         self._closed = False
+         self._uploader_running = False
+         self._admin_stop_event = threading.Event()
++        self._admin_auto_pending: dict[str, None] = {}
++        self._admin_targets_known: set[str] = set()
++        self._admin_auto_after = None
+         self._factory_stop_event = threading.Event()
+         self._admin_safety_disabled_sessions: set[str] = set()
+         self._upload_pause_event = threading.Event()
+@@ -3409,6 +3412,7 @@
+         targets_sb = ttk.Scrollbar(targets_wrap, orient="vertical", command=self.admin_targets_text.yview)
+         targets_sb.grid(row=0, column=1, sticky="ns")
+         self.admin_targets_text.configure(yscrollcommand=targets_sb.set)
++        self.admin_targets_text.bind("<<Modified>>", self._on_admin_targets_modified)
+         target_buttons = ttk.Frame(targets_wrap)
+         target_buttons.grid(row=1, column=0, sticky="w", pady=(5, 0))
+         ttk.Button(target_buttons, text="Вставить из буфера", command=self._paste_admin_targets).pack(side="left")
+@@ -3416,7 +3420,7 @@
+         ttk.Button(target_buttons, text="Очистить", command=lambda: self.admin_targets_text.delete("1.0", "end")).pack(side="left", padx=6)
+         ttk.Label(
+             targets_wrap,
+-            text="По одной ссылке / @username / ID на строку. Можно вставить сразу десятки групп.",
++            text="По одной ссылке / @username / ID на строку. Новые ссылки автоматически обрабатываются выбранными аккаунтами.",
+         ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+ 
+         self.join_var = tk.BooleanVar(value=True)
+@@ -3539,6 +3543,8 @@
+             return
+         self.store.data["admin_selected_sessions"] = [a.session for a in self._selected_admin_accounts()]
+         self.store.save()
++        if self._admin_auto_pending:
++            self._schedule_admin_auto_queue()
+ 
+     def _selected_admin_accounts(self) -> list[Account]:
+         accounts = self.store.accounts()
+@@ -3570,8 +3576,74 @@
+                 out.append(target)
+         return out
+ 
++    def _on_admin_targets_modified(self, _event=None) -> None:
++        if not self.admin_targets_text.edit_modified():
++            return
++        self.admin_targets_text.edit_modified(False)
++        targets = self._admin_targets()
++        current = set(targets)
++        self._admin_auto_pending = {target: None for target in self._admin_auto_pending if target in current}
++        for target in targets:
++            if target in self._admin_targets_known:
++                continue
++            complete = (self._extract_invite_hash(target) is not None
++                        or re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,}", target)
++                        or re.fullmatch(r"-?\d{5,}", target)
++                        or re.fullmatch(r"(?:https?://)?(?:www\.)?t\.me/[A-Za-z][A-Za-z0-9_]{4,}/?(?:\?[^\s]*)?", target, re.I))
++            if complete:
++                self._admin_auto_pending[target] = None
++        self._admin_targets_known = current
++        self._save_group_settings()
++        self._schedule_admin_auto_queue()
++
++    def _schedule_admin_auto_queue(self, delay: int = 900) -> None:
++        if self._admin_auto_after:
++            self.after_cancel(self._admin_auto_after)
++            self._admin_auto_after = None
++        if self._admin_auto_pending and not self._closed:
++            self._admin_auto_after = self.after(delay, self._flush_admin_auto_queue)
++
++    def _flush_admin_auto_queue(self) -> None:
++        self._admin_auto_after = None
++        if self._closed or not self._admin_auto_pending:
++            return
++        if not self._selected_admin_accounts():
++            self.admin_stats_var.set(f"Авто: выбери аккаунты · ожидают групп {len(self._admin_auto_pending)}")
++            return
++        try:
++            float(self.delay_var.get().replace(',', '.'))
++            if TelegramClient is None:
++                raise ValueError('Для назначения админов требуется Telethon.')
++            self.save_api_settings(quiet=True)
++            self._api_credentials()
++        except (ValueError, TypeError) as exc:
++            self.admin_stats_var.set(str(exc))
++            return
++        if self._busy or self._foreground_takeover_pending:
++            if (not self._foreground_takeover_pending
++                    and self._defer_if_background_monitor(
++                        lambda: self._continue_admin_handoff(self._flush_admin_auto_queue), "новые группы для админов")):
++                return
++            self.admin_stats_var.set(f"Авто: ожидают обработки групп {len(self._admin_auto_pending)}")
++            self._schedule_admin_auto_queue(500)
++            return
++        self.start_promote(targets_override=list(self._admin_auto_pending), automatic=True)
++
++    def _continue_admin_handoff(self, callback: Callable[[], Any]) -> None:
++        try:
++            callback()
++        finally:
++            # Stop, removed links or changed settings may cancel the operation
++            # after the uploader yielded. Release its resume request in that case.
++            if (not self._closed and not self._busy and not self._foreground_takeover_pending
++                    and self._resume_background_queue_after_busy):
++                self._resume_background_queue_after_busy = False
++                self.after(250, self.batch_uploader.resume_queue)
++
+     def stop_admin_batch(self) -> None:
+         self._admin_stop_event.set()
++        self._admin_auto_pending.clear()
++        self._schedule_admin_auto_queue()
+         self.admin_stats_var.set("Остановка после текущей группы…")
+         self.log("Запрошена остановка. Текущая группа будет завершена, новые не начнутся.")
+ 
+@@ -4114,6 +4186,11 @@
+         self.admin_anonymous_var.set(bool(d.get("admin_anonymous", True)))
+         self.admin_targets_text.delete("1.0", "end")
+         self.admin_targets_text.insert("1.0", str(d.get("admin_targets", "")))
++        # Restoring the saved list is not a new request to change Telegram rights.
++        self._admin_targets_known = set(self._admin_targets())
++        self._admin_auto_pending.clear()
++        self.admin_targets_text.edit_modified(False)
++        self._schedule_admin_auto_queue()
+         preset_key = str(d.get("admin_preset", "full_no_add_admins"))
+         self.preset_var.set("Всегда максимальные права")
+         self.upload_folder_var.set(str(d.get("upload_folder", "")))
+@@ -4387,6 +4464,8 @@
+         if hasattr(self, "upload_start_button"):
+             self.upload_start_button.configure(state="disabled" if busy else "normal")
+         self.busy_label.configure(text=text or ("Работаю…" if busy else "Готово"))
++        if not busy and self._admin_auto_pending and not self._foreground_takeover_pending:
++            self._schedule_admin_auto_queue(0)
+         if (
+             not busy
+             and self._resume_background_queue_after_busy
+@@ -5354,20 +5433,35 @@
+         self.refresh_account_list()
+ 
+     # ---------- group / promotion ----------
+-    def start_promote(self, force_recheck: bool = False) -> None:
+-        targets = self._admin_targets()
++    def start_promote(self, force_recheck: bool = False, *, targets_override=None, automatic: bool = False) -> None:
++        if self._busy:
++            if automatic:
++                self._schedule_admin_auto_queue(500)
++            elif not self._defer_if_background_monitor(
++                    lambda: self._continue_admin_handoff(
++                        lambda: self.start_promote(force_recheck, targets_override=targets_override)), "назначение админов"):
++                messagebox.showwarning(APP_NAME, "Сейчас уже выполняется другая операция.")
++            return
++        targets = self._admin_targets() if targets_override is None else list(targets_override)
++        def report_error(text):
++            if automatic:
++                self.log(f"Автоадмины: {text}")
++                self.admin_stats_var.set(text)
++            else:
++                messagebox.showerror(APP_NAME, text)
++
+         if not targets:
+-            messagebox.showerror(APP_NAME, "Вставь хотя бы одну ссылку, @username или ID группы.")
++            report_error("Вставь хотя бы одну ссылку, @username или ID группы.")
+             return
+         selected = self._selected_admin_accounts()
+         if not selected:
+-            messagebox.showerror(APP_NAME, "В окне «Админы» выбери аккаунты, которые нужно сделать администраторами.")
++            report_error("В окне «Админы» выбери аккаунты, которые нужно сделать администраторами.")
+             return
+ 
+         try:
+             delay = max(0.0, float(self.delay_var.get().replace(",", ".")))
+         except ValueError:
+-            messagebox.showerror(APP_NAME, "Некорректная задержка между аккаунтами.")
++            report_error("Некорректная задержка между аккаунтами.")
+             return
+ 
+         self.save_safety_settings(quiet=True)
+@@ -5396,26 +5490,34 @@
+         )
+ 
+         if not work_plan:
++            for target in targets:
++                self._admin_auto_pending.pop(target, None)
+             self.admin_progress.configure(value=1, maximum=1)
+             self.log("✅ Все выбранные группы уже имеют сохранённое состояние с такими же правами. Telegram не вызывается.")
+-            messagebox.showinfo(
+-                APP_NAME,
+-                f"Нечего делать.\n\n{cached_groups} групп уже готовы по локальному кэшу.\nTelegram не вызывался.",
+-            )
++            if not automatic:
++                messagebox.showinfo(
++                    APP_NAME,
++                    f"Нечего делать.\n\n{cached_groups} групп уже готовы по локальному кэшу.\nTelegram не вызывался.",
++                )
+             return
+ 
+         if TelegramClient is None:
+-            self._show_missing_dependency()
++            if automatic:
++                report_error("Для назначения админов требуется Telethon.")
++            else:
++                self._show_missing_dependency()
+             return
+         self.save_api_settings(quiet=True)
+         try:
+             self._api_credentials()
+         except Exception as exc:
+-            messagebox.showerror(APP_NAME, str(exc))
++            report_error(str(exc))
+             return
+ 
+         controller = self.controller_account()  # None = автоматический выбор отдельно для каждой группы
+         join_before = bool(self.join_var.get())
++        for target in targets:
++            self._admin_auto_pending.pop(target, None)
+         self._admin_stop_event.clear()
+         self._admin_safety_disabled_sessions.clear()
+         self.admin_progress.configure(value=0, maximum=max(1, len(work_plan)))
+@@ -5434,6 +5536,7 @@
+                     total_requested_groups=len(targets),
+                     cached_groups=cached_groups,
+                     force_recheck=force_recheck,
++                    notify=not automatic,
+                 )
+             )
+ 
+@@ -5451,6 +5554,7 @@
+         total_requested_groups: int,
+         cached_groups: int,
+         force_recheck: bool,
++        notify: bool = True,
+     ) -> None:
+         total_promoted = 0
+         total_failed = 0
+@@ -5529,7 +5633,8 @@
+                 f"Ошибок/пропусков: {total_failed}"
+             )
+             self.log(summary.replace("\n", " | "))
+-            self.ui_call(lambda: messagebox.showinfo(APP_NAME, summary))
++            if notify:
++                self.ui_call(lambda: None if self._admin_auto_pending else messagebox.showinfo(APP_NAME, summary))
+         finally:
+             self.ui_call(lambda: self.admin_stop_button.configure(state="disabled"))
+ 

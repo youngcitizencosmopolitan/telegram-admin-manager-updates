@@ -1,17 +1,11 @@
 {
-  "version": "0030",
-  "base_version": "0029",
-  "manifest_version": "4.3.8.0030",
-  "display_version": "0030",
+  "version": "0031",
+  "base_version": "0030",
+  "manifest_version": "4.3.8.0031",
+  "display_version": "0031",
   "patch_files": [
-    "release-src/0030/01-batch_uploader.py.patch",
-    "release-src/0030/02-tam_core-file_readiness.py.patch",
-    "release-src/0030/03-tam_ui-monitor_presentation.py.patch",
-    "release-src/0030/04-telegram_admin_manager.py.patch",
-    "release-src/0030/05-tests-test_empty_file_deferral.py.patch",
-    "release-src/0030/06-tests-test_file_readiness.py.patch",
-    "release-src/0030/07-tests-test_monitor_delta_upload.py.patch",
-    "release-src/0030/08-tests-test_monitor_presentation.py.patch"
+    "release-src/0031/01-telegram_admin_manager.py.patch",
+    "release-src/0031/02-tests-test_auto_admin_links.py.patch"
   ],
-  "notes": "0030: fix uploads stuck at Preparation / waiting for write when folders contain empty media files. Zero-byte photos and videos are deferred immediately so workers can upload the remaining files and continue other rules. The same check handles files emptied while waiting for stability. Deferred files create no upload records, fingerprints or reservations; monitoring detects them again when data appears and the source becomes stable. Show a separate deferred count and a clear zero-byte file status instead of reporting every file as uploaded. Existing account authorization, rules and upload history are preserved."
+  "notes": "0031: automatically assign the selected administrator accounts when new group links are added in the Admins tab. Debounce edits and queue new targets while an operation is active; monitor-origin uploads yield through the existing foreground handoff. Process only added links using the existing policy cache, account selection, delays and FloodWait handling. Removing pending links or pressing Stop cancels their automatic work; loading a saved list does not trigger new assignments. Automatic batch results are logged without modal completion dialogs so further links can continue."
 }
