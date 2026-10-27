@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0030",
-  "display_version": "0030",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0030/TelegramAdminManager_v0030_update.zip",
-  "sha256": "fad2eda0e7cf509f4ed98196af195d29d78603c9895f79e6d2f6a6ea948accf2",
-  "notes": "0030: fix uploads stuck at Preparation / waiting for write when folders contain empty media files. Zero-byte photos and videos are deferred immediately so workers can upload the remaining files and continue other rules. The same check handles files emptied while waiting for stability. Deferred files create no upload records, fingerprints or reservations; monitoring detects them again when data appears and the source becomes stable. Show a separate deferred count and a clear zero-byte file status instead of reporting every file as uploaded. Existing account authorization, rules and upload history are preserved."
+  "version": "4.3.8.0031",
+  "display_version": "0031",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0031/TelegramAdminManager_v0031_update.zip",
+  "sha256": "a2c174f6dece3546039809af699b38cd505a0df4a096bf0b9460c44e6c26e7f4",
+  "notes": "0031: automatically assign the selected administrator accounts when new group links are added in the Admins tab. Debounce edits and queue new targets while an operation is active; monitor-origin uploads yield through the existing foreground handoff. Process only added links using the existing policy cache, account selection, delays and FloodWait handling. Removing pending links or pressing Stop cancels their automatic work; loading a saved list does not trigger new assignments. Automatic batch results are logged without modal completion dialogs so further links can continue."
 }
