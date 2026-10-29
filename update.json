@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0031",
-  "display_version": "0031",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0031/TelegramAdminManager_v0031_update.zip",
-  "sha256": "a2c174f6dece3546039809af699b38cd505a0df4a096bf0b9460c44e6c26e7f4",
-  "notes": "0031: automatically assign the selected administrator accounts when new group links are added in the Admins tab. Debounce edits and queue new targets while an operation is active; monitor-origin uploads yield through the existing foreground handoff. Process only added links using the existing policy cache, account selection, delays and FloodWait handling. Removing pending links or pressing Stop cancels their automatic work; loading a saved list does not trigger new assignments. Automatic batch results are logged without modal completion dialogs so further links can continue."
+  "version": "4.3.8.0032",
+  "display_version": "0032",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0032/TelegramAdminManager_v0032_update.zip",
+  "sha256": "ae8de2695f0f793bc8c551375eb9af4590b6283bdaae6e5000c2afe385e66ef3",
+  "notes": "0032: add a generated multi-resolution app icon to the window and existing verified desktop/Start Menu shortcuts. Build the local Channels/Groups inventory off the UI thread with one consistent bulk snapshot instead of per-group and per-account database queries. Search and role/problem filters use a debounced in-memory index without SQLite or Telegram requests. Update rows in bounded batches, retain matching selections and sorting, cancel superseded paints and discard stale loads. Group detail roles also use the same local snapshot. Existing authorization, admin automation, monitoring and upload history are preserved."
 }
