@@ -1,0 +1,245 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0031"
++APP_VERSION = "0032"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -357,6 +357,7 @@
+         self._ui_queue: queue.Queue[Callable[[], Any]] = queue.Queue()
+         from tam_core.ui_latest import UiLatest
+         self._ui_latest = UiLatest()
++        self._configure_app_icon()
+         self._visible_log_lines = 0
+         self._log_text_widgets: list[tk.Text] = []
+         self._tree_sort_controllers: list[TreeviewSortController] = []
+@@ -376,6 +377,17 @@
+             # Installed builds may have a permanent release manifest configured.
+             # The check is delayed and runs off the UI thread.
+             self.after(4500, self._maybe_check_for_updates)
++
++    def _configure_app_icon(self) -> None:
++        from tam_ui.app_icon import ensure_app_icon, update_app_shortcuts
++        try:
++            icon = ensure_app_icon(DATA_DIR)
++            if os.name == 'nt':
++                self.iconbitmap(default=str(icon))
++                # Shell discovery/COM never belongs on the Tk event loop.
++                threading.Thread(target=update_app_shortcuts, args=(icon, BASE_DIR), daemon=True).start()
++        except (OSError, ValueError, tk.TclError):
++            pass  # Cosmetic asset failures must not prevent startup.
+ 
+     # ---------- table sorting ----------
+     def _load_table_sort_state(self, table_id: str) -> dict[str, Any] | None:
+@@ -1648,6 +1660,14 @@
+ 
+     # ---------- channels inventory ----------
+     def _build_channels_tab(self) -> None:
++        self._channels_inventory = None
++        self._channels_relations, self._channels_restrictions = {}, {}
++        self._channels_load_revision = 0
++        self._channels_load_running = False
++        self._channels_filter_after = self._channels_render_after = None
++        self._channels_render_revision = 0
++        self._channels_rendering = self._channels_sort_paused = False
++        self._channels_tree_ids, self._channels_painted_values = set(), {}
+         t = self.tab_channels
+         t.columnconfigure(0, weight=1)
+         t.rowconfigure(1, weight=1)
+@@ -1661,7 +1681,7 @@
+         self.channels_search_var = tk.StringVar()
+         search = ttk.Entry(toolbar, textvariable=self.channels_search_var, width=28)
+         search.pack(side="left")
+-        self.channels_search_var.trace_add("write", lambda *_: self.refresh_channels_from_cache())
++        self.channels_search_var.trace_add("write", lambda *_: self._schedule_channels_filter())
+         self.channels_owner_only_var = tk.BooleanVar(value=False)
+         self.channels_admin_only_var = tk.BooleanVar(value=False)
+         self.channels_problem_only_var = tk.BooleanVar(value=False)
+@@ -1670,7 +1690,7 @@
+             ("Только где есть наши админы", self.channels_admin_only_var),
+             ("Только проблемные", self.channels_problem_only_var),
+         ):
+-            ttk.Checkbutton(toolbar, text=text, variable=var, command=self.refresh_channels_from_cache).pack(side="left", padx=(8, 0))
++            ttk.Checkbutton(toolbar, text=text, variable=var, command=self._schedule_channels_filter).pack(side="left", padx=(8, 0))
+ 
+         self.channels_view_button = ttk.Menubutton(toolbar, text="Вид")
+         self.channels_view_button.pack(side="right")
+@@ -1704,7 +1724,7 @@
+         x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.channels_tree.xview)
+         x.grid(row=1, column=0, sticky="ew")
+         self.channels_tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+-        self._register_sortable_tree(self.channels_tree, "channels.inventory", {
++        self._channels_sort_controller = self._register_sortable_tree(self.channels_tree, "channels.inventory", {
+             "peer_id": "number", "last_refreshed_at": "datetime",
+         })
+         self.channels_tree.bind("<<TreeviewSelect>>", lambda _e: self._channels_show_selected_details())
+@@ -1853,52 +1873,131 @@
+         return time.strftime("%d.%m.%Y %H:%M", time.localtime(stamp)) if stamp > 0 else "—"
+ 
+     def refresh_channels_from_cache(self) -> None:
+-        if not hasattr(self, "channels_tree"):
+-            return
+-        selected = self._channels_selected_peer_id()
+-        query = str(getattr(self, "channels_search_var", tk.StringVar()).get() or "").strip().casefold()
+-        owner_only = bool(getattr(self, "channels_owner_only_var", tk.BooleanVar()).get())
+-        admin_only = bool(getattr(self, "channels_admin_only_var", tk.BooleanVar()).get())
+-        problem_only = bool(getattr(self, "channels_problem_only_var", tk.BooleanVar()).get())
+-        for iid in self.channels_tree.get_children(""):
+-            self.channels_tree.delete(iid)
+-        for row in self.state_db.channels_all():
+-            peer_id = int(row.get("peer_id", 0) or 0)
+-            if not peer_id:
+-                continue
+-            agg = self._channel_aggregate(peer_id)
+-            status = str(row.get("status", "ok") or "ok")
+-            problem = bool(agg["problem"] or status not in {"ok", ""} or row.get("error"))
+-            hay = " ".join(str(row.get(k, "")) for k in ("title", "link", "peer_id")).casefold()
+-            if query and query not in hay: continue
+-            if owner_only and not agg["owner"]: continue
+-            if admin_only and not agg["admins"] and not agg["owner"]: continue
+-            if problem_only and not problem: continue
+-            link_value = str(row.get("link", "") or "") or str(row.get("link_status", "") or "") or "—"
+-            refreshed = self._format_channel_refresh_time(row.get("last_refreshed_at"))
+-            values = (
+-                row.get("title", ""), link_value, row.get("peer_type", ""), peer_id,
+-                agg["owner"], agg["admins"], agg["members"], "⚠ Проблема" if problem else "OK", refreshed,
+-            )
+-            self.channels_tree.insert("", tk.END, iid=str(peer_id), values=values)
+-        if selected is not None and self.channels_tree.exists(str(selected)):
+-            self.channels_tree.selection_set(str(selected))
+-        self._channels_show_selected_details()
++        if self._closed or not hasattr(self, "channels_tree"):
++            return
++        self._channels_load_revision += 1
++        if not self._channels_load_running:
++            self._start_channels_inventory_load()
++
++    def _start_channels_inventory_load(self) -> None:
++        from tam_core.channel_search import build_channel_inventory
++        revision = self._channels_load_revision
++        labels = {account.session: account.display for account in self.store.accounts()}
++        self._channels_load_running = True
++
++        def load():
++            try:
++                snapshot = self.state_db.channels_inventory_snapshot()
++                data = build_channel_inventory(*snapshot, labels)
++                self.ui_call(lambda: self._finish_channels_inventory_load(revision, data, None))
++            except Exception as exc:
++                self.ui_call(lambda error=str(exc): self._finish_channels_inventory_load(revision, None, error))
++
++        threading.Thread(target=load, daemon=True).start()
++
++    def _finish_channels_inventory_load(self, revision, data, error) -> None:
++        self._channels_load_running = False
++        if self._closed:
++            return
++        if revision != self._channels_load_revision:
++            self._start_channels_inventory_load()
++            return
++        if error is not None:
++            self.log(f'Не удалось обновить локальный список групп: {error}')
++            if self._channels_inventory is None:
++                self._channels_inventory = {}
++        else:
++            self._channels_inventory, self._channels_relations, self._channels_restrictions = data
++        self._apply_channels_filter()
++
++    def _schedule_channels_filter(self) -> None:
++        if self._channels_filter_after:
++            self.after_cancel(self._channels_filter_after)
++        if not self._closed:
++            self._channels_filter_after = self.after(180, self._apply_channels_filter)
++
++    def _apply_channels_filter(self) -> None:
++        if self._channels_filter_after:
++            self.after_cancel(self._channels_filter_after)
++            self._channels_filter_after = None
++        if self._closed or self._channels_inventory is None:
++            return
++        if self._channels_render_after:
++            self.after_cancel(self._channels_render_after)
++            self._channels_render_after = None
++        if self._channels_sort_paused:
++            self._channels_sort_controller.resume()
++        self._channels_sort_controller.suspend()
++        self._channels_sort_paused = True
++        self._channels_rendering = True
++        self._channels_render_revision += 1
++        revision = self._channels_render_revision
++        query = self.channels_search_var.get().strip().casefold()
++        owner_only = self.channels_owner_only_var.get()
++        admin_only = self.channels_admin_only_var.get()
++        problem_only = self.channels_problem_only_var.get()
++        inventory = self._channels_inventory
++        wanted = [key for key, row in inventory.items() if
++                  (not query or query in row['search']) and (not owner_only or row['owner'])
++                  and (not admin_only or row['admin']) and (not problem_only or row['problem'])]
++        visible = set(self.channels_tree.get_children(''))
++        wanted_set = set(wanted)
++        removed = self._channels_tree_ids - set(inventory)
++        operations = iter([('delete', key) for key in removed]
++                          + [('detach', key) for key in visible - wanted_set - removed]
++                          + [('show', key) for key in wanted])
++
++        def paint():
++            self._channels_render_after = None
++            if self._closed or revision != self._channels_render_revision:
++                return
++            for _ in range(60):
++                try:
++                    action, key = next(operations)
++                except StopIteration:
++                    keep = [key for key in self.channels_tree.selection() if key in wanted_set]
++                    self.channels_tree.selection_set(keep)
++                    self._channels_rendering = self._channels_sort_paused = False
++                    self._channels_sort_controller.resume()
++                    self._channels_show_selected_details()
++                    return
++                if action == 'delete':
++                    self.channels_tree.delete(key)
++                    self._channels_tree_ids.discard(key)
++                    self._channels_painted_values.pop(key, None)
++                elif action == 'detach':
++                    self.channels_tree.selection_remove(key)
++                    self.channels_tree.detach(key)
++                else:
++                    values = inventory[key]['values']
++                    if key not in self._channels_tree_ids:
++                        self.channels_tree.insert('', 'end', iid=key, values=values)
++                        self._channels_tree_ids.add(key)
++                    elif self._channels_painted_values.get(key) != values:
++                        self.channels_tree.item(key, values=values)
++                    self._channels_painted_values[key] = values
++                    self.channels_tree.move(key, '', 'end')
++            self._channels_render_after = self.after(1, paint)
++
++        self._channels_render_after = self.after(0, paint)
+ 
+     def _channels_show_selected_details(self) -> None:
+-        if not hasattr(self, "channel_accounts_tree"):
++        if not hasattr(self, "channel_accounts_tree") or self._channels_rendering:
+             return
+         for iid in self.channel_accounts_tree.get_children(""):
+             self.channel_accounts_tree.delete(iid)
+         peer_id = self._channels_selected_peer_id()
+         if peer_id is None:
+             return
+-        rel_by_session = {str(r.get("session", "")): r for r in self.state_db.channel_accounts(peer_id)}
++        rels = (self._channels_relations.get(str(peer_id), []) if self._channels_inventory is not None
++                else self.state_db.channel_accounts(peer_id))
++        rel_by_session = {str(r.get("session", "")): r for r in rels}
+         for account in self.store.accounts():
+             rel = rel_by_session.get(account.session, {"relation": "unknown", "rights": {}, "last_error": ""})
+             rights = rel.get("rights") if isinstance(rel.get("rights"), dict) else {}
+             rights_text = ", ".join(k for k, v in rights.items() if v) or "—"
+-            restriction = self.account_restriction(account.session)
++            restriction = (self._channels_restrictions.get(account.session, {}) if self._channels_inventory is not None
++                           else self.account_restriction(account.session))
+             status = str(rel.get("last_error", "") or "")
+             if restriction:
+                 status = "⚠ Ограничен Telegram" + (f": {restriction.get('friendly_error')}" if restriction.get('friendly_error') else "")

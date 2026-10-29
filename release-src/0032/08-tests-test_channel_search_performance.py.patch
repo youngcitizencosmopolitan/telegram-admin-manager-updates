@@ -1,0 +1,246 @@
+--- /dev/null
++++ b/app/tests/test_channel_search_performance.py
+@@ -0,0 +1,243 @@
++import contextlib
++import json
++import tempfile
++import threading
++import time
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import test_redesign_integration as fixture
++from tam_core.models import Account
++from tam_core.state_db import StateDatabase
++
++
++class InventorySnapshotTests(unittest.TestCase):
++    def test_inventory_reads_channels_roles_and_restrictions_in_one_connection(self):
++        with tempfile.TemporaryDirectory() as directory:
++            db = StateDatabase(Path(directory) / 'state.db')
++            db.channel_upsert({'peer_id': 1, 'title': 'Alpha'})
++            db.channel_account_put(1, 'a', {'relation': 'owner'})
++            db.account_restriction_set('a', {'status': 'restricted'})
++            snapshot = getattr(db, 'channels_inventory_snapshot', None)
++            self.assertTrue(callable(snapshot), 'Inventory still requires database calls per group/account')
++            session = db.session
++            opened, statements = [], []
++
++            @contextlib.contextmanager
++            def observed():
++                opened.append(True)
++                with session() as connection:
++                    connection.set_trace_callback(statements.append)
++                    yield connection
++
++            with patch.object(db, 'session', observed):
++                channels, relations, restrictions = snapshot()
++            self.assertEqual(len(opened), 1)
++            self.assertEqual(len([s for s in statements if s.lstrip().upper().startswith('SELECT')]), 3)
++            self.assertEqual(channels[0]['title'], 'Alpha')
++            self.assertEqual(relations[0]['relation'], 'owner')
++            self.assertEqual(restrictions[0]['status'], 'restricted')
++
++
++class ChannelSearchPerformanceTests(unittest.TestCase):
++    setUp = fixture.RealApplicationFixture.setUp
++    _destroy_app = fixture.RealApplicationFixture._destroy_app
++
++    def wait_ready(self):
++        app = self.app
++        end = time.monotonic() + 5
++        while time.monotonic() < end:
++            app.update()
++            if (getattr(app, '_channels_inventory', None) is not None
++                    and not getattr(app, '_channels_load_running', True)
++                    and not getattr(app, '_channels_filter_after', None)
++                    and not getattr(app, '_channels_render_after', None)):
++                return
++            time.sleep(.005)
++        self.fail('Group inventory did not finish its bounded background refresh')
++
++    def seed(self, count=500):
++        app = self.app
++        app.store.set_accounts([Account(session='a', label='Owner', phone='', user_id=1),
++                                Account(session='b', label='Admin', phone='', user_id=2)])
++        with app.state_db.session() as db:
++            db.executemany('INSERT INTO channels(peer_id,payload_json,updated_at) VALUES(?,?,0)',
++                [(i, json.dumps({'peer_id': i, 'title': f'Alpha {i}' if i % 2 else f'Beta {i}',
++                    'link': f'https://t.me/group{i}'})) for i in range(1, count + 1)])
++            db.executemany('INSERT INTO channel_accounts(peer_id,session,payload_json,updated_at) VALUES(?,?,?,0)',
++                [(i, 'a', json.dumps({'peer_id': i, 'session': 'a', 'relation': 'owner' if i % 3 else 'member'}))
++                 for i in range(1, count + 1)])
++        app.refresh_channels_from_cache()
++        self.wait_ready()
++
++    def filter_now(self, query):
++        app = self.app
++        app.channels_search_var.set(query)
++        apply = getattr(app, '_apply_channels_filter', None)
++        self.assertTrue(callable(apply), 'Typing still rebuilds the inventory from SQLite')
++        token = getattr(app, '_channels_filter_after', None)
++        if token:
++            app.after_cancel(token)
++        apply()
++        self.wait_ready()
++
++    def test_inventory_loads_off_ui_thread_without_per_group_queries(self):
++        self.seed(200)
++        app = self.app
++        owner_thread = threading.get_ident()
++        snapshot = getattr(app.state_db, 'channels_inventory_snapshot', None)
++        self.assertTrue(callable(snapshot))
++        threads = []
++
++        def read():
++            threads.append(threading.get_ident())
++            return snapshot()
++
++        with patch.object(app.state_db, 'channels_inventory_snapshot', side_effect=read), \
++             patch.object(app.state_db, 'channel_accounts', side_effect=AssertionError('Per-group query')), \
++             patch.object(app.state_db, 'account_restriction_get', side_effect=AssertionError('Per-account query')):
++            app.refresh_channels_from_cache()
++            self.wait_ready()
++        self.assertTrue(threads)
++        self.assertNotIn(owner_thread, threads)
++
++    def test_typing_filters_memory_without_sqlite_or_deleting_matching_rows(self):
++        self.seed()
++        app = self.app
++        app.channels_tree.selection_set(('1', '3'))
++        with patch.object(app.state_db, 'channels_inventory_snapshot', side_effect=AssertionError('Search reread SQLite')), \
++             patch.object(app.state_db, 'channel_accounts', side_effect=AssertionError('Search queried roles')), \
++             patch.object(app.state_db, 'account_restriction_get', side_effect=AssertionError('Search queried restrictions')), \
++             patch.object(app.channels_tree, 'delete', wraps=app.channels_tree.delete) as delete:
++            self.filter_now('alpha')
++            self.assertEqual(len(app.channels_tree.get_children('')), 250)
++            self.assertEqual(set(app.channels_tree.selection()), {'1', '3'})
++            self.assertEqual(delete.call_count, 0)
++            self.filter_now('beta')
++            self.assertEqual(len(app.channels_tree.get_children('')), 250)
++            self.assertEqual(app.channels_tree.selection(), ())
++
++    def test_latest_query_cancels_obsolete_paint_and_keeps_window_responsive(self):
++        self.seed(1500)
++        app = self.app
++        self.filter_now('alpha')
++        app.channels_search_var.set('beta')
++        app._apply_channels_filter()
++        heartbeat = []
++        app.after(0, lambda: heartbeat.append(True))
++        self.filter_now('alpha 1499')
++        self.assertTrue(heartbeat)
++        self.assertEqual(app.channels_tree.get_children(''), ('1499',))
++
++    def test_refresh_after_inventory_changes_uses_current_search(self):
++        self.seed(20)
++        self.filter_now('new title')
++        self.app.state_db.channel_upsert({'peer_id': 21, 'title': 'New title'})
++        self.app.refresh_channels_from_cache()
++        self.wait_ready()
++        self.assertEqual(self.app.channels_tree.get_children(''), ('21',))
++
++    def test_owner_and_problem_filters_preserve_existing_meaning(self):
++        self.seed(12)
++        app = self.app
++        app.state_db.account_restriction_set('a', {'status': 'restricted'})
++        app.refresh_channels_from_cache()
++        self.wait_ready()
++        app.channels_owner_only_var.set(True)
++        app.channels_problem_only_var.set(True)
++        self.filter_now('alpha')
++        self.assertEqual(app.channels_tree.get_children(''), ('1', '5', '7', '11'))
++
++    def test_rapid_typing_is_debounced_into_one_filter(self):
++        self.seed(20)
++        app = self.app
++        with patch.object(app, '_apply_channels_filter', wraps=app._apply_channels_filter) as apply:
++            app.channels_search_var.set('a')
++            app.channels_search_var.set('al')
++            app.channels_search_var.set('alpha')
++            self.assertEqual(apply.call_count, 0)
++            self.wait_ready()
++            self.assertEqual(apply.call_count, 1)
++        self.assertEqual(len(app.channels_tree.get_children('')), 10)
++
++    def test_removed_detached_groups_are_deleted_on_inventory_refresh(self):
++        self.seed(20)
++        self.filter_now('alpha')
++        with self.app.state_db.session() as db:
++            db.execute('DELETE FROM channels WHERE peer_id=2')
++        self.app.refresh_channels_from_cache()
++        self.wait_ready()
++        self.assertFalse(self.app.channels_tree.exists('2'))
++
++    def test_selected_details_use_snapshot_and_sort_remains_active(self):
++        self.seed(20)
++        app = self.app
++        app._channels_sort_controller.toggle('title')
++        self.filter_now('alpha')
++        self.assertEqual(app.channels_tree.get_children(''), tuple(str(i) for i in range(1, 20, 2)))
++        with patch.object(app.state_db, 'channel_accounts', side_effect=AssertionError('Detail per-group query')), \
++             patch.object(app.state_db, 'account_restriction_get', side_effect=AssertionError('Detail restriction query')):
++            app.channels_tree.selection_set('1')
++            app._channels_show_selected_details()
++        self.assertEqual(app.channel_accounts_tree.set('a', 'role'), 'Владелец')
++
++    def test_stale_load_is_discarded_and_refreshes_are_coalesced(self):
++        self.seed(20)
++        app = self.app
++        original = app.state_db.channels_inventory_snapshot
++        started, release = threading.Event(), threading.Event()
++        calls = []
++
++        def delayed():
++            result = original()
++            calls.append(True)
++            if len(calls) == 1:
++                started.set()
++                release.wait(2)
++            return result
++
++        with patch.object(app.state_db, 'channels_inventory_snapshot', side_effect=delayed), \
++             patch.object(app, '_apply_channels_filter', wraps=app._apply_channels_filter) as apply:
++            try:
++                app.refresh_channels_from_cache()
++                self.assertTrue(started.wait(2))
++                app.state_db.channel_upsert({'peer_id': 21, 'title': 'Newest'})
++                for _ in range(10):
++                    app.refresh_channels_from_cache()
++                release.set()
++                self.wait_ready()
++                self.assertEqual(len(calls), 2)
++                self.assertEqual(apply.call_count, 1, 'An obsolete snapshot was painted')
++                self.assertEqual(len(app.channels_tree.get_children('')), 21)
++            finally:
++                release.set()
++
++    def test_failed_refresh_keeps_previous_searchable_snapshot(self):
++        self.seed(20)
++        with patch.object(self.app.state_db, 'channels_inventory_snapshot', side_effect=OSError('busy database')):
++            self.app.refresh_channels_from_cache()
++            self.wait_ready()
++        self.filter_now('alpha')
++        self.assertEqual(len(self.app.channels_tree.get_children('')), 10)
++
++    def test_hidden_group_is_deselected_before_detaching_it(self):
++        self.seed(150)
++        app = self.app
++        app.channels_tree.selection_set(('1', '2'))
++        original = app.channels_tree.detach
++        selected_at_detach = []
++
++        def detach(key):
++            if key in app.channels_tree.selection():
++                selected_at_detach.append(key)
++            return original(key)
++
++        with patch.object(app.channels_tree, 'detach', side_effect=detach):
++            self.filter_now('alpha')
++        self.assertEqual(selected_at_detach, [], 'Hidden groups could still be targeted between paint batches')
++        self.assertEqual(app.channels_tree.selection(), ('1',))
++
++
++if __name__ == '__main__':
++    unittest.main()
