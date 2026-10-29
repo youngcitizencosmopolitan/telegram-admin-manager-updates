@@ -1,0 +1,95 @@
+--- /dev/null
++++ b/app/tests/test_app_icon.py
+@@ -0,0 +1,92 @@
++import hashlib
++import os
++import struct
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++try:
++    from tam_ui import app_icon
++except ImportError:
++    app_icon = None
++
++
++class AppIconTests(unittest.TestCase):
++    def require_module(self):
++        self.assertIsNotNone(app_icon, 'App icon materialization and safe shortcut support are missing')
++
++    def test_materializes_complete_multiresolution_windows_icon(self):
++        self.require_module()
++        with tempfile.TemporaryDirectory() as folder:
++            result = app_icon.ensure_app_icon(Path(folder) / 'data')
++            self.assertEqual(result.name, 'app.ico')
++            data = result.read_bytes()
++            self.assertEqual(hashlib.sha256(data).hexdigest(), '22c4e18e662a5d82ff260f346e9192bf96bee7f71f2eca853d3e7ea0c2dcd8e1')
++            self.assertEqual(struct.unpack_from('<HHH', data), (0, 1, 7))
++            sizes = set()
++            for index in range(7):
++                width, height, _, _, _, _, length, offset = struct.unpack_from('<BBBBHHII', data, 6 + index * 16)
++                sizes.add((width or 256, height or 256))
++                self.assertLessEqual(offset + length, len(data))
++            self.assertEqual(sizes, {(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)})
++
++    def test_unchanged_icon_preserves_mtime_and_replaces_stale_data(self):
++        self.require_module()
++        with tempfile.TemporaryDirectory() as folder:
++            root = Path(folder)
++            result = app_icon.ensure_app_icon(root)
++            os.utime(result, ns=(1_000_000_000, 1_000_000_000))
++            self.assertEqual(app_icon.ensure_app_icon(root).stat().st_mtime_ns, 1_000_000_000)
++            result.write_bytes(b'stale icon')
++            app_icon.ensure_app_icon(root)
++            self.assertEqual(result.read_bytes()[:6], b'\x00\x00\x01\x00\x07\x00')
++            self.assertEqual([p.name for p in root.iterdir()], ['app.ico'])
++
++    def test_shortcut_eligibility_requires_exact_app_launcher(self):
++        self.require_module()
++        root = r'C:\Users\Tester\TelegramAdminManager'
++        cases = [
++            (r'C:\Windows\System32\wscript.exe', '"' + root + r'\TelegramAdminManager.vbs"', True),
++            (r'C:\Windows\System32\wscript.exe', '"' + root + r'\TelegramAdminManager.vbs" extra', False),
++            (r'C:\evil\wscript.exe', '"' + root + r'\TelegramAdminManager.vbs"', False),
++            (r'C:\Windows\System32\wscript.exe', '"' + root + r'-other\TelegramAdminManager.vbs"', False),
++            (root + r'\run.bat', '', True),
++            (root + r'\run.bat', 'unrelated', False),
++            (root + r'\.venv\Scripts\pythonw.exe', '"' + root + r'\telegram_admin_manager.py"', True),
++            (root + r'\.venv\Scripts\pythonw.exe', 'telegram_admin_manager.py', True),
++            (root + r'\.venv\Scripts\pythonw.exe', r'..\other\telegram_admin_manager.py', False),
++            (root + r'\unrelated.exe', '', False),
++        ]
++        with patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}):
++            for target, arguments, expected in cases:
++                with self.subTest(target=target, arguments=arguments):
++                    self.assertEqual(app_icon._shortcut_matches_install(target, arguments, root), expected)
++
++    def test_shortcut_update_filters_unrelated_links_and_passes_paths_as_data(self):
++        self.require_module()
++        root = r'C:\Users\Tester\TelegramAdminManager'
++        allowed = {'Path': r'C:\Users\Tester\Desktop\Telegram Admin Manager.lnk', 'Target': r'C:\Windows\System32\wscript.exe', 'Arguments': '"' + root + r'\TelegramAdminManager.vbs"'}
++        unrelated = dict(allowed, Arguments=r'"C:\Other\TelegramAdminManager.vbs"')
++        wrong_name = dict(allowed, Path=r'C:\Users\Tester\Desktop\Telegram.lnk')
++        invocations = []
++        def powershell_boundary(script, payload):
++            invocations.append(payload)
++            return [allowed, unrelated, wrong_name] if len(invocations) == 1 else [allowed['Path']]
++        windows = SimpleNamespace(name='nt', environ=os.environ)
++        with patch.object(app_icon, 'os', windows), patch.object(app_icon, '_run_powershell', side_effect=powershell_boundary):
++            result = app_icon.update_app_shortcuts(Path(r'C:\data\app.ico'), Path(root))
++        self.assertEqual([str(p) for p in result], [allowed['Path']])
++        self.assertEqual(invocations[1]['links'], [allowed])
++        self.assertEqual(invocations[1]['icon'], r'C:\data\app.ico')
++
++    def test_shortcut_discovery_failure_is_nonfatal(self):
++        self.require_module()
++        windows = SimpleNamespace(name='nt', environ=os.environ)
++        with patch.object(app_icon, 'os', windows), patch.object(app_icon, '_run_powershell', side_effect=OSError('unavailable')):
++            self.assertEqual(app_icon.update_app_shortcuts(Path('app.ico'), Path('app')), ())
++
++
++if __name__ == '__main__':
++    unittest.main()

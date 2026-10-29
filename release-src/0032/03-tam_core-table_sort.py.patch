@@ -1,0 +1,39 @@
+--- a/app/tam_core/table_sort.py
++++ b/app/tam_core/table_sort.py
+@@ -136,6 +136,7 @@
+         self.save_state = save_state
+         self.first_descending = set(first_descending or ())
+         self._scheduled = False
++        self._suspended = 0
+         self._labels: dict[str, str] = {}
+         self.active_column: str | None = None
+         self.reverse = False
+@@ -217,6 +218,8 @@
+ 
+     def resort(self) -> None:
+         self._scheduled = False
++        if self._suspended:
++            return
+         column = self.active_column
+         if not column:
+             return
+@@ -231,10 +234,18 @@
+             return
+ 
+     def schedule(self) -> None:
+-        if not self.active_column or self._scheduled:
++        if not self.active_column or self._scheduled or self._suspended:
+             return
+         self._scheduled = True
+         try:
+             self.tree.after_idle(self.resort)
+         except Exception:
+             self._scheduled = False
++
++    def suspend(self) -> None:
++        self._suspended += 1
++
++    def resume(self) -> None:
++        self._suspended = max(0, self._suspended - 1)
++        if not self._suspended:
++            self.schedule()

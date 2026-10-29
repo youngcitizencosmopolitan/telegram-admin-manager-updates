@@ -1,0 +1,160 @@
+--- /dev/null
++++ b/app/tam_ui/app_icon.py
+@@ -0,0 +1,157 @@
++"""Generated application artwork and conservative Windows shortcut maintenance.
++
++The ICO is shipped as UTF-8 base64 so text-only release patches carry the asset.
++Runtime materialization requires only Python's standard library.
++"""
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++import ntpath
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++_ICON_SHA256 = '22c4e18e662a5d82ff260f346e9192bf96bee7f71f2eca853d3e7ea0c2dcd8e1'
++_SHORTCUT_NAME = 'Telegram Admin Manager.lnk'
++
++
++def ensure_app_icon(data_dir: Path) -> Path:
++    """Return data_dir/app.ico, replacing stale content atomically only if needed."""
++    encoded = Path(__file__).with_name('app_icon.ico.b64').read_text(encoding='ascii')
++    content = base64.b64decode(''.join(encoded.split()), validate=True)
++    if hashlib.sha256(content).hexdigest() != _ICON_SHA256:
++        raise ValueError('The application icon asset is damaged')
++    data_dir = Path(data_dir)
++    data_dir.mkdir(parents=True, exist_ok=True)
++    destination = data_dir / 'app.ico'
++    try:
++        if destination.read_bytes() == content:
++            return destination
++    except FileNotFoundError:
++        pass
++    temporary = None
++    try:
++        with tempfile.NamedTemporaryFile(prefix='.app-icon-', suffix='.tmp', dir=data_dir, delete=False) as stream:
++            temporary = Path(stream.name)
++            stream.write(content)
++        os.replace(temporary, destination)
++    finally:
++        if temporary is not None:
++            temporary.unlink(missing_ok=True)
++    return destination
++
++
++def _shortcut_matches_install(target: str, arguments: str, install_dir: str) -> bool:
++    """Recognize only the app's exact supported launchers and one script argument."""
++    root = ntpath.normcase(ntpath.abspath(install_dir))
++    target = ntpath.normcase(ntpath.abspath(target))
++    argument = arguments.strip()
++    if argument.startswith('"') and argument.endswith('"'):
++        argument = argument[1:-1]
++    if '"' in argument:
++        return False
++    try:
++        argument_path = ntpath.normcase(ntpath.abspath(ntpath.join(root, argument))) if argument else ''
++        target_inside = ntpath.commonpath((root, target)) == root
++    except ValueError:
++        return False
++    name = ntpath.basename(target)
++    if target_inside and name in {'run.bat', 'telegramadminmanager.exe', 'telegram admin manager.exe'}:
++        return not argument
++    if target_inside and name in {'python.exe', 'pythonw.exe'}:
++        return argument_path == ntpath.join(root, 'telegram_admin_manager.py')
++    system_root = os.environ.get('SystemRoot', r'C:\Windows')
++    system_wscript = {
++        ntpath.normcase(ntpath.abspath(ntpath.join(system_root, directory, 'wscript.exe')))
++        for directory in ('System32', 'SysWOW64')
++    }
++    return target in system_wscript and argument_path == ntpath.join(root, 'telegramadminmanager.vbs')
++
++
++# Known folders handle redirected desktops; the profile fallback covers the
++# original installer location. Exactly three paths at most, with no recursion.
++_CANDIDATE_PS = r'''
++$taskName = 'Telegram Admin Manager.lnk'
++$taskFolders = @([Environment]::GetFolderPath('DesktopDirectory'), [Environment]::GetFolderPath('Programs'))
++if ($env:USERPROFILE) { $taskFolders += (Join-Path $env:USERPROFILE 'Desktop') }
++$taskPaths = @($taskFolders | Where-Object { $_ } | ForEach-Object { Join-Path $_ $taskName } | Select-Object -Unique)
++$taskShell = New-Object -ComObject WScript.Shell
++'''
++_DISCOVER_PS = _CANDIDATE_PS + r'''
++$taskRecords = @()
++foreach ($taskPath in $taskPaths) {
++    if (-not (Test-Path -LiteralPath $taskPath -PathType Leaf)) { continue }
++    try {
++        $taskLink = $taskShell.CreateShortcut($taskPath)
++        $taskRecords += @{Path=$taskPath; Target=$taskLink.TargetPath; Arguments=$taskLink.Arguments}
++    } catch { continue }
++}
++ConvertTo-Json -InputObject @($taskRecords) -Compress
++'''
++_UPDATE_PS = _CANDIDATE_PS + r'''
++$taskChanged = @()
++foreach ($taskRecord in $taskPayload.links) {
++    $taskPath = [string]$taskRecord.Path
++    if ($taskPaths -notcontains $taskPath) { continue }
++    if (-not (Test-Path -LiteralPath $taskPath -PathType Leaf)) { continue }
++    try {
++        $taskLink = $taskShell.CreateShortcut($taskPath)
++        if (-not [string]::Equals($taskLink.TargetPath, [string]$taskRecord.Target, [StringComparison]::OrdinalIgnoreCase)) { continue }
++        if (-not [string]::Equals($taskLink.Arguments, [string]$taskRecord.Arguments, [StringComparison]::Ordinal)) { continue }
++        $taskIcon = ([string]$taskPayload.icon) + ',0'
++        if ([string]::Equals($taskLink.IconLocation, $taskIcon, [StringComparison]::OrdinalIgnoreCase)) { continue }
++        $taskLink.IconLocation = $taskIcon
++        $taskLink.Save()
++        $taskChanged += $taskPath
++    } catch { continue }
++}
++ConvertTo-Json -InputObject @($taskChanged) -Compress
++'''
++
++
++def _run_powershell(script: str, payload: dict) -> list:
++    """Pass path data separately from code and keep background work bounded."""
++    encoded_payload = base64.b64encode(json.dumps(payload, ensure_ascii=True).encode('utf-8')).decode('ascii')
++    preamble = (
++        "$ErrorActionPreference = 'Stop'\n"
++        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
++        "$taskPayload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
++        + encoded_payload + "')) | ConvertFrom-Json\n"
++    )
++    encoded_script = base64.b64encode((preamble + script).encode('utf-16-le')).decode('ascii')
++    executable = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
++    result = subprocess.run(
++        [executable, '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded_script],
++        check=True, capture_output=True, encoding='utf-8-sig', timeout=15,
++        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
++    )
++    records = json.loads(result.stdout or '[]')
++    if not isinstance(records, list):
++        raise ValueError('Unexpected Windows shortcut response')
++    return records
++
++
++def update_app_shortcuts(icon_path: Path, install_dir: Path) -> tuple[Path, ...]:
++    """Update existing app shortcuts only; call from a background worker.
++
++    Existing target/arguments must identify this installation, and are checked
++    again immediately before Save. Unrelated links are never created or edited.
++    Failure to access Windows Shell is nonfatal to application startup.
++    """
++    if os.name != 'nt':
++        return ()
++    try:
++        records = _run_powershell(_DISCOVER_PS, {})
++        links = [record for record in records if isinstance(record, dict)
++                 and ntpath.basename(str(record.get('Path', ''))) == _SHORTCUT_NAME
++                 and _shortcut_matches_install(str(record.get('Target', '')), str(record.get('Arguments', '')), str(install_dir))]
++        if not links:
++            return ()
++        changed = _run_powershell(_UPDATE_PS, {'links': links, 'icon': str(icon_path)})
++        allowed = {str(record['Path']) for record in links}
++        return tuple(Path(path) for path in changed if isinstance(path, str) and path in allowed)
++    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
++        return ()

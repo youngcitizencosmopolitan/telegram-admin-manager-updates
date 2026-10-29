@@ -1,0 +1,11 @@
+--- a/app/tests/test_redesign_integration.py
++++ b/app/tests/test_redesign_integration.py
+@@ -20,7 +20,7 @@
+                            'SESSIONS_DIR':root/'sessions', 'THUMB_CACHE_DIR':root/'thumb_cache'}.items():
+             p = patch.object(main, name, path)
+             p.start(); self.addCleanup(p.stop)
+-        for name in ('_maybe_check_for_updates', 'refresh_group_names', '_refresh_group_catalog_ui', '_show_missing_dependency'):
++        for name in ('_maybe_check_for_updates', 'refresh_group_names', '_refresh_group_catalog_ui', '_show_missing_dependency', '_configure_app_icon'):
+             p = patch.object(main.TelegramAdminManager, name)
+             p.start(); self.addCleanup(p.stop)
+         scale = {'test_scaled_125_monitor_actions_fit': 96/72*1.25,

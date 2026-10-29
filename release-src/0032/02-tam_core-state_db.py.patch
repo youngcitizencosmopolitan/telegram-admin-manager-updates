@@ -1,0 +1,31 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -301,6 +301,28 @@
+                 "ON CONFLICT(peer_id) DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at",
+                 (peer_id, json.dumps(merged, ensure_ascii=False), time.time()),
+             )
++
++    def channels_inventory_snapshot(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
++        """Read inventory and its relationships together, without per-row queries."""
++        with self.session() as conn:
++            conn.execute('BEGIN')
++            tables = [conn.execute(sql).fetchall() for sql in (
++                'SELECT payload_json FROM channels ORDER BY peer_id',
++                'SELECT payload_json FROM channel_accounts ORDER BY peer_id, session',
++                'SELECT payload_json FROM account_restrictions ORDER BY session',
++            )]
++        decoded = []
++        for rows in tables:
++            items = []
++            for row in rows:
++                try:
++                    value = json.loads(row[0])
++                    if isinstance(value, dict):
++                        items.append(value)
++                except (ValueError, TypeError):
++                    continue
++            decoded.append(items)
++        return tuple(decoded)
+ 
+     def channels_all(self) -> list[dict[str, Any]]:
+         out: list[dict[str, Any]] = []

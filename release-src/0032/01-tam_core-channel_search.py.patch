@@ -1,0 +1,44 @@
+--- /dev/null
++++ b/app/tam_core/channel_search.py
+@@ -0,0 +1,41 @@
++"""Build a searchable local inventory without touching Tk or Telegram."""
++from collections import defaultdict
++import time
++
++
++def build_channel_inventory(channels, relations, restrictions, labels):
++    by_peer = defaultdict(list)
++    for relation in relations:
++        by_peer[str(relation.get('peer_id', ''))].append(relation)
++    by_session = {str(row.get('session', '')): row for row in restrictions}
++    inventory = {}
++    for row in channels:
++        try:
++            peer_id = int(row.get('peer_id', 0) or 0)
++        except (ValueError, TypeError):
++            continue
++        if not peer_id:
++            continue
++        key = str(peer_id)
++        roles = {'owner': [], 'admin': [], 'member': []}
++        problem = bool(row.get('error') or str(row.get('status', 'ok') or 'ok') not in {'ok', ''})
++        for relation in by_peer[key]:
++            session = str(relation.get('session', ''))
++            role = str(relation.get('relation', 'unknown'))
++            if role in roles:
++                roles[role].append(labels.get(session, session))
++            problem |= (role == 'unknown' or bool(relation.get('last_error'))
++                        or by_session.get(session, {}).get('status') == 'restricted')
++        try:
++            stamp = float(row.get('last_refreshed_at', 0) or 0)
++            refreshed = time.strftime('%d.%m.%Y %H:%M', time.localtime(stamp)) if stamp > 0 else '—'
++        except (ValueError, TypeError, OverflowError, OSError):
++            refreshed = '—'
++        inventory[key] = {
++            'search': ' '.join(str(row.get(k, '')) for k in ('title', 'link', 'peer_id')).casefold(),
++            'owner': bool(roles['owner']), 'admin': bool(roles['owner'] or roles['admin']), 'problem': problem,
++            'values': (row.get('title', ''), row.get('link') or row.get('link_status') or '—',
++                       row.get('peer_type', ''), peer_id, ', '.join(roles['owner']), ', '.join(roles['admin']),
++                       ', '.join(roles['member']), '⚠ Проблема' if problem else 'OK', refreshed),
++        }
++    return inventory, dict(by_peer), by_session
