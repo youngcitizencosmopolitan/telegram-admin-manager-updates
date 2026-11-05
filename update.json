@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0032",
-  "display_version": "0032",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0032/TelegramAdminManager_v0032_update.zip",
-  "sha256": "ae8de2695f0f793bc8c551375eb9af4590b6283bdaae6e5000c2afe385e66ef3",
-  "notes": "0032: add a generated multi-resolution app icon to the window and existing verified desktop/Start Menu shortcuts. Build the local Channels/Groups inventory off the UI thread with one consistent bulk snapshot instead of per-group and per-account database queries. Search and role/problem filters use a debounced in-memory index without SQLite or Telegram requests. Update rows in bounded batches, retain matching selections and sorting, cancel superseded paints and discard stale loads. Group detail roles also use the same local snapshot. Existing authorization, admin automation, monitoring and upload history are preserved."
+  "version": "4.3.8.0033",
+  "display_version": "0033",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0033/TelegramAdminManager_v0033_update.zip",
+  "sha256": "0a13da39b620a23d576f1cd2a895a1052c0f82ea2fc940641f33b4cdac1c9572",
+  "notes": "0033: persist upload prepublication phase and automatically reclaim interrupted preparation and video transfer claims on restart. Fence publication by exact claim token before sending. Preserve current claims, confirmed history, legacy unknown results and ambiguous publications; those still require review to avoid duplicate posts."
 }
