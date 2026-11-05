@@ -1,0 +1,67 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -10,7 +10,7 @@
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 12
++SCHEMA_VERSION = 13
+ 
+ 
+ class StateDatabase:
+@@ -253,6 +253,9 @@
+                 CREATE INDEX IF NOT EXISTS idx_events_category ON events(category, created_at);
+                 """
+             )
++            columns = {row[1] for row in conn.execute('PRAGMA table_info(upload_reservations)')}
++            if 'prepublication' not in columns:
++                conn.execute('ALTER TABLE upload_reservations ADD COLUMN prepublication INTEGER NOT NULL DEFAULT 0')
+             conn.execute(
+                 "INSERT INTO meta(key, value_json) VALUES('schema_version', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+@@ -849,6 +852,7 @@
+         path: str,
+         run_token: str,
+         claim_token: str,
++        prepublication: bool = False,
+     ) -> str:
+         """Atomically claim one target+fingerprint for upload.
+ 
+@@ -865,19 +869,32 @@
+             if done is not None:
+                 return "completed"
+             existing = conn.execute(
+-                "SELECT run_token FROM upload_reservations WHERE target_key=? AND fingerprint=? LIMIT 1",
++                "SELECT run_token, prepublication FROM upload_reservations WHERE target_key=? AND fingerprint=? LIMIT 1",
+                 (target_key, fingerprint),
+             ).fetchone()
+             if existing is not None:
+-                return "in_progress" if str(existing[0]) == str(run_token) else "stale"
++                if str(existing[0]) == str(run_token):
++                    return 'in_progress'
++                if not existing[1]:
++                    return 'stale'
++                conn.execute('DELETE FROM upload_reservations WHERE target_key=? AND fingerprint=?',
++                             (target_key, fingerprint))
+             conn.execute(
+                 """
+-                INSERT INTO upload_reservations(target_key, fingerprint, path, run_token, claim_token, reserved_at)
+-                VALUES (?, ?, ?, ?, ?, ?)
++                INSERT INTO upload_reservations(target_key, fingerprint, path, run_token, claim_token, reserved_at, prepublication)
++                VALUES (?, ?, ?, ?, ?, ?, ?)
+                 """,
+-                (target_key, fingerprint, path, run_token, claim_token, time.time()),
++                (target_key, fingerprint, path, run_token, claim_token, time.time(), int(prepublication)),
+             )
+             return "reserved"
++
++    def upload_mark_publishing(self, target_key: str, fingerprint: str, claim_token: str) -> bool:
++        """Commit uncertainty before the network operation; fence displaced workers."""
++        with self.session() as conn:
++            cur = conn.execute('UPDATE upload_reservations SET prepublication=0 '
++                'WHERE target_key=? AND fingerprint=? AND claim_token=?',
++                (target_key, fingerprint, claim_token))
++            return cur.rowcount == 1
+ 
+     def upload_release_fingerprint_reservation(self, target_key: str, fingerprint: str, claim_token: str) -> bool:
+         with self.session() as conn:
