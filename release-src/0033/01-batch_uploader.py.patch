@@ -1,0 +1,59 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -574,7 +574,8 @@
+ 
+     def _claim_upload_fingerprint(self, fingerprint: str, target_key: str, path: Path) -> tuple[str, str]:
+         claim_token = uuid.uuid4().hex
+-        status = self.app.upload_history.claim_fingerprint(
++        claim = getattr(self.app.upload_history, 'claim_prepublication', None) or self.app.upload_history.claim_fingerprint
++        status = claim(
+             fingerprint,
+             target_key,
+             path,
+@@ -5158,6 +5159,7 @@
+                         max_transient_retries = int(policy.get("upload_retries", 3) or 0)
+                         retry_base_delay = float(policy.get("retry_base_delay", 5) or 5)
+                         while True:
++                            publication_started = False
+                             try:
+                                 if not await self._wait_gate(tid):
+                                     release_reservation()
+@@ -5230,8 +5232,18 @@
+                                     if media_kind == 'video':
+                                         transfer['speed'] = 0.0
+                                         self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, 'Видео • публикация')
++                                    async def marked_send():
++                                        nonlocal publication_started
++                                        marker = getattr(self.app.upload_history, 'mark_publishing', None)
++                                        if marker is not None:
++                                            owned = await asyncio.to_thread(marker, dedup_fingerprint,
++                                                history_key, reservation_claim_token)
++                                            if not owned:
++                                                raise BatchUploadStopped()
++                                            publication_started = True
++                                        return await bounded_action(send)
+                                     return await _publish_with_min_gap(self._publication_state, session, delay,
+-                                        lambda: bounded_action(send), lambda: self._wait_gate(tid), self._sleep_stop)
++                                        marked_send, lambda: self._wait_gate(tid), self._sleep_stop)
+ 
+                                 if media_kind == 'video' or safe_parts_retry_used:
+                                     message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs,
+@@ -5396,6 +5408,18 @@
+                                         f"{friendly}"
+                                     )
+ 
++                                rejected = (errors is not None and isinstance(exc, errors.RPCError)
++                                            and int(getattr(exc, 'code', 500)) in {400, 401, 403, 404})
++                                if publication_started and not rejected:
++                                    state['blocked'] += 1
++                                    self._remember_unconfirmed(task, path, True)
++                                    self.app.log(f'{name}: {path.name}: результат публикации не подтверждён; '
++                                                 'резерв сохранён для проверки, автоматическая повторная публикация остановлена.')
++                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0,
++                                                                '⚠ Требуется проверка результата отправки')
++                                    self._emit_task_metrics(tid, force=True)
++                                    break
++
+                                 h = health(session)
+                                 h["errors"] = int(h.get("errors", 0)) + 1
+                                 if policy["enabled"] and self.app._is_api_credential_error(exc):
