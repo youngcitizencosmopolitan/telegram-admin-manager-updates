@@ -1,0 +1,85 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0036"
++APP_VERSION = "0037"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -436,6 +436,10 @@
+         self._log_text_widgets: list[tk.Text] = []
+         self._tree_sort_controllers: list[TreeviewSortController] = []
+         self.log_autoscroll_var = tk.BooleanVar(value=True)
++        self._verbose_journal = bool(self.store.data.get('verbose_journal', False))
++        self.verbose_journal_var = tk.BooleanVar(value=self._verbose_journal)
++        from tam_core.journal_policy import JournalPolicy
++        self._journal_policy = JournalPolicy()
+         self._build_ui()
+         self._install_keyboard_shortcuts()
+         self._load_config_into_ui()
+@@ -1624,6 +1628,8 @@
+         ttk.Checkbutton(tools, text="Авто", variable=self.log_autoscroll_var).grid(row=0, column=1, padx=4)
+         ttk.Button(tools, text="Ошибки", command=self._open_upload_error_log).grid(row=0, column=2, padx=4)
+         ttk.Button(tools, text="Очистить", command=self._clear_visible_log).grid(row=0, column=3)
++        ttk.Checkbutton(tools, text='Подробный журнал', variable=self.verbose_journal_var,
++            command=self._save_log_verbosity).grid(row=1, column=0, columnspan=4, sticky='w', pady=(4, 0))
+         text = tk.Text(parent, wrap="word", state="disabled", font=("Consolas", 9), padx=7, pady=7)
+         text.grid(row=1, column=0, sticky="nsew")
+         sb = ttk.Scrollbar(parent, orient="vertical", command=text.yview)
+@@ -4870,13 +4876,27 @@
+         except Exception:
+             pass
+ 
++        policy = self.__dict__.get('_journal_policy')
++        if policy is None:
++            from tam_core.journal_policy import JournalPolicy
++            policy = self._journal_policy = JournalPolicy()
++        visible_msg = policy.render(msg, verbose=self.__dict__.get('_verbose_journal', False))
++        if visible_msg is None:
++            return
++        line = f'[{stamp}] {visible_msg}'
++
+         def append() -> None:
+             widgets = list(getattr(self, "_log_text_widgets", []))
+-            tag = TelegramAdminManager._log_message_tag(msg)
++            tag = TelegramAdminManager._log_message_tag(visible_msg)
+             self._visible_log_lines += line.count("\n") + 1
+             trim_lines = self._visible_log_lines - 2000 if self._visible_log_lines > 2500 else 0
+             for text in widgets:
+                 try:
++                    follow = bool(self.log_autoscroll_var.get())
++                    try:
++                        follow = follow and float(text.yview()[1]) >= .995
++                    except (AttributeError, TypeError, IndexError):
++                        pass
+                     text.configure(state="normal")
+                     if tag:
+                         text.insert(tk.END, line + "\n", tag)
+@@ -4884,7 +4904,7 @@
+                         text.insert(tk.END, line + "\n")
+                     if trim_lines:
+                         text.delete("1.0", f"{trim_lines + 1}.0")
+-                    if self.log_autoscroll_var.get():
++                    if follow:
+                         text.see(tk.END)
+                     text.configure(state="disabled")
+                 except Exception:
+@@ -4892,6 +4912,15 @@
+             self._visible_log_lines -= trim_lines
+ 
+         self.ui_call(append)
++
++    def _save_log_verbosity(self) -> None:
++        self._verbose_journal = bool(self.verbose_journal_var.get())
++        self.store.data['verbose_journal'] = self._verbose_journal
++        try:
++            self.store.save()
++        except Exception:
++            self.log('Не удалось сохранить режим журнала.')
++        self.log('Журнал: подробный режим включён.' if self._verbose_journal else 'Журнал: обычный режим включён; служебные повторы скрыты.')
+ 
+     def _write_log(self, text: str) -> None:
+         try:

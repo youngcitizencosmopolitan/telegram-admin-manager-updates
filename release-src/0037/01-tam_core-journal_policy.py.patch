@@ -1,0 +1,84 @@
+--- /dev/null
++++ b/app/tam_core/journal_policy.py
+@@ -0,0 +1,81 @@
++"""Pure presentation policy for the visible journal; never filters disk logs.
++
++Only the exact routine formats emitted by batch_uploader are quieted. All
++unrecognised messages pass through, including warnings and upload failures.
++"""
++
++from collections import OrderedDict
++from dataclasses import dataclass
++import re
++import threading
++import time
++
++
++_CONNECTION = re.compile(
++    r'Пакет: (?:hot-add )?(.+?) (подключён|не подключён|недоступен) — ([^\r\n]*)'
++)
++_ROUTINE = (
++    # batch_uploader: per-file start and successful publication.
++    re.compile(r'[^\r\n]+: [^\r\n]+ → [^\r\n]+: (?:начинаю|✅)'),
++    # batch_uploader: cached administrator and forum-topic preparation.
++    re.compile(r'Пакет: [^\r\n]+: 🧠 кэш — \d+ аккаунт\(а/ов\) уже известны как админы; повторное назначение пропускаю\.'),
++    re.compile(r'[^\r\n]+: 🧠 кэш тем — все \d+ локальных тем уже известны; повторный запрос списка тем пропускаю\.'),
++)
++
++
++@dataclass
++class _ConnectionState:
++    status: str
++    detail: str
++    shown_at: float
++    suppressed: int = 0
++
++
++class JournalPolicy:
++    """Thread-safe bounded journal state, independent of upload/retry state.
++
++    ``now`` is a monotonic timestamp supplied for deterministic callers/tests.
++    The five-minute interval is measured from the last displayed failure, not
++    from its latest retry; no events are queued for later display.
++    """
++
++    def __init__(self):
++        self._accounts: OrderedDict[str, _ConnectionState] = OrderedDict()
++        self._lock = threading.Lock()
++
++    def render(self, message: str, *, verbose=False, now: float | None = None) -> str | None:
++        connection = _CONNECTION.fullmatch(message)
++        if connection is None:
++            if not verbose and any(pattern.fullmatch(message) for pattern in _ROUTINE):
++                return None
++            return message
++
++        account, status, detail = connection.groups()
++        # Batch setup and hot-add use different words for the same failure.
++        if status != 'подключён':
++            status = 'не подключён'
++        with self._lock:
++            instant = time.monotonic() if now is None else now
++            previous = self._accounts.get(account)
++            connected = status == 'подключён'
++            if connected:
++                result = message if verbose or (previous is not None and previous.status != 'подключён') else None
++                state = _ConnectionState(status, detail, instant)
++            elif previous is None or (previous.status, previous.detail) != (status, detail):
++                result = message
++                state = _ConnectionState(status, detail, instant)
++            elif verbose:
++                result = message
++                state = _ConnectionState(status, detail, instant)
++            elif instant - previous.shown_at >= 300:
++                result = message + f' (повторяется; скрыто повторов: {previous.suppressed})'
++                state = _ConnectionState(status, detail, instant)
++            else:
++                previous.suppressed += 1
++                state = previous
++                result = None
++            self._accounts[account] = state
++            self._accounts.move_to_end(account)
++            if len(self._accounts) > 512:
++                self._accounts.popitem(last=False)
++            return result

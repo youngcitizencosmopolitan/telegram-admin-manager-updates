@@ -1,15 +1,13 @@
 {
-  "version": "0036",
-  "base_version": "0035",
-  "manifest_version": "4.3.8.0036",
-  "display_version": "0036",
+  "version": "0037",
+  "base_version": "0036",
+  "manifest_version": "4.3.8.0037",
+  "display_version": "0037",
   "patch_files": [
-    "release-src/0036/01-tam_core-proxies.py.patch",
-    "release-src/0036/02-tam_ui-proxy_manager.py.patch",
-    "release-src/0036/03-telegram_admin_manager.py.patch",
-    "release-src/0036/04-tests-test_mtproto_proxies.py.patch",
-    "release-src/0036/05-tests-test_mtproto_proxy_ui.py.patch",
-    "release-src/0036/06-tests-test_proxy_client_routing.py.patch"
+    "release-src/0037/01-tam_core-journal_policy.py.patch",
+    "release-src/0037/02-telegram_admin_manager.py.patch",
+    "release-src/0037/03-tests-test_journal_policy.py.patch",
+    "release-src/0037/04-tests-test_quiet_journal_integration.py.patch"
   ],
-  "notes": "0036: add per-account MTProto proxies alongside SOCKS5 using Telethon RandomizedIntermediate. Encrypt secrets with Windows DPAPI, preserve existing assignments and sessions, import MTProto links or HOST:PORT:SECRET atomically with SOCKS5 lines. Accept standard32hex anddd secrets, reject unsupported FakeTLS. Separate masked MTProto editor and protocol labels; TCP reachability checks explicitly do not confirm MTProto authentication. Preserve fail-closed routing and existing upload diagnostics and controls."
+  "notes": "0037: quiet the visible journal by default, retaining original full disk and event logs. Hide known routine upload/cache/successful connection chatter; show first/changed connection failures and recovery, summarize identical repeated failures at most once per five minutes with bounded thread-safe state. Add a persistent detailed-journal checkbox. Stop forcing readers to the bottom when new messages arrive; auto-follow continues when already at the end. Upload, connection retry and scan behavior are unchanged."
 }
