@@ -1,0 +1,56 @@
+--- /dev/null
++++ b/app/tests/test_quiet_journal_integration.py
+@@ -0,0 +1,53 @@
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import telegram_admin_manager as main
++
++
++class QuietJournalTests(unittest.TestCase):
++    def app(self, at_bottom=True):
++        app = main.TelegramAdminManager.__new__(main.TelegramAdminManager)
++        app._visible_log_lines = 0
++        app._write_log = Mock()
++        app.state_db = SimpleNamespace(record_event=Mock())
++        app._verbose_journal = False
++        app._journal_policy = SimpleNamespace(render=Mock(side_effect=lambda msg,**kw:msg))
++        app.log_autoscroll_var = SimpleNamespace(get=lambda:True)
++        text = Mock()
++        text.yview.return_value = (0, 1 if at_bottom else .5)
++        app._log_text_widgets = [text]
++        app.ui_call = Mock()
++        return app, text
++
++    def test_suppressed_visible_message_still_reaches_full_disk_log(self):
++        app, text = self.app()
++        app._journal_policy.render.return_value = None
++        app._journal_policy.render.side_effect = None
++        app.log('Пакет: account подключён — обычный')
++        app._write_log.assert_called_once()
++        app.state_db.record_event.assert_called_once()
++        app.ui_call.assert_not_called()
++
++    def test_incoming_message_does_not_pull_reader_to_bottom(self):
++        app, text = self.app(at_bottom=False)
++        app.log('Ошибка подключения')
++        app.ui_call.call_args.args[0]()
++        text.insert.assert_called_once()
++        text.see.assert_not_called()
++
++    def test_auto_follow_continues_when_reader_is_at_bottom(self):
++        app, text = self.app()
++        app.log('Ошибка подключения')
++        app.ui_call.call_args.args[0]()
++        text.see.assert_called_once()
++
++    def test_verbose_setting_persists_and_updates_plain_worker_flag(self):
++        app, text = self.app()
++        app.verbose_journal_var = SimpleNamespace(get=lambda:True)
++        app.store = SimpleNamespace(data={},save=Mock())
++        app.log = Mock()
++        app._save_log_verbosity()
++        self.assertTrue(app._verbose_journal)
++        self.assertTrue(app.store.data['verbose_journal'])
++        app.store.save.assert_called_once()

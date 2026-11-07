@@ -1,0 +1,135 @@
+--- /dev/null
++++ b/app/tests/test_journal_policy.py
+@@ -0,0 +1,132 @@
++import unittest
++from concurrent.futures import ThreadPoolExecutor
++from unittest.mock import patch
++
++from tam_core.journal_policy import JournalPolicy
++
++
++class JournalPolicyTests(unittest.TestCase):
++    def test_only_known_routine_formats_are_hidden(self):
++        policy = JournalPolicy()
++        for message in (
++            'Правило: account → film.mp4: начинаю',
++            'Правило: account → film.mp4: ✅',
++            'Пакет: target: 🧠 кэш — 2 аккаунт(а/ов) уже известны как админы; повторное назначение пропускаю.',
++            'Правило: 🧠 кэш тем — все 3 локальных тем уже известны; повторный запрос списка тем пропускаю.',
++        ):
++            self.assertIsNone(policy.render(message), message)
++            self.assertEqual(policy.render(message, verbose=True), message)
++
++    def test_warnings_and_useful_summaries_are_unchanged(self):
++        policy = JournalPolicy()
++        for message in (
++            'Правило: account → начинаю ✅ кэш.mp4: ❌ FloodWait: 20',
++            'Правило: account → кэш тем.mp4: ❌ proxy connection failed',
++            'Правило: начинаю.mp4: ошибка подготовки — AUTH_KEY_UNREGISTERED',
++            'Пакет: 🛑 аварийная остановка — ошибка API ID/Hash: invalid',
++            'Правило: доступно 3 аккаунтов, Premium 2, автоадмин ON.',
++            'Очередь: ▶ Правило; параллельный лимит 4.',
++            '⚠ ошибка: film: начинаю',
++            'Правило: account → film.mp4: ✅ ошибка',
++            'Пакет: a не подключён — auth error\ntraceback',
++        ):
++            self.assertEqual(policy.render(message), message)
++
++    def test_interleaved_accounts_fail_independently_and_recover(self):
++        policy = JournalPolicy()
++        a = 'Пакет: a недоступен — timeout'
++        b = 'Пакет: b не подключён — proxy refused'
++        self.assertIsNone(policy.render('Пакет: a подключён — Premium', now=0))
++        self.assertEqual(policy.render(a, now=1), a)
++        self.assertEqual(policy.render(b, now=2), b)
++        self.assertIsNone(policy.render(a, now=3))
++        self.assertEqual(policy.render('Пакет: a подключён — Premium', now=4),
++                         'Пакет: a подключён — Premium')
++        self.assertIsNone(policy.render('Пакет: a подключён — Premium', now=5))
++        self.assertIsNone(policy.render(b, now=6))
++        self.assertEqual(policy.render(a, now=7), a)
++
++    def test_exact_error_changes_are_visible_and_hot_add_shares_account(self):
++        policy = JournalPolicy()
++        first = 'Пакет: a не подключён — AUTH_KEY_UNREGISTERED'
++        changed = 'Пакет: a не подключён — SESSION_REVOKED'
++        self.assertEqual(policy.render(first, now=0), first)
++        self.assertIsNone(policy.render(first, now=1))
++        self.assertEqual(policy.render(changed, now=2), changed)
++        self.assertIsNone(policy.render('Пакет: hot-add a не подключён — SESSION_REVOKED', now=3))
++        recovered = 'Пакет: hot-add a подключён — обычный'
++        self.assertEqual(policy.render(recovered, now=4), recovered)
++        self.assertIsNone(policy.render('Пакет: a подключён — обычный', now=5))
++
++    def test_batch_and_hot_add_failure_wording_share_the_same_failed_state(self):
++        policy = JournalPolicy()
++        batch = 'Пакет: a недоступен — timeout'
++        hot_add = 'Пакет: hot-add a не подключён — timeout'
++        self.assertEqual(policy.render(batch, now=0), batch)
++        self.assertIsNone(policy.render(hot_add, now=1))
++        self.assertIsNone(policy.render(batch, now=2))
++        self.assertEqual(policy.render(hot_add, now=300),
++                         hot_add + ' (повторяется; скрыто повторов: 2)')
++        self.assertEqual(policy.render('Пакет: a подключён — Premium', now=301),
++                         'Пакет: a подключён — Premium')
++
++    def test_repeated_failures_use_fixed_interval_and_reset_suppressed_count(self):
++        policy = JournalPolicy()
++        message = 'Пакет: a недоступен — timeout'
++        self.assertEqual(policy.render(message, now=10), message)
++        for instant in (11, 100, 309.9):
++            self.assertIsNone(policy.render(message, now=instant))
++        self.assertEqual(policy.render(message, now=310),
++                         message + ' (повторяется; скрыто повторов: 3)')
++        self.assertIsNone(policy.render(message, now=400))
++        self.assertEqual(policy.render(message, now=610),
++                         message + ' (повторяется; скрыто повторов: 1)')
++
++    def test_verbose_returns_original_and_keeps_connection_state_current(self):
++        policy = JournalPolicy()
++        failed = 'Пакет: a недоступен — timeout'
++        connected = 'Пакет: a подключён — Premium'
++        self.assertEqual(policy.render(failed, verbose=True, now=0), failed)
++        self.assertIsNone(policy.render(failed, now=1))
++        self.assertEqual(policy.render(connected, now=2), connected)
++        self.assertEqual(policy.render(failed, verbose=True, now=3), failed)
++        self.assertEqual(policy.render(failed, verbose=True, now=4), failed)
++        self.assertIsNone(policy.render(failed, now=5))
++        self.assertEqual(policy.render(connected, verbose=True, now=6), connected)
++        self.assertIsNone(policy.render(connected, now=7))
++
++    def test_default_clock_is_monotonic_and_backward_time_does_not_trigger_repeat(self):
++        policy = JournalPolicy()
++        message = 'Пакет: a недоступен — timeout'
++        with patch('tam_core.journal_policy.time.monotonic', side_effect=[100, 399, 400]):
++            self.assertEqual(policy.render(message), message)
++            self.assertIsNone(policy.render(message))
++            self.assertEqual(policy.render(message), message + ' (повторяется; скрыто повторов: 1)')
++        self.assertIsNone(policy.render(message, now=20))
++        self.assertIsNone(policy.render(message, now=699))
++
++    def test_account_memory_evicts_oldest_and_retains_recent_accounts(self):
++        policy = JournalPolicy()
++        oldest = 'Пакет: oldest недоступен — timeout'
++        recent = 'Пакет: recent недоступен — timeout'
++        policy.render(oldest, now=0)
++        policy.render(recent, now=0)
++        for i in range(511):
++            policy.render(recent, now=1)
++            policy.render(f'Пакет: account{i} недоступен — timeout', now=1)
++        self.assertIsNone(policy.render(recent, now=2))
++        self.assertEqual(policy.render(oldest, now=2), oldest)
++
++    def test_concurrent_duplicate_failures_emit_first_only(self):
++        policy = JournalPolicy()
++        message = 'Пакет: a недоступен — timeout'
++        with ThreadPoolExecutor(max_workers=8) as executor:
++            results = list(executor.map(lambda _: policy.render(message, now=0), range(200)))
++        self.assertEqual(results.count(message), 1)
++        self.assertEqual(results.count(None), 199)
++        self.assertEqual(policy.render(message, now=300),
++                         message + ' (повторяется; скрыто повторов: 199)')
++
++
++if __name__ == '__main__':
++    unittest.main()
