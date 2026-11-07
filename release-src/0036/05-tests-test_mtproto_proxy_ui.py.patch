@@ -1,0 +1,125 @@
+--- /dev/null
++++ b/app/tests/test_mtproto_proxy_ui.py
+@@ -0,0 +1,122 @@
++import queue
++import tkinter as tk
++from tkinter import ttk
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_ui.proxy_manager import ProxyPane
++
++
++class MTManager:
++    def __init__(self):
++        self.records = [{'id': 'mt', 'host': 'mt.example', 'port': 443, 'protocol': 'mtproto'},
++                        {'id': 'socks', 'host': 'socks.example', 'port': 1080}]
++        self.calls = []
++    def list_proxies(self): return self.records
++    def route_label(self, session): return 'MTProto mt.example:443'
++    def add_mtproto(self, **data): self.calls.append(('add', data))
++    def update_mtproto(self, proxy_id, **data): self.calls.append(('update', proxy_id, data))
++    def check(self, *args, **kwargs): return {'ok': True, 'scope': 'tcp', 'latency_ms': 8.4, 'error': ''}
++    def import_lines(self, text): self.calls.append(('import', text))
++
++
++class MTProtoProxyUITests(unittest.TestCase):
++    def setUp(self):
++        error_dialog = patch('tam_ui.proxy_manager.messagebox.showerror')
++        self.error_dialog = error_dialog.start()
++        self.addCleanup(error_dialog.stop)
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            if 'display' in str(exc).lower():
++                self.skipTest(f'Tk display is unavailable: {exc}')
++            raise
++        self.root.withdraw()
++        self.manager = MTManager()
++        self.callbacks = queue.Queue()
++        self.allowed = True
++        self.app = SimpleNamespace(proxy_manager=self.manager,
++            store=SimpleNamespace(accounts=lambda: []),
++            _proxy_changes_allowed=lambda: self.allowed, ui_call=self.callbacks.put)
++        self.pane = ProxyPane(self.root, self.app)
++    def tearDown(self): self.root.destroy()
++    def dialog(self):
++        return next(child for child in self.pane.winfo_children() if isinstance(child, tk.Toplevel))
++    def entries(self, dialog): return [child for child in dialog.winfo_children() if isinstance(child, ttk.Entry)]
++    def save(self, dialog):
++        next(child for child in dialog.winfo_children() if isinstance(child, ttk.Button) and child.cget('text') == 'Сохранить').invoke()
++    def test_protocol_is_visible_without_revealing_secret(self):
++        self.manager.records[0]['secret'] = 'private-secret'
++        self.pane.refresh()
++        self.assertIn('MTProto', str(self.pane.proxy_tree.item('mt', 'values')))
++        self.assertIn('SOCKS5', str(self.pane.proxy_tree.item('socks', 'values')))
++        self.assertNotIn('private-secret', str(self.pane.proxy_tree.item('mt')))
++    def test_add_mtproto_submits_masked_secret_to_separate_api(self):
++        self.pane.add_mtproto()
++        dialog = self.dialog()
++        entries = self.entries(dialog)
++        self.assertEqual(len(entries), 3)
++        self.assertEqual(entries[-1].cget('show'), '*')
++        for entry, value in zip(entries, ['new.example', '443', 'a' * 32]): entry.insert(0, value)
++        self.save(dialog)
++        self.assertEqual(self.manager.calls, [('add', {'host': 'new.example', 'port': '443', 'secret': 'a' * 32})])
++    def test_edit_routes_mtproto_and_keeps_secret_without_prefilling(self):
++        self.manager.records[0]['secret'] = 'private-secret'
++        self.pane.refresh()
++        self.pane.proxy_tree.selection_set('mt')
++        self.pane.edit_selected()
++        dialog = self.dialog()
++        self.assertEqual([entry.get() for entry in self.entries(dialog)], ['mt.example', '443', ''])
++        self.assertEqual(self.entries(dialog)[-1].cget('show'), '*')
++        self.save(dialog)
++        self.assertEqual(self.manager.calls[-1], ('update', 'mt', {'host': 'mt.example', 'port': '443', 'secret': '', 'keep_credentials': True}))
++    def test_replacement_secret_disables_keep_credentials(self):
++        self.pane.proxy_tree.selection_set('mt')
++        self.pane.edit_selected()
++        dialog = self.dialog()
++        self.entries(dialog)[-1].insert(0, 'b' * 32)
++        self.save(dialog)
++        self.assertFalse(self.manager.calls[-1][2]['keep_credentials'])
++    def test_busy_change_blocks_mtproto_save(self):
++        self.pane.add_mtproto()
++        dialog = self.dialog()
++        self.allowed = False
++        with patch('tam_ui.proxy_manager.messagebox.showwarning'):
++            self.save(dialog)
++        self.assertEqual(self.manager.calls, [])
++        self.assertTrue(dialog.winfo_exists())
++    def test_busy_guard_prevents_opening_mtproto_dialog(self):
++        self.allowed = False
++        with patch('tam_ui.proxy_manager.messagebox.showwarning'):
++            self.pane.add_mtproto()
++        self.assertFalse(any(isinstance(child, tk.Toplevel) for child in self.pane.winfo_children()))
++    def test_unexpected_mtproto_error_never_discloses_secret(self):
++        def broken(**data):
++            raise RuntimeError('private-secret-in-exception')
++        self.manager.add_mtproto = broken
++        self.pane.add_mtproto()
++        dialog = self.dialog()
++        self.entries(dialog)[-1].insert(0, 'private-secret-in-entry')
++        self.save(dialog)
++        self.error_dialog.assert_called_once()
++        self.assertNotIn('private-secret', str(self.error_dialog.call_args))
++        self.assertTrue(dialog.winfo_exists())
++    def test_tcp_probe_does_not_claim_mtproto_confirmation(self):
++        self.pane.proxy_tree.selection_set('mt')
++        self.pane.check_selected()
++        self.callbacks.get(timeout=3)()
++        status = self.pane.proxy_tree.set('mt', 'status')
++        self.assertIn('TCP доступен', status)
++        self.assertIn('MTProto не подтверждён', status)
++        self.assertIn('8.4', status)
++    def test_mixed_import_passes_links_and_legacy_format_together(self):
++        self.pane.import_proxies()
++        dialog = self.dialog()
++        body = next(child for child in dialog.winfo_children() if isinstance(child, tk.Text))
++        text = 'tg://proxy?server=one&port=443&secret=' + 'a' * 32 + '\nold:1080:user:password'
++        body.insert('1.0', text)
++        next(child for child in dialog.winfo_children() if isinstance(child, ttk.Button) and child.cget('text') == 'Импортировать').invoke()
++        self.assertEqual(self.manager.calls, [('import', text)])
++
++if __name__ == '__main__': unittest.main()

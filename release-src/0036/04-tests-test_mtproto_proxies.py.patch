@@ -1,0 +1,135 @@
+--- /dev/null
++++ b/app/tests/test_mtproto_proxies.py
+@@ -0,0 +1,132 @@
++import copy
++import importlib.util
++import json
++import unittest
++from unittest.mock import patch
++
++from tam_core.proxies import ProxyError, ProxyManager
++
++
++class Protector:
++    def protect(self, value): return bytes(x ^ 173 for x in value)
++    def unprotect(self, value): return bytes(x ^ 173 for x in value)
++
++
++class Store:
++    def __init__(self): self.data, self.fail = {}, False
++    def save(self):
++        if self.fail: raise OSError('private secret details')
++
++
++class MTProtoProxyTests(unittest.TestCase):
++    secret = '0123456789abcdef0123456789abcdef'
++
++    def setUp(self):
++        self.store = Store()
++        self.manager = ProxyManager(self.store, protector=Protector())
++
++    @unittest.skipUnless(importlib.util.find_spec('telethon'), 'Telethon integration dependency unavailable')
++    def test_mtproto_encrypted_options_and_telethon_boundary_secrets(self):
++        from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
++        from telethon.network.connection.tcpmtproxy import MTProxyIO
++        for secret in (self.secret, 'dd' + self.secret, 'dd' + self.secret[2:], 'ee' + self.secret[2:]):
++            with self.subTest(secret=secret):
++                ident = self.manager.add_mtproto('proxy.example', 443, secret)
++                self.manager.assign('a', ident)
++                options = self.manager.options('a')
++                self.assertIs(options['connection'], ConnectionTcpMTProxyRandomizedIntermediate)
++                self.assertEqual(options['proxy'][:2], ('proxy.example', 443))
++                normalized = ConnectionTcpMTProxyRandomizedIntermediate.normalize_secret(options['proxy'][2])
++                self.assertEqual(normalized, bytes.fromhex(secret[-32:]))
++                header, encryptor, decryptor = MTProxyIO.init_header(
++                    normalized, 2, ConnectionTcpMTProxyRandomizedIntermediate.packet_codec)
++                self.assertEqual(len(header), 64)
++                self.assertIsNotNone(encryptor)
++                self.assertIsNotNone(decryptor)
++                self.assertNotIn(secret, json.dumps(self.store.data))
++                self.assertEqual(self.manager.list_proxies()[-1], {
++                    'id': ident, 'host': 'proxy.example', 'port': 443, 'protocol': 'mtproto'})
++
++    def test_rejects_unsupported_secrets_without_exposing_them(self):
++        for secret in ('ee' + self.secret, 'ee' + self.secret + '6578616d706c652e636f6d',
++                       'base64-secret', self.secret[:-1], self.secret + '00', '', ' ' + self.secret):
++            with self.subTest(secret=secret):
++                with self.assertRaises(ProxyError) as caught:
++                    self.manager.add_mtproto('proxy.example', 443, secret)
++                if secret:
++                    self.assertNotIn(secret, str(caught.exception))
++        self.assertEqual(self.store.data, {})
++
++    def test_mixed_import_urls_and_atomic_validation(self):
++        ids = self.manager.import_lines('\n'.join([
++            '127.0.0.1:1080', 'proxy.example:1080:user:pass:word',
++            'proxy.example:443:' + self.secret,
++            'tg://proxy?server=proxy.example&port=443&secret=' + self.secret,
++            'https://t.me/proxy?server=proxy.example&port=443&secret=dd' + self.secret]))
++        self.assertEqual(len(ids), 5)
++        self.assertNotIn('protocol', self.manager.list_proxies()[0])
++        self.manager.distribute(['a', 'b', 'c', 'd', 'e', 'f'])
++        self.assertEqual(self.store.data['account_proxies']['f'], ids[0])
++        before = copy.deepcopy(self.store.data)
++        for bad in (
++            'tg://proxy?server=proxy.example&port=443&secret=' + self.secret + '&secret=' + self.secret,
++            'https://t.me/proxy?server=proxy.example&port=443&secret=' + self.secret + '&extra=x',
++            'https://evil.example/proxy?server=proxy.example&port=443&secret=' + self.secret,
++            'tg://proxy?server=proxy.example&port=443&secret=bad',
++            'tg://proxy?server=proxy.example&port=443&secret=' + self.secret + '#fragment',
++            'tg://proxy?server=proxy.example&port=443&secret=%ZZ',
++            'tg://proxy?server=proxy.example&port=4\t43&secret=' + self.secret,
++        ):
++            with self.subTest(bad=bad), self.assertRaises(ProxyError):
++                self.manager.import_lines('127.0.0.1:1080\n' + bad)
++            self.assertEqual(self.store.data, before)
++
++    def test_socks_password_containing_url_remains_compatible(self):
++        ids = self.manager.import_lines('proxy.example:1080:user:https://secret')
++        self.manager.assign('account', ids[0])
++        self.assertEqual(self.manager.options('account'), {
++            'proxy': ('socks5', 'proxy.example', 1080, True, 'user', 'https://secret')})
++
++    @unittest.skipUnless(importlib.util.find_spec('telethon'), 'Telethon integration dependency unavailable')
++    def test_edit_preserves_protocol_credentials_and_rolls_back_save_failure(self):
++        ident = self.manager.add_mtproto('one.example', 443, self.secret)
++        self.manager.assign('a', ident)
++        self.manager.update_mtproto(ident, 'two.example', 444, keep_credentials=True)
++        self.assertEqual(self.manager.options('a')['proxy'], ('two.example', 444, self.secret))
++        with self.assertRaises(ProxyError): self.manager.update(ident, 'socks.example', 1080)
++        socks = self.manager.add('socks.example', 1080)
++        with self.assertRaises(ProxyError): self.manager.update_mtproto(socks, 'mt.example', 443, self.secret)
++        before = copy.deepcopy(self.store.data)
++        self.store.fail = True
++        with self.assertRaises(ProxyError): self.manager.update_mtproto(ident, 'new.example', 443, 'dd' + self.secret)
++        self.assertEqual(self.store.data, before)
++
++    def test_unknown_protocol_and_corrupted_mt_secret_fail_closed(self):
++        ident = self.manager.add_mtproto('one.example', 443, self.secret)
++        self.manager.assign('a', ident)
++        record = self.store.data['socks5_proxies'][ident]
++        record['protocol'] = 'unknown'
++        with self.assertRaises(ProxyError): self.manager.options('a')
++        with self.assertRaises(ProxyError): self.manager.assign('b', ident)
++        record['protocol'] = 'mtproto'
++        record['credentials'] = self.manager._seal('mtproto', 'invalid-secret')
++        with self.assertRaises(ProxyError): self.manager.options('a')
++        with self.assertRaises(ProxyError): self.manager.distribute(['b'])
++
++    def test_mtproto_check_is_only_tcp_and_closes_socket(self):
++        ident = self.manager.add_mtproto('one.example', 443, self.secret)
++        class Socket:
++            closed = False
++            def close(self): self.closed = True
++        sock = Socket()
++        with patch('tam_core.proxies.socket.create_connection', return_value=sock) as connect:
++            result = self.manager.check(ident, timeout=3)
++        connect.assert_called_once_with(('one.example', 443), timeout=3)
++        self.assertTrue(result['ok'])
++        self.assertEqual(result['scope'], 'tcp')
++        self.assertTrue(sock.closed)
++        with patch('tam_core.proxies.socket.create_connection', side_effect=OSError(self.secret)):
++            result = self.manager.check(ident)
++        self.assertFalse(result['ok'])
++        self.assertEqual(result['scope'], 'tcp')
++        self.assertNotIn(self.secret, result['error'])

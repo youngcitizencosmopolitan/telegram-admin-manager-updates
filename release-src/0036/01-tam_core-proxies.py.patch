@@ -1,0 +1,219 @@
+--- a/app/tam_core/proxies.py
++++ b/app/tam_core/proxies.py
+@@ -11,9 +11,11 @@
+ import math
+ import os
+ import re
++import socket
+ import threading
+ import time
+ import uuid
++from urllib.parse import parse_qsl, urlsplit
+ 
+ 
+ class ProxyError(ValueError):
+@@ -128,6 +130,28 @@
+             raise ProxyError('Повреждены настройки прокси.')
+         return records, assignments
+ 
++    @staticmethod
++    def _protocol(record):
++        protocol = record.get('protocol', 'socks5')
++        if protocol not in ('socks5', 'mtproto'):
++            raise ProxyError('Неизвестный протокол прокси. Проверьте настройки.')
++        return protocol
++
++    @staticmethod
++    def _mt_secret(secret):
++        if not isinstance(secret, str) or not re.fullmatch(r'(?:[0-9a-fA-F]{32}|[dD][dD][0-9a-fA-F]{32})', secret):
++            raise ProxyError('MTProto: нужен секрет из 32 hex символов или dd + 32 hex. FakeTLS не поддерживается.')
++        return secret.lower()
++
++    def _route_credentials(self, record):
++        protocol = self._protocol(record)
++        username, password = self._unseal(record)
++        if protocol == 'mtproto':
++            if username != 'mtproto':
++                raise ProxyError('Повреждены настройки MTProto.')
++            password = self._mt_secret(password)
++        return username, password
++
+     def _record(self, ident):
+         records, _ = self._state()
+         if not isinstance(ident, str) or ident not in records:
+@@ -136,6 +160,7 @@
+         if not isinstance(record, dict):
+             raise ProxyError('Повреждены настройки прокси.')
+         self._endpoint(record.get('host'), record.get('port'))
++        self._protocol(record)
+         return record
+ 
+     def _change(self, operation):
+@@ -161,7 +186,10 @@
+             result = []
+             for ident in records:
+                 record = self._record(ident)
+-                result.append({'id': ident, 'host': record['host'], 'port': record['port']})
++                item = {'id': ident, 'host': record['host'], 'port': record['port']}
++                if self._protocol(record) == 'mtproto':
++                    item['protocol'] = 'mtproto'
++                result.append(item)
+             return result
+ 
+     def add(self, host, port, username='', password=''):
+@@ -175,6 +203,8 @@
+         host, port = self._endpoint(host, port)
+         with self._lock:
+             old = self._record(ident)
++            if self._protocol(old) != 'socks5':
++                raise ProxyError('Используйте настройки MTProto для этого прокси.')
+             if keep_credentials:
+                 self._unseal(old)
+                 protected = old['credentials']
+@@ -183,6 +213,59 @@
+             self._change(lambda records, assignments: records.__setitem__(ident, {
+                 'host': host, 'port': port, 'credentials': protected}))
+ 
++    def add_mtproto(self, host, port, secret):
++        host, port = self._endpoint(host, port)
++        secret = self._mt_secret(secret)
++        ident = uuid.uuid4().hex
++        record = {'host': host, 'port': port, 'protocol': 'mtproto',
++                  'credentials': self._seal('mtproto', secret)}
++        self._change(lambda records, assignments: records.__setitem__(ident, record))
++        return ident
++
++    def update_mtproto(self, ident, host, port, secret='', keep_credentials=False):
++        host, port = self._endpoint(host, port)
++        with self._lock:
++            old = self._record(ident)
++            if self._protocol(old) != 'mtproto':
++                raise ProxyError('Используйте настройки SOCKS5 для этого прокси.')
++            if keep_credentials:
++                self._route_credentials(old)
++                protected = old['credentials']
++            else:
++                protected = self._seal('mtproto', self._mt_secret(secret))
++            record = {'host': host, 'port': port, 'protocol': 'mtproto', 'credentials': protected}
++            self._change(lambda records, assignments: records.__setitem__(ident, record))
++
++    def _parse_import(self, line):
++        if line.startswith(('tg://', 'https://')):
++            try:
++                if any(ord(char) <= 32 or ord(char) == 127 for char in line) or re.search(r'%(?![0-9a-fA-F]{2})', line):
++                    raise ValueError
++                url = urlsplit(line)
++                if url.fragment or not ((url.scheme == 'tg' and url.netloc == 'proxy' and not url.path)
++                        or (url.scheme == 'https' and url.netloc == 't.me' and url.path == '/proxy')):
++                    raise ValueError
++                pairs = parse_qsl(url.query, keep_blank_values=True, strict_parsing=True,
++                                  encoding='utf-8', errors='strict')
++                fields = dict(pairs)
++                if len(pairs) != 3 or set(fields) != {'server', 'port', 'secret'}:
++                    raise ValueError
++                host, port = self._endpoint(fields['server'], fields['port'])
++                secret = self._mt_secret(fields['secret'])
++            except Exception:
++                raise ProxyError('Некорректная ссылка MTProto или неподдерживаемый секрет.') from None
++            return {'host': host, 'port': port, 'protocol': 'mtproto',
++                    'credentials': self._seal('mtproto', secret)}
++        parts = line.split(':', 3)
++        if len(parts) not in (2, 3, 4):
++            raise ProxyError('Формат строки: IP:PORT[:LOGIN:PASSWORD] или HOST:PORT:SECRET.')
++        host, port = self._endpoint(parts[0], parts[1])
++        if len(parts) == 3:
++            return {'host': host, 'port': port, 'protocol': 'mtproto',
++                    'credentials': self._seal('mtproto', self._mt_secret(parts[2]))}
++        username, password = parts[2:] if len(parts) == 4 else ('', '')
++        return {'host': host, 'port': port, 'credentials': self._seal(username, password)}
++
+     def delete(self, ident):
+         def remove(records, assignments):
+             self._record(ident)
+@@ -198,13 +281,7 @@
+         for line in text.splitlines():
+             if not line.strip():
+                 continue
+-            parts = line.strip().split(':', 3)
+-            if len(parts) not in (2, 4):
+-                raise ProxyError('Формат строки: IP:PORT[:LOGIN:PASSWORD].')
+-            host, port = self._endpoint(parts[0], parts[1])
+-            username, password = parts[2:] if len(parts) == 4 else ('', '')
+-            parsed.append((uuid.uuid4().hex, {'host': host, 'port': port,
+-                                             'credentials': self._seal(username, password)}))
++            parsed.append((uuid.uuid4().hex, self._parse_import(line.strip())))
+         if not parsed:
+             return []
+         self._change(lambda records, assignments: records.update(parsed))
+@@ -217,7 +294,7 @@
+             if proxy_id is None:
+                 assignments.pop(session, None)
+             else:
+-                self._unseal(self._record(proxy_id))
++                self._route_credentials(self._record(proxy_id))
+                 assignments[session] = proxy_id
+         self._change(assign_route)
+ 
+@@ -230,7 +307,7 @@
+             if not ids:
+                 raise ProxyError('Сначала добавьте SOCKS5 прокси.')
+             for ident in ids:
+-                self._unseal(self._record(ident))
++                self._route_credentials(self._record(ident))
+             for index, session in enumerate(sessions):
+                 assignments[session] = ids[index % len(ids)]
+         self._change(distribute_routes)
+@@ -241,7 +318,19 @@
+             if session not in assignments:
+                 return {}
+             record = self._record(assignments[session])
+-            username, password = self._unseal(record)
++            username, password = self._route_credentials(record)
++            if self._protocol(record) == 'mtproto':
++                try:
++                    from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
++                except Exception:
++                    raise ProxyError('Для MTProto необходима библиотека Telethon.') from None
++                # Telethon strips dd/ee before decoding, including a plain 16-byte
++                # secret starting with those bytes. An explicit dd marker keeps
++                # all 16 key bytes and suits the randomized intermediate transport.
++                if len(password) == 32 and password[:2] in ('dd', 'ee'):
++                    password = 'dd' + password
++                return {'connection': ConnectionTcpMTProxyRandomizedIntermediate,
++                        'proxy': (record['host'], int(record['port']), password)}
+             return {'proxy': ('socks5', record['host'], int(record['port']), True, username, password)}
+ 
+     def route_label(self, session):
+@@ -256,14 +345,21 @@
+     def check(self, proxy_id, timeout=8):
+         start = time.monotonic()
+         sock = None
++        scope = None
+         try:
+             if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+                 raise ProxyError('Некорректное время проверки.')
+             with self._lock:
+                 record = self._record(proxy_id)
+-                username, password = self._unseal(record)
++                if self._protocol(record) == 'mtproto':
++                    scope = 'tcp'
++                username, password = self._route_credentials(record)
+                 parameters = dict(host=record['host'], port=int(record['port']),
+                                   username=username or None, password=password or None)
++            if scope == 'tcp':
++                sock = socket.create_connection((parameters['host'], parameters['port']), timeout=timeout)
++                return {'ok': True, 'latency_ms': round((time.monotonic() - start) * 1000, 1),
++                        'error': '', 'scope': 'tcp'}
+             if self._proxy_factory is None:
+                 from python_socks import ProxyType
+                 from python_socks.sync import Proxy
+@@ -273,6 +369,9 @@
+             sock = tunnel.connect(dest_host='149.154.167.51', dest_port=443, timeout=timeout)
+             return {'ok': True, 'latency_ms': round((time.monotonic() - start) * 1000, 1), 'error': ''}
+         except Exception:
++            if scope == 'tcp':
++                return {'ok': False, 'latency_ms': None, 'scope': 'tcp',
++                        'error': 'TCP соединение с MTProto прокси не установлено.'}
+             return {'ok': False, 'latency_ms': None,
+                     'error': 'SOCKS5 соединение не установлено. Проверьте адрес, порт и учётные данные.'}
+         finally:
