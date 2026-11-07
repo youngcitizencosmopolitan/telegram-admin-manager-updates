@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0034",
-  "display_version": "0034",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0034/TelegramAdminManager_v0034_update.zip",
-  "sha256": "e974c9bb2f1b00fc25d3c2323299b121d1688736dfe6dd8db16eb284cc2b5ebd",
-  "notes": "0034: show effective successful upload throughput over the last 10, 30 and 60 wall-clock minutes in the monitoring summary. Credit file bytes on confirmed completion, include pauses and idle time, exclude failures and partial uploads. Read persisted statistics with a bounded indexed aggregate off the Tk thread every 15 seconds, coalesce refreshes, expire old values while idle and wrap summary text to available width. No additional Telegram requests."
+  "version": "4.3.8.0035",
+  "display_version": "0035",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0035/TelegramAdminManager_v0035_update.zip",
+  "sha256": "82d1752a7c39f381cb5856c78faa12e46e5e12b93cc3b58e6e960f78808bb589",
+  "notes": "0035: add per-account SOCKS5 proxy manager with encrypted Windows DPAPI credentials, atomic bulk import, assignment, round-robin distribution, explicit direct mode and background tunnel checks. Route every Telegram client and reauthentication stage through assigned options with no direct fallback; preserve account/session identity. Add bounded nonblocking upload diagnostics, per-account and total logical speed, duration, retries, FloodWait, event-loop lag and MTProto sender counts. Explicit cancellable sequential A/B byte-upload test uses one existing session, one unchanged file, fixed512KiB parts, no publication and paired run IDs. Preserve all0034 rolling statistics and upload limits; fail closed on corrupt routing config."
 }
