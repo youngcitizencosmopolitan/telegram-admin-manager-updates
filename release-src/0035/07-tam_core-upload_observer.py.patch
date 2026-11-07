@@ -1,0 +1,30 @@
+--- /dev/null
++++ b/app/tam_core/upload_observer.py
+@@ -0,0 +1,27 @@
++"""Low-frequency event-loop lag and connected MTProto sender observations."""
++import asyncio
++import time
++
++
++async def observe_upload_loop(collector, clients):
++    if collector is None:
++        return
++    previous = time.monotonic()
++    try:
++        while True:
++            await asyncio.sleep(1)
++            now = time.monotonic()
++            collector.lag(max(0, now-previous-1))
++            previous = now
++            count = 0
++            for client in list(clients()):
++                try:
++                    count += int(client.is_connected())
++                    for _state, sender in list(getattr(client, '_borrowed_senders', {}).values()):
++                        count += int(sender.is_connected())
++                except Exception:
++                    pass
++            collector.transports(count)
++    finally:
++        collector.lag(0)
++        collector.transports(0)

@@ -1,0 +1,85 @@
+--- /dev/null
++++ b/app/tests/test_proxy_benchmark.py
+@@ -0,0 +1,82 @@
++import asyncio
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from tam_core.proxy_benchmark import compare_routes
++
++
++class ProxyBenchmarkTests(unittest.IsolatedAsyncioTestCase):
++    async def test_same_file_sequential_routes_no_publication(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td)/'a.mp4'
++            path.write_bytes(b'video')
++            events = []
++            class Client:
++                def __init__(self, route): self.route = route
++                async def connect(self): events.append(('connect',self.route))
++                async def is_user_authorized(self): return True
++                async def upload_file(self, value, **kw):
++                    events.append(('upload',self.route, value, kw['part_size_kb']))
++                    kw['progress_callback'](5,5)
++                async def disconnect(self): events.append(('disconnect',self.route))
++            diag = SimpleNamespace(begin=lambda *a,**kw: None, progress=lambda *a: None,
++                event=lambda *a: None, finish=lambda *a: None)
++            await compare_routes(lambda opts: Client('proxy' if opts else 'direct'), diag,
++                'saved',path,{'proxy':('socks5','host',1080)},'proxy:id',lambda:False)
++            self.assertEqual([e[:2] for e in events], [('connect','direct'),('upload','direct'),
++                ('disconnect','direct'),('connect','proxy'),('upload','proxy'),('disconnect','proxy')])
++            self.assertTrue(all(e[2] == str(path) and e[3] == 512 for e in events if e[0]=='upload'))
++
++    async def test_cancel_does_not_try_other_route(self):
++        made=[]
++        with tempfile.TemporaryDirectory() as td:
++            path=Path(td)/'a.mp4';path.write_bytes(b'x')
++            await compare_routes(lambda opts: made.append(opts),None,'s',path,{'proxy':('socks5',)},'proxy:p',lambda:True)
++        self.assertEqual(made,[])
++
++    async def test_stop_interrupts_stalled_connect_before_any_upload(self):
++        entered = asyncio.Event()
++        stopped = [False]
++        closed = []
++        class Client:
++            async def connect(self):
++                entered.set()
++                await asyncio.Event().wait()
++            async def disconnect(self): closed.append(True)
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td)/'a.mp4';path.write_bytes(b'x')
++            task = asyncio.create_task(compare_routes(lambda options:Client(),None,'s',path,
++                {'proxy':('socks5',)},'proxy:p',lambda:stopped[0]))
++            await asyncio.wait_for(entered.wait(),1)
++            stopped[0] = True
++            await asyncio.wait_for(task,1)
++            self.assertEqual(closed,[True])
++
++    async def test_stop_after_connect_prevents_byte_transfer(self):
++        stopped = [False]
++        class Client:
++            async def connect(self): stopped[0] = True
++            async def is_user_authorized(self): return True
++            async def disconnect(self): pass
++            async def upload_file(self,*args,**kwargs): raise AssertionError('Stopped test uploaded bytes')
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td)/'a.mp4';path.write_bytes(b'x')
++            await compare_routes(lambda options:Client(),None,'s',path,{'proxy':('socks5',)},
++                'proxy:p',lambda:stopped[0])
++
++    async def test_cleanup_failure_prevents_second_client(self):
++        made=[]
++        class Client:
++            async def connect(self): pass
++            async def is_user_authorized(self): return True
++            async def upload_file(self,*args,**kwargs): pass
++            async def disconnect(self): raise OSError('cleanup failed')
++        def factory(options): made.append(options); return Client()
++        diag = SimpleNamespace(begin=lambda *a,**kw:None, finish=lambda *a:None)
++        with tempfile.TemporaryDirectory() as td:
++            path=Path(td)/'a.mp4';path.write_bytes(b'x')
++            with self.assertRaisesRegex(RuntimeError,'закрыть'):
++                await compare_routes(factory,diag,'saved',path,{'proxy':('socks5',)},'proxy:p',lambda:False)
++        self.assertEqual(made,[{}])

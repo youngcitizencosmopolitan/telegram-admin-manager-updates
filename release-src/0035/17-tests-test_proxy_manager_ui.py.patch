@@ -1,0 +1,156 @@
+--- /dev/null
++++ b/app/tests/test_proxy_manager_ui.py
+@@ -0,0 +1,153 @@
++import queue
++import threading
++import tkinter as tk
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_ui.proxy_manager import ProxyPane
++
++
++class FakeManager:
++    def __init__(self):
++        self.proxies = [{'id': 'p1', 'host': 'proxy.local', 'port': 1080}]
++        self.routes = {}
++        self.calls = []
++        self.check_started = threading.Event()
++        self.check_release = threading.Event()
++    def list_proxies(self): return self.proxies
++    def route_label(self, session): return self.routes.get(session) or 'Прямое подключение'
++    def assign(self, session, proxy_id):
++        self.calls.append(('assign', session, proxy_id))
++        self.routes[session] = proxy_id
++    def distribute(self, sessions): self.calls.append(('distribute', sessions))
++    def delete(self, proxy_id):
++        self.calls.append(('delete', proxy_id))
++        self.proxies = []
++    def check(self, proxy_id, timeout=8):
++        self.calls.append(('check', proxy_id, threading.get_ident()))
++        self.check_started.set()
++        self.check_release.wait(3)
++        return {'ok': True, 'latency_ms': 12.3, 'error': ''}
++
++
++class ProxyPaneTests(unittest.TestCase):
++    def setUp(self):
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            if 'display' in str(exc).lower():
++                self.skipTest(f'Tk display is unavailable: {exc}')
++            raise
++        self.root.withdraw()
++        self.manager = FakeManager()
++        self.callbacks = queue.Queue()
++        self.allowed = True
++        self.app = SimpleNamespace(proxy_manager=self.manager,
++            store=SimpleNamespace(accounts=lambda: [SimpleNamespace(session='s1', display='Account One'),
++                                                     SimpleNamespace(session='s2', display='Account Two')]),
++            _proxy_changes_allowed=lambda: self.allowed, ui_call=self.callbacks.put)
++        self.pane = ProxyPane(self.root, self.app)
++    def tearDown(self):
++        self.manager.check_release.set()
++        self.root.destroy()
++    def test_routes_require_explicit_choice_and_preserve_selected_accounts(self):
++        self.pane.account_tree.selection_set(('s1', 's2'))
++        self.pane.assign_selected()
++        self.assertEqual(self.manager.calls, [])
++        self.pane.proxy_tree.selection_set('p1')
++        self.pane.assign_selected()
++        self.assertEqual(self.manager.calls, [('assign', 's1', 'p1'), ('assign', 's2', 'p1')])
++        self.assertEqual(set(self.pane.account_tree.selection()), {'s1', 's2'})
++        self.pane.assign_direct()
++        self.assertEqual(self.manager.calls[-2:], [('assign', 's1', None), ('assign', 's2', None)])
++    def test_busy_guard_prevents_assign_distribute_and_delete(self):
++        self.allowed = False
++        self.pane.account_tree.selection_set('s1')
++        self.pane.proxy_tree.selection_set('p1')
++        with patch('tam_ui.proxy_manager.messagebox.showwarning'), patch('tam_ui.proxy_manager.messagebox.askyesno', return_value=True):
++            self.pane.assign_selected()
++            self.pane.assign_direct()
++            self.pane.distribute_selected()
++            self.pane.delete_selected()
++        self.assertEqual(self.manager.calls, [])
++    def test_check_is_single_flight_and_returns_through_ui_queue(self):
++        self.pane.proxy_tree.selection_set('p1')
++        self.pane.check_selected()
++        self.assertTrue(self.manager.check_started.wait(2))
++        self.pane.check_selected()
++        self.assertEqual(len(self.manager.calls), 1)
++        self.assertNotEqual(self.manager.calls[0][2], threading.get_ident())
++        self.manager.check_release.set()
++        self.callbacks.get(timeout=3)()
++        self.assertIn('12.3', str(self.pane.proxy_tree.item('p1', 'values')))
++        self.assertFalse(self.pane._checking)
++    def test_unexpected_error_never_discloses_secrets(self):
++        self.pane.proxy_tree.selection_set('p1')
++        self.pane.account_tree.selection_set('s1')
++        def broken(*args): raise RuntimeError('socks5://user:secret@host:1080')
++        self.manager.assign = broken
++        with patch('tam_ui.proxy_manager.messagebox.showerror') as error:
++            self.pane.assign_selected()
++        self.assertEqual(error.call_count, 1)
++        self.assertNotIn('secret', str(error.call_args))
++    def test_mass_import_submits_all_text_in_one_atomic_operation(self):
++        self.manager.import_lines = lambda text: self.manager.calls.append(('import', text))
++        self.pane.import_proxies()
++        dialog = next(child for child in self.pane.winfo_children() if isinstance(child, tk.Toplevel))
++        body = next(child for child in dialog.winfo_children() if isinstance(child, tk.Text))
++        body.insert('1.0', 'proxy-a:1080\nproxy-b:1081:user:secret')
++        save = next(child for child in dialog.winfo_children() if isinstance(child, tk.ttk.Button) and child.cget('text') == 'Импортировать')
++        save.invoke()
++        self.assertEqual(self.manager.calls, [('import', 'proxy-a:1080\nproxy-b:1081:user:secret')])
++        self.assertFalse(dialog.winfo_exists())
++
++    def test_probe_failure_keeps_existing_route(self):
++        self.manager.routes['s1'] = 'p1'
++        self.manager.check = lambda *args, **kwargs: {'ok': False, 'latency_ms': None, 'error': 'Connection refused'}
++        self.pane.proxy_tree.selection_set('p1')
++        self.pane.check_selected()
++        self.callbacks.get(timeout=3)()
++        self.assertEqual(self.manager.routes['s1'], 'p1')
++        self.assertIn('Connection refused', str(self.pane.proxy_tree.item('p1', 'values')))
++        self.assertEqual(self.manager.calls, [])
++
++    def test_probe_completion_after_pane_destroy_is_safe(self):
++        self.pane.proxy_tree.selection_set('p1')
++        self.pane.check_selected()
++        self.assertTrue(self.manager.check_started.wait(2))
++        self.pane.destroy()
++        self.manager.check_release.set()
++        self.callbacks.get(timeout=3)()
++
++    def test_edit_keeps_credentials_without_prefilling_secrets(self):
++        self.manager.proxies[0].update(username='secret-user', password='secret-pass')
++        self.manager.update = lambda *args, **kwargs: self.manager.calls.append(('update', args, kwargs))
++        self.pane.proxy_tree.selection_set('p1')
++        self.pane.edit_selected()
++        dialog = next(child for child in self.pane.winfo_children() if isinstance(child, tk.Toplevel))
++        entries = [child for child in dialog.winfo_children() if isinstance(child, tk.ttk.Entry)]
++        self.assertEqual([entry.get() for entry in entries], ['proxy.local', '1080', '', ''])
++        self.assertEqual(entries[-1].cget('show'), '*')
++        save = next(child for child in dialog.winfo_children() if isinstance(child, tk.ttk.Button) and child.cget('text') == 'Сохранить')
++        save.invoke()
++        self.assertTrue(self.manager.calls[-1][2]['keep_credentials'])
++
++    def test_open_dialog_rechecks_busy_guard_before_save(self):
++        self.manager.add = lambda **kwargs: self.manager.calls.append(('add', kwargs))
++        self.pane.add_proxy()
++        dialog = next(child for child in self.pane.winfo_children() if isinstance(child, tk.Toplevel))
++        self.allowed = False
++        save = next(child for child in dialog.winfo_children() if isinstance(child, tk.ttk.Button) and child.cget('text') == 'Сохранить')
++        with patch('tam_ui.proxy_manager.messagebox.showwarning'):
++            save.invoke()
++        self.assertEqual(self.manager.calls, [])
++        self.assertTrue(dialog.winfo_exists())
++
++    def test_refresh_lists_only_endpoint_and_route(self):
++        self.manager.proxies[0].update(username='secret-user', password='secret-pass')
++        self.pane.refresh()
++        self.assertNotIn('secret', str(self.pane.proxy_tree.item('p1')))
++        self.assertIn('Account One', str(self.pane.account_tree.item('s1', 'values')))
++
++if __name__ == '__main__': unittest.main()

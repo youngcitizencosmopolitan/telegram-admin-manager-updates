@@ -1,0 +1,11 @@
+--- a/app/tests/test_redesign_integration.py
++++ b/app/tests/test_redesign_integration.py
+@@ -58,7 +58,7 @@
+         self.assertIsInstance(self.app.main_notebook, ttk.Notebook)
+         self.assertFalse(hasattr(self.app, 'workspace'))
+         labels = [self.app.main_notebook.tab(tab, 'text') for tab in self.app.main_notebook.tabs()]
+-        self.assertEqual(labels, ['Создание групп', 'Мониторинг', 'Админы', 'Каналы', 'Аккаунты / API', 'Twitter / X', 'Обновления'])
++        self.assertEqual(labels, ['Создание групп', 'Мониторинг', 'Админы', 'Каналы', 'Аккаунты / API', 'Прокси', 'Twitter / X', 'Обновления'])
+         self.assertFalse(hasattr(self.app.batch_uploader, 'monitor_view'))
+         self.assertTrue(self.app._log_text_widgets)
+ 

@@ -1,0 +1,13 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -444,7 +444,9 @@
+                 try:
+                     out[str(row["key"])] = json.loads(row["value_json"])
+                 except Exception:
+-                    pass
++                    if str(row['key']) in {'account_proxies', 'socks5_proxies'}:
++                        # Missing routes mean direct; corrupt routes must stay invalid.
++                        out[str(row['key'])] = None
+             accounts: list[dict[str, Any]] = []
+             for row in conn.execute("SELECT payload_json FROM accounts ORDER BY position, session"):
+                 try:

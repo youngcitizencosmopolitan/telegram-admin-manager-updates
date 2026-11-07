@@ -1,0 +1,57 @@
+--- /dev/null
++++ b/app/tests/test_proxy_client_routing.py
+@@ -0,0 +1,54 @@
++import ast
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import telegram_admin_manager as main
++from batch_uploader import BatchUploaderPane
++
++
++class ProxyClientRoutingTests(unittest.TestCase):
++    def app(self):
++        app = main.TelegramAdminManager.__new__(main.TelegramAdminManager)
++        app.proxy_manager = SimpleNamespace(options=Mock(return_value={'proxy': ('socks5','127.0.0.1',1080,True,'u','p')}))
++        return app
++
++    def test_existing_session_and_client_options_are_preserved(self):
++        app = self.app()
++        with patch.object(main, 'TelegramClient') as factory:
++            app._new_telegram_client('sessions/saved', 1, 'hash', flood_sleep_threshold=0)
++        self.assertEqual(factory.call_args.args, ('sessions/saved',1,'hash'))
++        app.proxy_manager.options.assert_called_once_with('saved')
++        self.assertEqual(factory.call_args.kwargs['proxy'][0], 'socks5')
++        self.assertEqual(factory.call_args.kwargs['flood_sleep_threshold'], 0)
++
++    def test_reauthentication_stage_uses_saved_account_route(self):
++        app = self.app()
++        with patch.object(main, 'TelegramClient'):
++            app._new_telegram_client('sessions/phone_reauth_123', 1, 'hash', proxy_session='saved')
++        app.proxy_manager.options.assert_called_once_with('saved')
++
++    def test_bad_proxy_never_constructs_direct_client(self):
++        app = self.app()
++        app.proxy_manager.options.side_effect = RuntimeError('unavailable')
++        with patch.object(main, 'TelegramClient') as factory, self.assertRaises(RuntimeError):
++            app._new_telegram_client('sessions/saved',1,'hash')
++        factory.assert_not_called()
++
++    def test_batch_routes_through_same_factory(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.app = SimpleNamespace(_new_telegram_client=Mock(return_value='client'))
++        self.assertEqual(pane._new_telegram_client('sessions/saved',1,'hash'), 'client')
++        pane.app._new_telegram_client.assert_called_once_with('sessions/saved',1,'hash')
++
++    def test_only_factory_methods_construct_clients(self):
++        for name in ('telegram_admin_manager.py','batch_uploader.py'):
++            tree = ast.parse(Path(name).read_text(encoding='utf-8'))
++            owners = []
++            for node in ast.walk(tree):
++                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                    if any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
++                           and call.func.id == 'TelegramClient' for call in ast.walk(node)):
++                        owners.append(node.name)
++            self.assertEqual(owners, ['_new_telegram_client'])

@@ -1,0 +1,145 @@
+--- /dev/null
++++ b/app/tests/test_proxies.py
+@@ -0,0 +1,142 @@
++import copy
++import json
++import os
++import unittest
++
++from tam_core.proxies import DPAPIProtector, ProxyError, ProxyManager
++
++
++class TestProtector:
++    def protect(self, value):
++        return bytes(x ^ 173 for x in value)
++
++    def unprotect(self, value):
++        return bytes(x ^ 173 for x in value)
++
++
++class Store:
++    def __init__(self):
++        self.data = {}
++        self.fail = False
++
++    def save(self):
++        if self.fail:
++            raise OSError('sensitive detail')
++
++
++class ProxyTests(unittest.TestCase):
++    def setUp(self):
++        self.store = Store()
++        self.manager = ProxyManager(self.store, protector=TestProtector())
++
++    def test_credentials_are_ciphertext_and_listing_is_safe(self):
++        ident = self.manager.add('127.0.0.1', 1080, 'test-login', 'test-secret')
++        self.assertEqual(self.manager.list_proxies(), [{'id': ident, 'host': '127.0.0.1', 'port': 1080}])
++        self.assertNotIn('test-login', json.dumps(self.store.data))
++        self.assertNotIn('test-secret', json.dumps(self.store.data))
++        self.manager.assign('account', ident)
++        self.assertEqual(self.manager.options('account'), {'proxy': ('socks5', '127.0.0.1', 1080, True, 'test-login', 'test-secret')})
++
++    def test_import_and_invalid_import_are_atomic(self):
++        ids = self.manager.import_lines('127.0.0.1:1080\n\n192.0.2.2:9050:login:pass:word')
++        self.assertEqual(len(ids), 2)
++        self.manager.assign('a', ids[1])
++        self.assertEqual(self.manager.options('a')['proxy'][-1], 'pass:word')
++        before = copy.deepcopy(self.store.data)
++        for text in ('127.0.0.1:1080\nbad', '127.0.0.1:0', '127.0.0.1:65536', 'http://host:10', 'host:1080:user', 'host:1080:user:', 'bad host:1080'):
++            with self.subTest(text=text), self.assertRaises(ProxyError):
++                self.manager.import_lines(text)
++            self.assertEqual(self.store.data, before)
++
++    def test_assigned_proxy_cannot_be_deleted_and_direct_is_explicit(self):
++        ident = self.manager.add('proxy.example', 1080)
++        self.manager.assign('a', ident)
++        with self.assertRaises(ProxyError):
++            self.manager.delete(ident)
++        self.assertIn('proxy.example:1080', self.manager.route_label('a'))
++        self.manager.assign('a', None)
++        self.manager.delete(ident)
++        self.assertEqual(self.manager.options('a'), {})
++        self.assertEqual(self.manager.route_label('a'), 'Прямое')
++
++    def test_unknown_and_corrupt_routes_never_fall_back_to_direct(self):
++        with self.assertRaises(ProxyError):
++            self.manager.assign('a', 'missing')
++        self.store.data['account_proxies'] = {'a': 'missing'}
++        with self.assertRaises(ProxyError):
++            self.manager.options('a')
++        ident = self.manager.add('proxy.example', 1080, 'user', 'secret')
++        self.manager.assign('a', ident)
++        self.store.data['socks5_proxies'][ident]['credentials'] = 'invalid ciphertext'
++        with self.assertRaises(ProxyError) as caught:
++            self.manager.options('a')
++        self.assertNotIn('secret', str(caught.exception))
++
++    def test_round_robin_and_options_are_fresh_snapshots(self):
++        first = self.manager.add('one.example', 1080, 'u', 'p')
++        second = self.manager.add('two.example', 1081)
++        self.manager.distribute(['a', 'b', 'c'])
++        old = self.manager.options('a')
++        self.assertEqual(self.store.data['account_proxies'], {'a': first, 'b': second, 'c': first})
++        self.manager.assign('a', second)
++        self.assertEqual(old['proxy'][1], 'one.example')
++        self.assertEqual(self.manager.options('a')['proxy'][1], 'two.example')
++
++    def test_update_preserves_credentials_only_when_explicit(self):
++        ident = self.manager.add('one.example', 1080, 'u', 'p')
++        self.manager.assign('a', ident)
++        self.manager.update(ident, 'two.example', 1081, keep_credentials=True)
++        self.assertEqual(self.manager.options('a')['proxy'][-2:], ('u', 'p'))
++        self.manager.update(ident, 'two.example', 1081)
++        self.assertEqual(self.manager.options('a')['proxy'][-2:], ('', ''))
++
++    def test_failed_save_restores_snapshot_and_sanitizes_error(self):
++        before = copy.deepcopy(self.store.data)
++        self.store.fail = True
++        with self.assertRaises(ProxyError) as caught:
++            self.manager.add('one.example', 1080, 'u', 'secret')
++        self.assertEqual(self.store.data, before)
++        self.assertNotIn('sensitive detail', str(caught.exception))
++
++    def test_probe_uses_socks_tunnel_and_sanitizes_failure(self):
++        calls = []
++        connection_settings = []
++        class Tunnel:
++            def connect(self, **kwargs):
++                calls.append(kwargs)
++                raise OSError('secret proxy credentials')
++        def factory(**kwargs):
++            connection_settings.append(kwargs)
++            return Tunnel()
++        manager = ProxyManager(self.store, protector=TestProtector(), proxy_factory=factory)
++        ident = manager.add('one.example', 1080, 'u', 'secret')
++        result = manager.check(ident, timeout=3)
++        self.assertFalse(result['ok'])
++        self.assertNotIn('secret', result['error'])
++        self.assertEqual(connection_settings, [{'host': 'one.example', 'port': 1080,
++                                               'username': 'u', 'password': 'secret'}])
++        self.assertEqual(calls, [{'dest_host': '149.154.167.51', 'dest_port': 443, 'timeout': 3}])
++
++    def test_probe_success_closes_socket(self):
++        calls = []
++        class Socket:
++            def close(self): calls.append('closed')
++        class Tunnel:
++            def connect(self, **kwargs): return Socket()
++        manager = ProxyManager(self.store, protector=TestProtector(), proxy_factory=lambda **kw: Tunnel())
++        result = manager.check(manager.add('one.example', 1080))
++        self.assertTrue(result['ok'])
++        self.assertGreaterEqual(result['latency_ms'], 0)
++        self.assertEqual(calls, ['closed'])
++
++    @unittest.skipUnless(os.name == 'nt', 'Windows DPAPI only')
++    def test_windows_dpapi_roundtrip(self):
++        protector = DPAPIProtector()
++        encrypted = protector.protect(b'synthetic-test-secret')
++        self.assertNotIn(b'synthetic-test-secret', encrypted)
++        self.assertEqual(protector.unprotect(encrypted), b'synthetic-test-secret')
++
++    @unittest.skipIf(os.name == 'nt', 'Non-Windows fail-closed check')
++    def test_default_crypto_fails_closed_without_windows(self):
++        with self.assertRaises(ProxyError):
++            ProxyManager(Store()).add('one.example', 1080, 'u', 'p')

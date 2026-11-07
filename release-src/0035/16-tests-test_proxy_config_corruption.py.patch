@@ -1,0 +1,26 @@
+--- /dev/null
++++ b/app/tests/test_proxy_config_corruption.py
+@@ -0,0 +1,23 @@
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from tam_core.proxies import ProxyManager, ProxyError
++from tam_core.state_db import StateDatabase
++
++
++class CorruptProxyConfigTests(unittest.TestCase):
++    def test_bad_persisted_routing_never_degrades_into_missing_direct_setting(self):
++        for key in ('account_proxies', 'socks5_proxies'):
++            with self.subTest(key=key), tempfile.TemporaryDirectory() as td:
++                db = StateDatabase(Path(td)/'state.db')
++                with db.session() as conn:
++                    conn.execute('INSERT INTO settings(key,value_json) VALUES(?,?)',(key,'{bad'))
++                config = db.load_config({})
++                manager = ProxyManager(SimpleNamespace(data=config, save=lambda:None))
++                with self.assertRaises(ProxyError): manager.options('saved')
++                db.save_config(config)
++                config = db.load_config({})
++                with self.assertRaises(ProxyError):
++                    ProxyManager(SimpleNamespace(data=config)).options('saved')

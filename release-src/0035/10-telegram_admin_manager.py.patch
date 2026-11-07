@@ -1,0 +1,400 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0034"
++APP_VERSION = "0035"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -88,6 +88,7 @@
+     ("admins", "Админы"),
+     ("channels", "Каналы"),
+     ("accounts", "Аккаунты / API"),
++    ("proxies", "Прокси"),
+     ("x", "Twitter / X"),
+     ("updates", "Обновления"),
+ )
+@@ -313,6 +314,75 @@
+ 
+ 
+ class TelegramAdminManager(tk.Tk):
++    def _new_telegram_client(self, session_path, api_id, api_hash, *, proxy_session=None, _connection_options=None, **kwargs):
++        manager = self.__dict__.get('proxy_manager')
++        session = proxy_session or Path(session_path).name.removesuffix('.session')
++        if _connection_options is not None:
++            kwargs.update(_connection_options)
++        elif manager is not None:
++            kwargs.update(manager.options(session))
++        client = TelegramClient(session_path, api_id, api_hash, **kwargs)
++        route_id = self.__dict__.get('store')
++        route_id = route_id.data.get('account_proxies', {}).get(session) if route_id is not None else None
++        client._tam_route = f'proxy:{route_id}' if route_id else 'direct'
++        return client
++
++    def _proxy_changes_allowed(self):
++        uploader = self.__dict__.get('batch_uploader')
++        if (self.__dict__.get('_busy', False) or self.__dict__.get('_uploader_running', False)
++                or (uploader is not None and (uploader.monitor_active or uploader.running))):
++            return False
++        return True
++
++    def stop_proxy_comparison(self):
++        event = self.__dict__.get('_proxy_benchmark_stop')
++        if event is not None:
++            event.set()
++
++    def _diagnostic(self, method, *args):
++        collector = self.__dict__.get('upload_diagnostics')
++        if collector is None:
++            return
++        try:
++            getattr(collector, method)(*args)
++            if method == 'begin':
++                self.__dict__.setdefault('_quick_diagnostic_keys', set()).add(args[0])
++            elif method == 'finish':
++                self.__dict__.get('_quick_diagnostic_keys', set()).discard(args[0])
++        except Exception:
++            pass
++
++    def start_proxy_comparison(self, session, path):
++        if not self._proxy_changes_allowed():
++            messagebox.showinfo(APP_NAME, 'Останови мониторинг и текущие операции перед сравнением.', parent=self)
++            return
++        try:
++            if not any(account.session == session for account in self.store.accounts()):
++                raise ValueError('Выбери сохранённый аккаунт.')
++            path = Path(path)
++            size = path.stat().st_size
++            if not path.is_file() or not 0 < size <= 2*1024**3:
++                raise ValueError('Выбери непустой файл до 2 ГБ для одинаковых условий теста.')
++            options = self.proxy_manager.options(session)
++            if not options:
++                raise ValueError('Сначала назначь аккаунту SOCKS5-прокси.')
++            proxy_id = self.store.data['account_proxies'][session]
++            api_id, api_hash = self._api_credentials()
++        except Exception as exc:
++            from tam_core.proxies import ProxyError
++            text = str(exc) if isinstance(exc, (ProxyError, ValueError)) else 'Не удалось подготовить тест.'
++            messagebox.showerror(APP_NAME, text, parent=self)
++            return
++        self._proxy_benchmark_stop = threading.Event()
++        from tam_core.proxy_benchmark import compare_routes
++        def make_client(connection_options):
++            return self._new_telegram_client(str(SESSIONS_DIR / session), api_id, api_hash,
++                _connection_options=connection_options, flood_sleep_threshold=0)
++        def run():
++            asyncio.run(compare_routes(make_client, self.upload_diagnostics, session, path, options,
++                f'proxy:{proxy_id}', lambda: self._closed or self._proxy_benchmark_stop.is_set()))
++        self.run_worker(run, 'Сравнение: один файл, прямое подключение / SOCKS5…')
++
+     def __init__(self):
+         super().__init__()
+         self.title(f"{APP_NAME} {APP_VERSION}")
+@@ -321,6 +391,10 @@
+ 
+         self.store = ConfigStore(CONFIG_PATH)
+         self.state_db = self.store.db
++        from tam_core.proxies import ProxyManager
++        from tam_core.upload_diagnostics import UploadDiagnostics
++        self.proxy_manager = ProxyManager(self.store)
++        self.upload_diagnostics = UploadDiagnostics(self.state_db)
+         self.upload_history = UploadHistory(UPLOAD_DB_PATH)
+         self.group_state_cache = GroupStateCache(GROUP_CACHE_PATH)
+         self.group_registry = GroupRegistry(self.state_db)
+@@ -581,6 +655,7 @@
+         self.tab_group = ttk.Frame(self.main_notebook, padding=10)
+         self.tab_channels = ttk.Frame(self.main_notebook, padding=10)
+         self.tab_account_api = ttk.Frame(self.main_notebook, padding=10)
++        self.tab_proxies = ttk.Frame(self.main_notebook, padding=10)
+         self.tab_x_main = ttk.Frame(self.main_notebook, padding=14)
+         self.tab_updates_main = ttk.Frame(self.main_notebook, padding=14)
+         tab_frames = {
+@@ -589,6 +664,7 @@
+             "admins": self.tab_group,
+             "channels": self.tab_channels,
+             "accounts": self.tab_account_api,
++            "proxies": self.tab_proxies,
+             "x": self.tab_x_main,
+             "updates": self.tab_updates_main,
+         }
+@@ -637,6 +713,15 @@
+         self._build_safety_tab()
+         self._build_statistics_tab()
+         self._build_settings_tab()
++
++        from tam_ui.proxy_manager import ProxyPane
++        from tam_ui.upload_diagnostics import DiagnosticsPane
++        proxy_tabs = ttk.Notebook(self.tab_proxies)
++        proxy_tabs.pack(fill='both', expand=True)
++        self.proxy_pane = ProxyPane(proxy_tabs, self)
++        self.diagnostics_pane = DiagnosticsPane(proxy_tabs, self)
++        proxy_tabs.add(self.proxy_pane, text='Настройки прокси')
++        proxy_tabs.add(self.diagnostics_pane, text='Диагностика загрузок')
+ 
+         self.tab_x_main.columnconfigure(0, weight=1)
+         ttk.Label(
+@@ -1332,7 +1417,7 @@
+         for account in accounts:
+             if not remaining or self._closed:
+                 break
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+@@ -2040,7 +2125,7 @@
+                 if cooldown > 0:
+                     self.log(f"Каналы: {account.display} → {target}: FloodWait ещё {cooldown}с — пропуск")
+                     continue
+-                client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++                client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+                 try:
+                     await client.connect()
+                     if not await client.is_user_authorized():
+@@ -2207,7 +2292,7 @@
+             if controller is None:
+                 self.log(f"Каналы: {peer_id}: ❌ нет владельца/админа с правом изменять администраторов")
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / controller.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / controller.session), api_id, api_hash, flood_sleep_threshold=0)
+             target_ref = self._channel_target_ref(peer_id)
+             try:
+                 await client.connect()
+@@ -2290,7 +2375,7 @@
+             if controller is None:
+                 self.log(f"Каналы: {peer_id}: ❌ нет контроллера для снятия прав")
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / controller.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / controller.session), api_id, api_hash, flood_sleep_threshold=0)
+             try:
+                 await client.connect()
+                 target = await self._resolve_or_join_target(client, self._channel_target_ref(peer_id), should_join=False)
+@@ -2331,7 +2416,7 @@
+                 if self.account_is_restricted(account.session) or admin_flood_remaining(self.state_db, account.session) > 0:
+                     self.log(f"Каналы: {account.display} → {target_ref}: пропуск по состоянию Telegram")
+                     continue
+-                client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++                client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+                 try:
+                     await client.connect()
+                     entity = await self._resolve_or_join_target(client, target_ref, should_join=False)
+@@ -2438,7 +2523,7 @@
+                     candidate_seen.add(peer_id)
+             if not eligible:
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), *self._api_credentials(), flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), *self._api_credentials(), flood_sleep_threshold=0)
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+@@ -2508,7 +2593,7 @@
+                 failed_sessions.add(account.session)
+                 self.log(f"Каналы [{index}/{len(accounts)}] {account.display}: FloodWait ещё {cooldown}с — read-скан пропущен.")
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+             seen: set[int] = set()
+             try:
+                 await client.connect()
+@@ -2576,7 +2661,7 @@
+             cooldown = admin_flood_remaining(self.state_db, account.session)
+             if cooldown > 0:
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+@@ -3121,7 +3206,7 @@
+         client = clients.get(account.session)
+         if client is not None:
+             return client
+-        client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++        client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+         await client.connect()
+         if not await client.is_user_authorized():
+             await client.disconnect()
+@@ -4474,6 +4559,9 @@
+         self._sync_account_selection('list')
+         if hasattr(self, "channels_tree"):
+             self.refresh_channels_from_cache()
++        proxy_pane = self.__dict__.get('proxy_pane')
++        if proxy_pane is not None:
++            proxy_pane.refresh()
+ 
+     def select_all_accounts(self) -> None:
+         if self.accounts_list.size():
+@@ -4965,7 +5053,7 @@
+ 
+     async def _recheck_account_restriction_async(self, account: Account) -> None:
+         api_id, api_hash = self._api_credentials()
+-        client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++        client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+         try:
+             await client.connect()
+             if not await client.is_user_authorized():
+@@ -5042,7 +5130,7 @@
+         wait_task = None
+         saved = False
+         try:
+-            client = TelegramClient(session_path, api_id, api_hash)
++            client = self._new_telegram_client(session_path, api_id, api_hash)
+             await client.connect()
+             if await client.is_user_authorized():
+                 if not existing_account:
+@@ -5064,7 +5152,7 @@
+                 # user. Install a fresh session only after its owner is checked.
+                 await client.disconnect()
+                 working_session_name = f'qr_reauth_{time.time_ns()}'
+-                client = TelegramClient(str(SESSIONS_DIR / working_session_name), api_id, api_hash)
++                client = self._new_telegram_client(str(SESSIONS_DIR / working_session_name), api_id, api_hash, proxy_session=session_name)
+                 await client.connect()
+                 if await client.is_user_authorized():
+                     raise RuntimeError('Новая QR-сессия неожиданно уже авторизована.')
+@@ -5303,7 +5391,7 @@
+             await asyncio.to_thread(copy_session_database, session_file, backup)
+         client, working_session_name, saved = None, None, False
+         try:
+-            client = TelegramClient(str(SESSIONS_DIR / session_name), api_id, api_hash)
++            client = self._new_telegram_client(str(SESSIONS_DIR / session_name), api_id, api_hash)
+             try:
+                 await client.connect()
+                 authorized = await client.is_user_authorized()
+@@ -5330,7 +5418,7 @@
+ 
+             await client.disconnect()
+             working_session_name = f'phone_reauth_{time.time_ns()}'
+-            client = TelegramClient(str(SESSIONS_DIR / working_session_name), api_id, api_hash)
++            client = self._new_telegram_client(str(SESSIONS_DIR / working_session_name), api_id, api_hash, proxy_session=session_name)
+             await client.connect()
+             if await client.is_user_authorized():
+                 raise RuntimeError('Новая сессия неожиданно уже авторизована.')
+@@ -5397,7 +5485,7 @@
+         session_name = f"acc_{safe}_{int(time.time())}"
+         session_path = str(SESSIONS_DIR / session_name)
+ 
+-        client = TelegramClient(session_path, api_id, api_hash)
++        client = self._new_telegram_client(session_path, api_id, api_hash)
+         failed = False
+         try:
+             await client.connect()
+@@ -5466,7 +5554,7 @@
+         api_id, api_hash = self._api_credentials()
+         updated: list[Account] = []
+         for account in self.store.accounts():
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash)
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+@@ -5782,7 +5870,7 @@
+                 join_results[account.user_id] = False
+                 self.log(f"[{i}/{len(selected)}] {account.display}: 🛑 пропуск — аккаунт отключён безопасным режимом в текущем запуске")
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+@@ -5840,7 +5928,7 @@
+         else:
+             self.log(f"Главный выбран вручную: {effective_controller.display}")
+ 
+-        controller_client = TelegramClient(
++        controller_client = self._new_telegram_client(
+             str(SESSIONS_DIR / effective_controller.session), api_id, api_hash, flood_sleep_threshold=0
+         )
+         promoted = 0
+@@ -6020,7 +6108,7 @@
+                 continue
+             if account.session in self._admin_safety_disabled_sessions:
+                 continue
+-            client = TelegramClient(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++            client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+             try:
+                 await client.connect()
+                 if not await client.is_user_authorized():
+@@ -6752,6 +6840,8 @@
+     ) -> None:
+         api_id, api_hash = self._api_credentials()
+         clients: list[tuple[Account, Any, Any, bool]] = []
++        from tam_core.upload_observer import observe_upload_loop
++        observer = asyncio.create_task(observe_upload_loop(self.__dict__.get('upload_diagnostics'), lambda:[pair[1] for pair in clients]))
+         total_size = sum((p.stat().st_size if p.exists() else 0) for p in files)
+         total_files = len(files)
+         state = {
+@@ -6782,7 +6872,7 @@
+             for account in accounts:
+                 if self._upload_stop_event.is_set():
+                     break
+-                client = TelegramClient(
++                client = self._new_telegram_client(
+                     str(SESSIONS_DIR / account.session),
+                     api_id,
+                     api_hash,
+@@ -6952,6 +7042,7 @@
+ 
+                         def progress_callback(current: int, total: int) -> None:
+                             nonlocal last_emit
++                            self._diagnostic('progress', diagnostic_key, current)
+                             if self._upload_stop_event.is_set():
+                                 raise UploadStopped()
+                             state["active"][str(path)] = int(current)
+@@ -6973,6 +7064,8 @@
+                         )
+                         self.log(f"{account.display} → {path.name}: начинаю загрузку")
+                         transfer_started = time.monotonic()
++                        diagnostic_key = f'quick:{account.session}:{path}'
++                        self._diagnostic('begin', diagnostic_key, account.session, str(path), size, getattr(client, '_tam_route', 'direct'))
+ 
+                         while True:
+                             try:
+@@ -7000,6 +7093,7 @@
+                                 state["processed_bytes"] += size
+                                 state["processed_files"] += 1
+                                 state["success"] += 1
++                                await asyncio.to_thread(self._diagnostic, 'finish', diagnostic_key, True)
+                                 flood_counts[account.session] = 0
+                                 self.ui_call(
+                                     lambda p=path: self._upload_tree_update(p, status="✅ Отправлено", progress="100%")
+@@ -7008,12 +7102,14 @@
+                                 update_overall()
+                                 break
+                             except UploadStopped:
++                                await asyncio.to_thread(self._diagnostic, 'finish', diagnostic_key, False)
+                                 state["active"].pop(str(path), None)
+                                 self.ui_call(
+                                     lambda p=path: self._upload_tree_update(p, status="Остановлено", progress="—")
+                                 )
+                                 return
+                             except TELETHON_WAIT_ERRORS as exc:
++                                self._diagnostic('event', diagnostic_key, 'flood')
+                                 state["active"].pop(str(path), None)
+                                 seconds = telegram_wait_seconds(exc)
+                                 premium_wait = is_premium_upload_wait(exc)
+@@ -7043,8 +7139,11 @@
+                                     return
+                                 if not await self._wait_upload_gate():
+                                     return
++                                self._diagnostic('event', diagnostic_key, 'retry')
+                                 continue
+                             except Exception as exc:
++                                self._diagnostic('event', diagnostic_key, 'error')
++                                await asyncio.to_thread(self._diagnostic, 'finish', diagnostic_key, False)
+                                 state["active"].pop(str(path), None)
+                                 state["processed_bytes"] += size
+                                 state["processed_files"] += 1
+@@ -7142,6 +7241,10 @@
+                     )
+                 )
+         finally:
++            observer.cancel()
++            await asyncio.gather(observer, return_exceptions=True)
++            for diagnostic_key in list(self.__dict__.get('_quick_diagnostic_keys', set())):
++                await asyncio.to_thread(self._diagnostic, 'finish', diagnostic_key, False)
+             for _account, client, _entity, _premium in clients:
+                 try:
+                     await client.disconnect()

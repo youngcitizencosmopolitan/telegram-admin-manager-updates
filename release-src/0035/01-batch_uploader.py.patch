@@ -1,0 +1,832 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -589,6 +589,38 @@
+             claim_token,
+         )
+         return status, claim_token
++
++    def _new_telegram_client(self, session_path, api_id, api_hash, **kwargs):
++        factory = getattr(self.app, '_new_telegram_client', None)
++        if factory is not None:
++            return factory(session_path, api_id, api_hash, **kwargs)
++        return TelegramClient(session_path, api_id, api_hash, **kwargs)
++
++    def _diagnostic(self, method, *args):
++        collector = getattr(self.app, 'upload_diagnostics', None)
++        if collector is not None:
++            try:
++                getattr(collector, method)(*args)
++                if method == 'begin':
++                    if not hasattr(self, '_diagnostic_keys'):
++                        self._diagnostic_keys = set()
++                    self._diagnostic_keys.add(args[0])
++            except Exception:
++                pass
++
++    async def _finish_diagnostic(self, key, success):
++        collector = getattr(self.app, 'upload_diagnostics', None)
++        if collector is not None:
++            try:
++                await asyncio.to_thread(collector.finish, key, success)
++            except Exception:
++                pass
++        getattr(self, '_diagnostic_keys', set()).discard(key)
++
++    async def _watch_upload_loop(self, clients):
++        from tam_core.upload_observer import observe_upload_loop
++        await observe_upload_loop(getattr(self.app, 'upload_diagnostics', None),
++            lambda: [pair[1] for pair in clients.values()])
+ 
+     def tasks(self) -> list[dict[str, Any]]:
+         raw = self.app.store.data.get("upload_tasks", [])
+@@ -2856,7 +2888,7 @@
+                 account = accounts_by_session.get(session)
+                 if account is None:
+                     continue
+-                client = TelegramClient(str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=0)
++                client = self._new_telegram_client(str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=0)
+                 try:
+                     await client.connect()
+                     if not await client.is_user_authorized():
+@@ -3718,10 +3750,10 @@
+             if not self.session_connection_ready(session):
+                 continue
+             account = accounts_by_session[session]
+-            client = TelegramClient(
+-                str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD
+-            )
++            client = None
+             try:
++                client = self._new_telegram_client(
++                    str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD)
+                 await client.connect()
+                 if not await client.is_user_authorized():
+                     raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+@@ -3775,6 +3807,7 @@
+             raise RuntimeError("В заданиях нет доступных авторизованных аккаунтов.")
+ 
+         clients: dict[str, tuple[Any, Any]] = {}
++        diagnostic_watch = asyncio.create_task(self._watch_upload_loop(clients))
+         premium_by_session: dict[str, bool] = {}
+         preparation = None
+         policy = self.app.safety_policy()
+@@ -3795,10 +3828,10 @@
+                 if not self.session_connection_ready(session):
+                     continue
+                 account = accounts_by_session[session]
+-                client = TelegramClient(
+-                    str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD
+-                )
++                client = None
+                 try:
++                    client = self._new_telegram_client(
++                        str(self.sessions_dir / session), api_id, api_hash, flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD)
+                     await client.connect()
+                     if not await client.is_user_authorized():
+                         raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+@@ -3924,6 +3957,10 @@
+                     ))
+             return hard_error_ids
+         finally:
++            diagnostic_watch.cancel()
++            await asyncio.gather(diagnostic_watch, return_exceptions=True)
++            for diagnostic_key in list(getattr(self, '_diagnostic_keys', set())):
++                await self._finish_diagnostic(diagnostic_key, False)
+             if preparation is not None:
+                 await preparation.close()
+             for _account, client in clients.values():
+@@ -5133,344 +5170,214 @@
+                         else:
+                             self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Фото • подготовка')
+ 
+-                        transfer = {
+-                            "current": 0, "size": size, "speed": 0.0, "last_current": 0,
+-                            "last_time": time.monotonic(), "session": session, "path": str(path),
+-                        }
+-                        state["active"][key] = transfer
+-                        last_ui = 0.0
+-
+-                        def progress_callback(current: int, total: int) -> None:
+-                            nonlocal last_ui
+-                            if self.stop_event.is_set():
+-                                raise BatchUploadStopped()
+-                            now = time.monotonic()
+-                            dt = now - float(transfer["last_time"])
+-                            db = int(current) - int(transfer["last_current"])
+-                            if dt >= 0.15 and db >= 0:
+-                                inst = db / dt
+-                                old = float(transfer["speed"])
+-                                transfer["speed"] = inst if old <= 0 else old * 0.62 + inst * 0.38
+-                                transfer["last_current"] = int(current)
+-                                transfer["last_time"] = now
+-                            transfer["current"] = int(current)
+-                            pct = (current / total * 100.0) if total else 0.0
+-                            if now - last_ui >= 0.75 or current >= total:
+-                                last_ui = now
+-                                speed = float(transfer["speed"])
+-                                self._queue_activity_update(key, name, path, account_name, size, pct, speed, 'Видео • загрузка' if _media_kind(path) == 'video' else 'Фото • загрузка')
+-                                self._emit_task_metrics(tid)
+-
+-                        self.app.log(f"{name}: {account.display} → {path.name}: начинаю")
+-                        transfer_started = time.monotonic()
+-                        transient_retry_count = 0
+-                        safe_parts_retry_used = False
+-                        max_transient_retries = int(policy.get("upload_retries", 3) or 0)
+-                        retry_base_delay = float(policy.get("retry_base_delay", 5) or 5)
+-                        while True:
+-                            publication_started = False
+-                            try:
+-                                if not await self._wait_gate(tid):
+-                                    release_reservation()
+-                                    queue_for_path(path).put_nowait(item)
+-                                    state["active"].pop(key, None)
+-                                    return
+-                                async with global_sem:
+-                                    if prepared is not None and (
+-                                        await asyncio.to_thread(read_stamp, path) != prepared.stamp
+-                                        or await asyncio.to_thread(has_active_writer, path)
+-                                    ):
+-                                        release_reservation()
+-                                        state['active'].pop(key, None)
+-                                        queue_for_path(path).put_nowait(item)
+-                                        break
+-                                    # A worker can wait here while another file is sending.
+-                                    # Re-read account policy only after the slot is free: hot OFF
+-                                    # stops the next send, while an already running send is untouched.
+-                                    if not self._runtime_task_account_allowed(task, session):
++                        self._diagnostic('begin', key, session, str(path), size, getattr(client, '_tam_route', 'direct'))
++                        try:
++                            transfer = {
++                                "current": 0, "size": size, "speed": 0.0, "last_current": 0,
++                                "last_time": time.monotonic(), "session": session, "path": str(path),
++                            }
++                            state["active"][key] = transfer
++                            last_ui = 0.0
++
++                            def progress_callback(current: int, total: int) -> None:
++                                nonlocal last_ui
++                                self._diagnostic('progress', key, current)
++                                if self.stop_event.is_set():
++                                    raise BatchUploadStopped()
++                                now = time.monotonic()
++                                dt = now - float(transfer["last_time"])
++                                db = int(current) - int(transfer["last_current"])
++                                if dt >= 0.15 and db >= 0:
++                                    inst = db / dt
++                                    old = float(transfer["speed"])
++                                    transfer["speed"] = inst if old <= 0 else old * 0.62 + inst * 0.38
++                                    transfer["last_current"] = int(current)
++                                    transfer["last_time"] = now
++                                transfer["current"] = int(current)
++                                pct = (current / total * 100.0) if total else 0.0
++                                if now - last_ui >= 0.75 or current >= total:
++                                    last_ui = now
++                                    speed = float(transfer["speed"])
++                                    self._queue_activity_update(key, name, path, account_name, size, pct, speed, 'Видео • загрузка' if _media_kind(path) == 'video' else 'Фото • загрузка')
++                                    self._emit_task_metrics(tid)
++
++                            self.app.log(f"{name}: {account.display} → {path.name}: начинаю")
++                            transfer_started = time.monotonic()
++                            transient_retry_count = 0
++                            safe_parts_retry_used = False
++                            max_transient_retries = int(policy.get("upload_retries", 3) or 0)
++                            retry_base_delay = float(policy.get("retry_base_delay", 5) or 5)
++                            while True:
++                                publication_started = False
++                                try:
++                                    if not await self._wait_gate(tid):
+                                         release_reservation()
+                                         queue_for_path(path).put_nowait(item)
+                                         state["active"].pop(key, None)
+-                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '⏸ Аккаунт отключён')
+-                                        break
+-                                    caption = self._render_live_caption(task, path, original_index, total_files, name)
+-                                    send_kwargs: dict[str, Any] = {
+-                                        "caption": caption,
+-                                        "progress_callback": progress_callback,
+-                                        "silent": bool(task.get("silent", False)),
+-                                    }
+-                                    if media_kind == "video":
+-                                        if thumb_path is not None:
+-                                            send_kwargs["thumb"] = str(thumb_path)
+-                                        send_kwargs["supports_streaming"] = bool(task.get("streaming", True)) and path.suffix.lower() in {".mp4", ".m4v"}
+-                                    elif media_kind == "photo":
+-                                        send_kwargs["force_document"] = str(task.get("photo_mode", "photo")) == "file"
+-                                    if forum_mode:
+-                                        topic_id = topic_id_for_path(path)
+-                                        if topic_id:
+-                                            send_kwargs["reply_to"] = int(topic_id)
+-                                delay = max(0.0, float(task.get('delay', 0) or 0))
+-                                if policy['enabled']:
+-                                    delay = max(delay, float(policy['min_file_delay']))
+-
+-                                async def bounded_action(action):
+-                                    while await self._wait_gate(tid):
+-                                        async with global_sem:
+-                                            if self.stop_event.is_set():
+-                                                raise BatchUploadStopped()
+-                                            all_event = getattr(self, 'pause_all_event', None)
+-                                            task_event = self.task_pause_events.get(tid)
+-                                            if ((all_event is not None and not all_event.is_set())
+-                                                    or (task_event is not None and not task_event.is_set())):
+-                                                continue  # Release the slot before awaiting resume.
+-                                            return await action()
+-                                    raise BatchUploadStopped()
+-
+-                                async def before_upload():
+-                                    if prepared is not None and (
+-                                        await asyncio.to_thread(read_stamp, path) != prepared.stamp
+-                                        or await asyncio.to_thread(has_active_writer, path)
+-                                    ):
++                                        return
++                                    async with global_sem:
++                                        if prepared is not None and (
++                                            await asyncio.to_thread(read_stamp, path) != prepared.stamp
++                                            or await asyncio.to_thread(has_active_writer, path)
++                                        ):
++                                            release_reservation()
++                                            state['active'].pop(key, None)
++                                            queue_for_path(path).put_nowait(item)
++                                            break
++                                        # A worker can wait here while another file is sending.
++                                        # Re-read account policy only after the slot is free: hot OFF
++                                        # stops the next send, while an already running send is untouched.
++                                        if not self._runtime_task_account_allowed(task, session):
++                                            release_reservation()
++                                            queue_for_path(path).put_nowait(item)
++                                            state["active"].pop(key, None)
++                                            self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '⏸ Аккаунт отключён')
++                                            break
++                                        caption = self._render_live_caption(task, path, original_index, total_files, name)
++                                        send_kwargs: dict[str, Any] = {
++                                            "caption": caption,
++                                            "progress_callback": progress_callback,
++                                            "silent": bool(task.get("silent", False)),
++                                        }
++                                        if media_kind == "video":
++                                            if thumb_path is not None:
++                                                send_kwargs["thumb"] = str(thumb_path)
++                                            send_kwargs["supports_streaming"] = bool(task.get("streaming", True)) and path.suffix.lower() in {".mp4", ".m4v"}
++                                        elif media_kind == "photo":
++                                            send_kwargs["force_document"] = str(task.get("photo_mode", "photo")) == "file"
++                                        if forum_mode:
++                                            topic_id = topic_id_for_path(path)
++                                            if topic_id:
++                                                send_kwargs["reply_to"] = int(topic_id)
++                                    delay = max(0.0, float(task.get('delay', 0) or 0))
++                                    if policy['enabled']:
++                                        delay = max(delay, float(policy['min_file_delay']))
++
++                                    async def bounded_action(action):
++                                        while await self._wait_gate(tid):
++                                            async with global_sem:
++                                                if self.stop_event.is_set():
++                                                    raise BatchUploadStopped()
++                                                all_event = getattr(self, 'pause_all_event', None)
++                                                task_event = self.task_pause_events.get(tid)
++                                                if ((all_event is not None and not all_event.is_set())
++                                                        or (task_event is not None and not task_event.is_set())):
++                                                    continue  # Release the slot before awaiting resume.
++                                                return await action()
+                                         raise BatchUploadStopped()
+-                                    if (self.stop_event.is_set() or health(session).get('disabled')
+-                                            or not self._runtime_task_account_allowed(task, session)):
+-                                        raise BatchUploadStopped()
+-                                    send_kwargs['caption'] = self._render_live_caption(task, path, original_index, total_files, name)
+-
+-                                async def publish(send):
+-                                    if media_kind == 'video':
+-                                        transfer['speed'] = 0.0
+-                                        self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, 'Видео • публикация')
+-                                    async def marked_send():
+-                                        nonlocal publication_started
+-                                        marker = getattr(self.app.upload_history, 'mark_publishing', None)
+-                                        if marker is not None:
+-                                            owned = await asyncio.to_thread(marker, dedup_fingerprint,
+-                                                history_key, reservation_claim_token)
+-                                            if not owned:
+-                                                raise BatchUploadStopped()
+-                                            publication_started = True
+-                                        return await bounded_action(send)
+-                                    return await _publish_with_min_gap(self._publication_state, session, delay,
+-                                        marked_send, lambda: self._wait_gate(tid), self._sleep_stop)
+-
+-                                if media_kind == 'video' or safe_parts_retry_used:
+-                                    message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs,
+-                                        publisher=publish, uploader=bounded_action, before_upload=before_upload)
+-                                else:
+-                                    async def send_direct():
+-                                        await before_upload()
+-                                        return await client.send_file(entity, str(path), **send_kwargs)
+-                                    message = await publish(send_direct)
+-                                message_id = getattr(message, "id", None)
+-                                self.app.upload_history.record_completed(
+-                                    path,
+-                                    history_key,
+-                                    dedup_fingerprint,
+-                                    account,
+-                                    int(message_id) if message_id else None,
+-                                    reservation_claim_token=reservation_claim_token,
+-                                )
+-                                reservation_held = False
+-                                try:
+-                                    self.app.state_db.transfer_stat_record(
+-                                        session=session, account_label=account.display, task=name, target=task_target, path=str(path),
+-                                        size=size, duration=max(0.001, time.monotonic() - transfer_started), success=True,
++
++                                    async def before_upload():
++                                        if prepared is not None and (
++                                            await asyncio.to_thread(read_stamp, path) != prepared.stamp
++                                            or await asyncio.to_thread(has_active_writer, path)
++                                        ):
++                                            raise BatchUploadStopped()
++                                        if (self.stop_event.is_set() or health(session).get('disabled')
++                                                or not self._runtime_task_account_allowed(task, session)):
++                                            raise BatchUploadStopped()
++                                        send_kwargs['caption'] = self._render_live_caption(task, path, original_index, total_files, name)
++
++                                    async def publish(send):
++                                        if media_kind == 'video':
++                                            transfer['speed'] = 0.0
++                                            self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, 'Видео • публикация')
++                                        async def marked_send():
++                                            nonlocal publication_started
++                                            marker = getattr(self.app.upload_history, 'mark_publishing', None)
++                                            if marker is not None:
++                                                owned = await asyncio.to_thread(marker, dedup_fingerprint,
++                                                    history_key, reservation_claim_token)
++                                                if not owned:
++                                                    raise BatchUploadStopped()
++                                                publication_started = True
++                                            return await bounded_action(send)
++                                        return await _publish_with_min_gap(self._publication_state, session, delay,
++                                            marked_send, lambda: self._wait_gate(tid), self._sleep_stop)
++
++                                    if media_kind == 'video' or safe_parts_retry_used:
++                                        message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs,
++                                            publisher=publish, uploader=bounded_action, before_upload=before_upload)
++                                    else:
++                                        async def send_direct():
++                                            await before_upload()
++                                            return await client.send_file(entity, str(path), **send_kwargs)
++                                        message = await publish(send_direct)
++                                    message_id = getattr(message, "id", None)
++                                    self.app.upload_history.record_completed(
++                                        path,
++                                        history_key,
++                                        dedup_fingerprint,
++                                        account,
++                                        int(message_id) if message_id else None,
++                                        reservation_claim_token=reservation_claim_token,
+                                     )
+-                                except Exception:
+-                                    pass
+-                                state["active"].pop(key, None)
+-                                state["processed_bytes"] += size
+-                                state["processed_files"] += 1
+-                                state["success"] += 1
+-                                h = health(session)
+-                                h.update({"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": ""})
+-                                self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, '✅ Отправлено')
+-                                self.app.log(f"{name}: {account.display} → {path.name}: ✅")
+-                                self._emit_task_metrics(tid, force=True)
+-                                break
+-                            except BatchUploadStopped:
+-                                state["active"].pop(key, None)
+-                                release_reservation()
+-                                queue_for_path(path).put_nowait(item)
+-                                self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Остановлено')
+-                                return
+-                            except TELETHON_WAIT_ERRORS as exc:
+-                                state["active"].pop(key, None)
+-                                seconds = telegram_wait_seconds(exc)
+-                                h = health(session)
+-                                premium_wait = is_premium_upload_wait(exc)
+-                                if premium_wait:
+-                                    # This is upload throttling for non-Premium accounts, not an
+-                                    # anti-spam strike. Do not inflate the FloodWait counter or
+-                                    # apply the 120s repeated-flood penalty. Short waits <=60s are
+-                                    # normally swallowed inside Telethon before reaching here; this
+-                                    # fallback handles unusually long waits.
+-                                    wait_seconds = seconds + (min(2, int(policy["flood_buffer"])) if policy["enabled"] else 0)
+-                                    h.update({
+-                                        "state": "Лимит upload",
+-                                        "reason": f"Telegram ограничил upload обычного аккаунта на {seconds}с",
+-                                        "cooldown_until": time.time() + wait_seconds,
+-                                    })
+-                                    self.app.log(
+-                                        f"{name}: {account.display}: ⏳ лимит скорости обычного аккаунта — "
+-                                        f"Telegram просит подождать {seconds}с; жду {wait_seconds}с. "
+-                                        "Это не считается ошибкой файла."
+-                                    )
+-                                else:
+-                                    h["floods"] = int(h.get("floods", 0)) + 1
+-                                    wait_seconds = seconds
+-                                    if policy["enabled"]:
+-                                        wait_seconds += int(policy["flood_buffer"])
+-                                        if int(h["floods"]) >= int(policy["repeat_after"]):
+-                                            wait_seconds += int(policy["repeat_cooldown"])
+-                                    h.update({
+-                                        "state": "Cooldown", "reason": f"{exc.__class__.__name__} {seconds}с",
+-                                        "cooldown_until": time.time() + wait_seconds,
+-                                    })
+-                                    self.app.log(
+-                                        f"{name}: {account.display}: {exc.__class__.__name__} {seconds}с; "
+-                                        f"жду {wait_seconds}с (случай #{h['floods']})"
+-                                    )
+-                                self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'Cooldown {wait_seconds}с')
+-                                if not await self._sleep_stop(wait_seconds):
++                                    reservation_held = False
++                                    try:
++                                        self.app.state_db.transfer_stat_record(
++                                            session=session, account_label=account.display, task=name, target=task_target, path=str(path),
++                                            size=size, duration=max(0.001, time.monotonic() - transfer_started), success=True,
++                                        )
++                                    except Exception:
++                                        pass
++                                    state["active"].pop(key, None)
++                                    state["processed_bytes"] += size
++                                    state["processed_files"] += 1
++                                    state["success"] += 1
++                                    await self._finish_diagnostic(key, True)
++                                    h = health(session)
++                                    h.update({"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": ""})
++                                    self._ui_latest(('health',), self.app.refresh_safety_health_table)
++                                    self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, '✅ Отправлено')
++                                    self.app.log(f"{name}: {account.display} → {path.name}: ✅")
++                                    self._emit_task_metrics(tid, force=True)
++                                    break
++                                except BatchUploadStopped:
++                                    await self._finish_diagnostic(key, False)
++                                    state["active"].pop(key, None)
+                                     release_reservation()
+                                     queue_for_path(path).put_nowait(item)
++                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Остановлено')
+                                     return
+-                                if not await self._wait_gate(tid):
+-                                    release_reservation()
+-                                    queue_for_path(path).put_nowait(item)
+-                                    return
+-                                h["state"] = "OK"
+-                                h["cooldown_until"] = 0.0
+-                                self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                transfer.update({"current": 0, "speed": 0.0, "last_current": 0, "last_time": time.monotonic()})
+-                                state["active"][key] = transfer
+-                                continue
+-                            except Exception as exc:
+-                                state["active"].pop(key, None)
+-                                friendly = self.app._friendly_error(exc)
+-                                exc_name = exc.__class__.__name__
+-                                if exc_name in {
+-                                    "ChatAdminRequiredError", "ChatWriteForbiddenError", "UserBannedInChannelError",
+-                                    "ChannelPrivateError", "RightForbiddenError", "ChannelInvalidError",
+-                                    "ChatIdInvalidError", "PeerIdInvalidError", "UserNotParticipantError",
+-                                }:
+-                                    self.app.group_state_cache.invalidate_admin(task_target, session)
+-                                    self._ui_latest(('monitor',), self.refresh_monitor_tab)
+-                                if "Topic" in exc_name or "topic" in friendly.casefold() or "тема" in friendly.casefold():
+-                                    self.app.group_state_cache.invalidate_topics(task_target)
+-                                    self._ui_latest(('monitor',), self.refresh_monitor_tab)
+-                                if _is_file_parts_invalid_error(exc):
+-                                    action = _file_parts_invalid_action(
+-                                        size,
+-                                        premium=bool(premium_by_session.get(session, False)),
+-                                        safe_retry_used=safe_parts_retry_used,
+-                                    )
+-                                    if action == "premium":
+-                                        release_reservation()
+-                                        big_queue.put_nowait(item)
++                                except TELETHON_WAIT_ERRORS as exc:
++                                    self._diagnostic('event', key, 'flood')
++                                    state["active"].pop(key, None)
++                                    seconds = telegram_wait_seconds(exc)
++                                    h = health(session)
++                                    premium_wait = is_premium_upload_wait(exc)
++                                    if premium_wait:
++                                        # This is upload throttling for non-Premium accounts, not an
++                                        # anti-spam strike. Do not inflate the FloodWait counter or
++                                        # apply the 120s repeated-flood penalty. Short waits <=60s are
++                                        # normally swallowed inside Telethon before reaching here; this
++                                        # fallback handles unusually long waits.
++                                        wait_seconds = seconds + (min(2, int(policy["flood_buffer"])) if policy["enabled"] else 0)
++                                        h.update({
++                                            "state": "Лимит upload",
++                                            "reason": f"Telegram ограничил upload обычного аккаунта на {seconds}с",
++                                            "cooldown_until": time.time() + wait_seconds,
++                                        })
+                                         self.app.log(
+-                                            f"{name}: {account.display} → {path.name}: Telegram отклонил число частей; "
+-                                            "переношу файл в Premium-очередь."
+-                                        )
+-                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '↻ Нужен Premium')
+-                                        self._emit_task_metrics(tid, force=True)
+-                                        break
+-                                    if action == "retry_safe":
+-                                        safe_parts_retry_used = True
+-                                        transfer.update({"current": 0, "speed": 0.0, "last_current": 0, "last_time": time.monotonic()})
+-                                        state["active"][key] = transfer
+-                                        self.app.log(
+-                                            f"{name}: {account.display} → {path.name}: Telegram отклонил число частей; "
+-                                            "перезапускаю файл с нуля с новым upload-id и частями 512 КБ (1/1)."
+-                                        )
+-                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '↻ multipart 512 КБ')
+-                                        continue
+-                                    if action == "too_large":
+-                                        friendly = (
+-                                            "Файл превышает multipart-лимит Telegram для Premium "
+-                                            f"({TELEGRAM_MAX_FILEPARTS_PREMIUM} частей × 512 КБ): {friendly}"
++                                            f"{name}: {account.display}: ⏳ лимит скорости обычного аккаунта — "
++                                            f"Telegram просит подождать {seconds}с; жду {wait_seconds}с. "
++                                            "Это не считается ошибкой файла."
+                                         )
+                                     else:
+-                                        friendly = f"Telegram снова отклонил число частей после чистого перезапуска: {friendly}"
+-
+-                                if _is_file_part_missing_error(exc):
+-                                    path_key = str(path)
+-                                    next_cycle = _next_file_part_requeue_cycle(file_part_requeue_cycles.get(path_key, 0))
+-                                    if next_cycle is not None:
+-                                        file_part_requeue_cycles[path_key] = next_cycle
+-                                        file_part_deferred.append(item)
++                                        h["floods"] = int(h.get("floods", 0)) + 1
++                                        wait_seconds = seconds
++                                        if policy["enabled"]:
++                                            wait_seconds += int(policy["flood_buffer"])
++                                            if int(h["floods"]) >= int(policy["repeat_after"]):
++                                                wait_seconds += int(policy["repeat_cooldown"])
++                                        h.update({
++                                            "state": "Cooldown", "reason": f"{exc.__class__.__name__} {seconds}с",
++                                            "cooldown_until": time.time() + wait_seconds,
++                                        })
+                                         self.app.log(
+-                                            f"{name}: {account.display} → {path.name}: Telegram потерял часть файла; "
+-                                            f"возвращаю файл в конец очереди ({next_cycle}/{FILE_PART_REQUEUE_LIMIT}), "
+-                                            "следующая полная загрузка будет после остальных файлов."
++                                            f"{name}: {account.display}: {exc.__class__.__name__} {seconds}с; "
++                                            f"жду {wait_seconds}с (случай #{h['floods']})"
+                                         )
+-                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'↻ В конец очереди {next_cycle}/{FILE_PART_REQUEUE_LIMIT}')
+-                                        release_reservation()
+-                                        self._emit_task_metrics(tid, force=True)
+-                                        break
+-                                    friendly = (
+-                                        f"Telegram снова потерял часть файла после {FILE_PART_REQUEUE_LIMIT} возвратов в конец очереди: "
+-                                        f"{friendly}"
+-                                    )
+-
+-                                rejected = (errors is not None and isinstance(exc, errors.RPCError)
+-                                            and int(getattr(exc, 'code', 500)) in {400, 401, 403, 404})
+-                                if publication_started and not rejected:
+-                                    state['blocked'] += 1
+-                                    self._remember_unconfirmed(task, path, True)
+-                                    self.app.log(f'{name}: {path.name}: результат публикации не подтверждён; '
+-                                                 'резерв сохранён для проверки, автоматическая повторная публикация остановлена.')
+-                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0,
+-                                                                '⚠ Требуется проверка результата отправки')
+-                                    self._emit_task_metrics(tid, force=True)
+-                                    break
+-
+-                                h = health(session)
+-                                h["errors"] = int(h.get("errors", 0)) + 1
+-                                if policy["enabled"] and self.app._is_api_credential_error(exc):
+-                                    h.update({"state": "СТОП API", "disabled": True, "reason": friendly})
+-                                    self.stop_event.set()
+-                                    release_reservation()
+-                                    queue_for_path(path).put_nowait(item)
+                                     self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                    self.app.log(
+-                                        f"Пакет: 🛑 аварийная остановка — Telegram вернул ошибку API ID/Hash: {friendly}. "
+-                                        "Никакие следующие загрузки не запускаю."
+-                                    )
+-                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '🛑 STOP API')
+-                                    return
+-                                serious = bool(policy["enabled"] and policy["stop_serious"] and self.app._is_serious_account_error(exc))
+-                                if serious:
+-                                    h.update({"state": "Отключён", "disabled": True, "reason": friendly})
+-                                    self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                    release_reservation()
+-                                    queue_for_path(path).put_nowait(item)
+-                                    self.app.log(
+-                                        f"{name}: {account.display}: 🛑 серьёзная ошибка — {friendly}. "
+-                                        "Аккаунт отключён до следующего запуска, файл возвращён в очередь."
+-                                    )
+-                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '🛑 аккаунт отключён')
+-                                    self._emit_task_metrics(tid, force=True)
+-                                    return
+-
+-                                if self.app._is_retryable_upload_error(exc) and transient_retry_count < max_transient_retries:
+-                                    transient_retry_count += 1
+-                                    wait_seconds = min(120.0, retry_base_delay * (2 ** (transient_retry_count - 1)))
+-                                    h.update({
+-                                        "state": "Повтор",
+-                                        "reason": f"{friendly} — повтор {transient_retry_count}/{max_transient_retries}",
+-                                        "cooldown_until": time.time() + wait_seconds,
+-                                    })
+-                                    self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                    self.app.log(
+-                                        f"{name}: {account.display} → {path.name}: ⚠️ временная ошибка — {friendly}; "
+-                                        f"повтор {transient_retry_count}/{max_transient_retries} через {wait_seconds:.0f}с"
+-                                    )
+-                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'↻ Повтор {transient_retry_count}/{max_transient_retries} через {wait_seconds:.0f}с')
++                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'Cooldown {wait_seconds}с')
+                                     if not await self._sleep_stop(wait_seconds):
+                                         release_reservation()
+                                         queue_for_path(path).put_nowait(item)
+@@ -5481,31 +5388,175 @@
+                                         return
+                                     h["state"] = "OK"
+                                     h["cooldown_until"] = 0.0
++                                    self._diagnostic('event', key, 'retry')
+                                     self._ui_latest(('health',), self.app.refresh_safety_health_table)
+                                     transfer.update({"current": 0, "speed": 0.0, "last_current": 0, "last_time": time.monotonic()})
+                                     state["active"][key] = transfer
+                                     continue
+-
+-                                release_reservation()
+-                                state["processed_bytes"] += size
+-                                state["processed_files"] += 1
+-                                state["failed"] += 1
+-                                self.app.log(f"{name}: {account.display} → {path.name}: ❌ {friendly}")
+-                                attempts_total = 1 + transient_retry_count + int(file_part_requeue_cycles.get(str(path), 0))
+-                                self.app.record_upload_error(
+-                                    task=name, target=task_target, path=str(path), account=account.display,
+-                                    attempts=attempts_total, error=friendly,
+-                                )
+-                                try:
+-                                    self.app.state_db.transfer_stat_record(
+-                                        session=session, account_label=account.display, task=name, target=task_target, path=str(path),
+-                                        size=size, duration=max(0.001, time.monotonic() - transfer_started), success=False, error=friendly,
++                                except Exception as exc:
++                                    self._diagnostic('event', key, 'error')
++                                    state["active"].pop(key, None)
++                                    friendly = self.app._friendly_error(exc)
++                                    exc_name = exc.__class__.__name__
++                                    if exc_name in {
++                                        "ChatAdminRequiredError", "ChatWriteForbiddenError", "UserBannedInChannelError",
++                                        "ChannelPrivateError", "RightForbiddenError", "ChannelInvalidError",
++                                        "ChatIdInvalidError", "PeerIdInvalidError", "UserNotParticipantError",
++                                    }:
++                                        self.app.group_state_cache.invalidate_admin(task_target, session)
++                                        self._ui_latest(('monitor',), self.refresh_monitor_tab)
++                                    if "Topic" in exc_name or "topic" in friendly.casefold() or "тема" in friendly.casefold():
++                                        self.app.group_state_cache.invalidate_topics(task_target)
++                                        self._ui_latest(('monitor',), self.refresh_monitor_tab)
++                                    if _is_file_parts_invalid_error(exc):
++                                        action = _file_parts_invalid_action(
++                                            size,
++                                            premium=bool(premium_by_session.get(session, False)),
++                                            safe_retry_used=safe_parts_retry_used,
++                                        )
++                                        if action == "premium":
++                                            release_reservation()
++                                            big_queue.put_nowait(item)
++                                            self.app.log(
++                                                f"{name}: {account.display} → {path.name}: Telegram отклонил число частей; "
++                                                "переношу файл в Premium-очередь."
++                                            )
++                                            self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '↻ Нужен Premium')
++                                            self._emit_task_metrics(tid, force=True)
++                                            break
++                                        if action == "retry_safe":
++                                            self._diagnostic('event', key, 'retry')
++                                            safe_parts_retry_used = True
++                                            transfer.update({"current": 0, "speed": 0.0, "last_current": 0, "last_time": time.monotonic()})
++                                            state["active"][key] = transfer
++                                            self.app.log(
++                                                f"{name}: {account.display} → {path.name}: Telegram отклонил число частей; "
++                                                "перезапускаю файл с нуля с новым upload-id и частями 512 КБ (1/1)."
++                                            )
++                                            self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '↻ multipart 512 КБ')
++                                            continue
++                                        if action == "too_large":
++                                            friendly = (
++                                                "Файл превышает multipart-лимит Telegram для Premium "
++                                                f"({TELEGRAM_MAX_FILEPARTS_PREMIUM} частей × 512 КБ): {friendly}"
++                                            )
++                                        else:
++                                            friendly = f"Telegram снова отклонил число частей после чистого перезапуска: {friendly}"
++
++                                    if _is_file_part_missing_error(exc):
++                                        self._diagnostic('event', key, 'retry')
++                                        path_key = str(path)
++                                        next_cycle = _next_file_part_requeue_cycle(file_part_requeue_cycles.get(path_key, 0))
++                                        if next_cycle is not None:
++                                            file_part_requeue_cycles[path_key] = next_cycle
++                                            file_part_deferred.append(item)
++                                            self.app.log(
++                                                f"{name}: {account.display} → {path.name}: Telegram потерял часть файла; "
++                                                f"возвращаю файл в конец очереди ({next_cycle}/{FILE_PART_REQUEUE_LIMIT}), "
++                                                "следующая полная загрузка будет после остальных файлов."
++                                            )
++                                            self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'↻ В конец очереди {next_cycle}/{FILE_PART_REQUEUE_LIMIT}')
++                                            release_reservation()
++                                            self._emit_task_metrics(tid, force=True)
++                                            break
++                                        friendly = (
++                                            f"Telegram снова потерял часть файла после {FILE_PART_REQUEUE_LIMIT} возвратов в конец очереди: "
++                                            f"{friendly}"
++                                        )
++
++                                    rejected = (errors is not None and isinstance(exc, errors.RPCError)
++                                                and int(getattr(exc, 'code', 500)) in {400, 401, 403, 404})
++                                    if publication_started and not rejected:
++                                        state['blocked'] += 1
++                                        self._remember_unconfirmed(task, path, True)
++                                        self.app.log(f'{name}: {path.name}: результат публикации не подтверждён; '
++                                                     'резерв сохранён для проверки, автоматическая повторная публикация остановлена.')
++                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0,
++                                                                    '⚠ Требуется проверка результата отправки')
++                                        self._emit_task_metrics(tid, force=True)
++                                        break
++
++                                    h = health(session)
++                                    h["errors"] = int(h.get("errors", 0)) + 1
++                                    if policy["enabled"] and self.app._is_api_credential_error(exc):
++                                        h.update({"state": "СТОП API", "disabled": True, "reason": friendly})
++                                        self.stop_event.set()
++                                        release_reservation()
++                                        queue_for_path(path).put_nowait(item)
++                                        self._ui_latest(('health',), self.app.refresh_safety_health_table)
++                                        self.app.log(
++                                            f"Пакет: 🛑 аварийная остановка — Telegram вернул ошибку API ID/Hash: {friendly}. "
++                                            "Никакие следующие загрузки не запускаю."
++                                        )
++                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '🛑 STOP API')
++                                        return
++                                    serious = bool(policy["enabled"] and policy["stop_serious"] and self.app._is_serious_account_error(exc))
++                                    if serious:
++                                        h.update({"state": "Отключён", "disabled": True, "reason": friendly})
++                                        self._ui_latest(('health',), self.app.refresh_safety_health_table)
++                                        release_reservation()
++                                        queue_for_path(path).put_nowait(item)
++                                        self.app.log(
++                                            f"{name}: {account.display}: 🛑 серьёзная ошибка — {friendly}. "
++                                            "Аккаунт отключён до следующего запуска, файл возвращён в очередь."
++                                        )
++                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '🛑 аккаунт отключён')
++                                        self._emit_task_metrics(tid, force=True)
++                                        return
++
++                                    if self.app._is_retryable_upload_error(exc) and transient_retry_count < max_transient_retries:
++                                        self._diagnostic('event', key, 'retry')
++                                        transient_retry_count += 1
++                                        wait_seconds = min(120.0, retry_base_delay * (2 ** (transient_retry_count - 1)))
++                                        h.update({
++                                            "state": "Повтор",
++                                            "reason": f"{friendly} — повтор {transient_retry_count}/{max_transient_retries}",
++                                            "cooldown_until": time.time() + wait_seconds,
++                                        })
++                                        self._ui_latest(('health',), self.app.refresh_safety_health_table)
++                                        self.app.log(
++                                            f"{name}: {account.display} → {path.name}: ⚠️ временная ошибка — {friendly}; "
++                                            f"повтор {transient_retry_count}/{max_transient_retries} через {wait_seconds:.0f}с"
++                                        )
++                                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'↻ Повтор {transient_retry_count}/{max_transient_retries} через {wait_seconds:.0f}с')
++                                        if not await self._sleep_stop(wait_seconds):
++                                            release_reservation()
++                                            queue_for_path(path).put_nowait(item)
++                                            return
++                                        if not await self._wait_gate(tid):
++                                            release_reservation()
++                                            queue_for_path(path).put_nowait(item)
++                                            return
++                                        h["state"] = "OK"
++                                        h["cooldown_until"] = 0.0
++                                        self._ui_latest(('health',), self.app.refresh_safety_health_table)
++                                        transfer.update({"current": 0, "speed": 0.0, "last_current": 0, "last_time": time.monotonic()})
++                                        state["active"][key] = transfer
++                                        continue
++
++                                    release_reservation()
++                                    state["processed_bytes"] += size
++                                    state["processed_files"] += 1
++                                    state["failed"] += 1
++                                    self.app.log(f"{name}: {account.display} → {path.name}: ❌ {friendly}")
++                                    attempts_total = 1 + transient_retry_count + int(file_part_requeue_cycles.get(str(path), 0))
++                                    self.app.record_upload_error(
++                                        task=name, target=task_target, path=str(path), account=account.display,
++                                        attempts=attempts_total, error=friendly,
+                                     )
+-                                except Exception:
+-                                    pass
+-                                self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '❌ Ошибка')
+-                                self._emit_task_metrics(tid, force=True)
+-                                break
++                                    try:
++                                        self.app.state_db.transfer_stat_record(
++                                            session=session, account_label=account.display, task=name, target=task_target, path=str(path),
++                                            size=size, duration=max(0.001, time.monotonic() - transfer_started), success=False, error=friendly,
++                                        )
++                                    except Exception:
++                                        pass
++                                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '❌ Ошибка')
++                                    self._emit_task_metrics(tid, force=True)
++                                    break
++
++                        finally:
++                            await self._finish_diagnostic(key, False)
+ 
+                 # The next byte upload can begin immediately. Publication of
+                 # its handle observes the shared per-account interval above.

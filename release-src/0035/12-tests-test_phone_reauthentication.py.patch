@@ -1,0 +1,10 @@
+--- a/app/tests/test_phone_reauthentication.py
++++ b/app/tests/test_phone_reauthentication.py
+@@ -39,6 +39,7 @@
+         self.app=SimpleNamespace(store=self.store,_closed=False,_api_credentials=lambda:(1,'synthetic-api-hash'),
+             log=self.logs.append,ui_call=lambda fn:fn(),refresh_account_list=lambda:None)
+         self.app._account_from_me=main.TelegramAdminManager._account_from_me
++        self.app._new_telegram_client=lambda *args, **kw: main.TelegramAdminManager._new_telegram_client(self.app, *args, **kw)
+         self.app._save_account=lambda a:main.TelegramAdminManager._save_account(self.app,a)
+         self.app._delete_session_files=main.TelegramAdminManager._delete_session_files
+         self.app._sent_code_description=main.TelegramAdminManager._sent_code_description

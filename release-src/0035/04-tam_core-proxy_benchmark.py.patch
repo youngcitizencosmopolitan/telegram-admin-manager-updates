@@ -1,0 +1,80 @@
+--- /dev/null
++++ b/app/tam_core/proxy_benchmark.py
+@@ -0,0 +1,77 @@
++"""Explicit sequential byte-transfer test. Never publishes messages or changes routes."""
++import asyncio
++import time
++import uuid
++from pathlib import Path
++
++from .file_readiness import read_stamp
++
++
++async def compare_routes(make_client, diagnostics, session, path, proxy_options, proxy_route, cancelled):
++    task = asyncio.create_task(_compare_routes(make_client, diagnostics, session, path, proxy_options, proxy_route, cancelled))
++    try:
++        while not task.done():
++            if cancelled():
++                task.cancel()
++                break
++            await asyncio.wait({task}, timeout=0.1)
++        return await task
++    except asyncio.CancelledError:
++        task.cancel()
++        await asyncio.gather(task, return_exceptions=True)
++
++
++async def _compare_routes(make_client, diagnostics, session, path, proxy_options, proxy_route, cancelled):
++    path = Path(path)
++    stamp = await asyncio.to_thread(read_stamp, path)
++    size = path.stat().st_size
++    comparison_id = uuid.uuid4().hex
++    for route, options in [('direct', {}), (proxy_route, proxy_options)]:
++        if cancelled():
++            return
++        if await asyncio.to_thread(read_stamp, path) != stamp:
++            raise RuntimeError('Файл изменился; сравнение отменено.')
++        client = None
++        key = 'comparison:' + uuid.uuid4().hex
++        started = False
++        observer = None
++        try:
++            client = make_client(options)
++            await asyncio.wait_for(client.connect(), 30)
++            from .upload_observer import observe_upload_loop
++            observer = asyncio.create_task(observe_upload_loop(diagnostics, lambda:[client]))
++            if not await client.is_user_authorized():
++                raise RuntimeError('Для теста требуется уже авторизованный аккаунт.')
++            if cancelled():
++                return
++            diagnostics.begin(key, session, str(path), size, route, comparison=True, comparison_id=comparison_id)
++            started = True
++            def progress(current, total):
++                if cancelled():
++                    raise asyncio.CancelledError()
++                diagnostics.progress(key, current)
++            # Same size/part size/account, one client at a time; no send_file call.
++            await client.upload_file(str(path), part_size_kb=512, file_size=size, progress_callback=progress)
++            if await asyncio.to_thread(read_stamp, path) != stamp:
++                raise RuntimeError('Файл изменился во время теста.')
++            await asyncio.to_thread(diagnostics.finish, key, True)
++            started = False
++        except asyncio.CancelledError:
++            return
++        except Exception:
++            if started:
++                diagnostics.event(key, 'error')
++            # No recovery by another route: failure stops the whole comparison.
++            raise RuntimeError('Сравнительный тест прерван: ошибка маршрута, авторизации или передачи. Резервный маршрут не включался.') from None
++        finally:
++            if observer is not None:
++                observer.cancel()
++                await asyncio.gather(observer, return_exceptions=True)
++            if started:
++                await asyncio.to_thread(diagnostics.finish, key, False)
++            if client is not None:
++                try:
++                    await asyncio.wait_for(client.disconnect(), 5)
++                except (Exception, asyncio.CancelledError):
++                    if not cancelled():
++                        raise RuntimeError('Не удалось закрыть тестовое соединение. Сравнение остановлено до запуска следующего маршрута.') from None
