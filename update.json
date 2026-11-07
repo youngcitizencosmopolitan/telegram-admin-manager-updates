@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0033",
-  "display_version": "0033",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0033/TelegramAdminManager_v0033_update.zip",
-  "sha256": "0a13da39b620a23d576f1cd2a895a1052c0f82ea2fc940641f33b4cdac1c9572",
-  "notes": "0033: persist upload prepublication phase and automatically reclaim interrupted preparation and video transfer claims on restart. Fence publication by exact claim token before sending. Preserve current claims, confirmed history, legacy unknown results and ambiguous publications; those still require review to avoid duplicate posts."
+  "version": "4.3.8.0034",
+  "display_version": "0034",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0034/TelegramAdminManager_v0034_update.zip",
+  "sha256": "e974c9bb2f1b00fc25d3c2323299b121d1688736dfe6dd8db16eb284cc2b5ebd",
+  "notes": "0034: show effective successful upload throughput over the last 10, 30 and 60 wall-clock minutes in the monitoring summary. Credit file bytes on confirmed completion, include pauses and idle time, exclude failures and partial uploads. Read persisted statistics with a bounded indexed aggregate off the Tk thread every 15 seconds, coalesce refreshes, expire old values while idle and wrap summary text to available width. No additional Telegram requests."
 }
