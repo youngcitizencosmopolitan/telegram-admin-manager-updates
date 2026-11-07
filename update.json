@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0035",
-  "display_version": "0035",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0035/TelegramAdminManager_v0035_update.zip",
-  "sha256": "82d1752a7c39f381cb5856c78faa12e46e5e12b93cc3b58e6e960f78808bb589",
-  "notes": "0035: add per-account SOCKS5 proxy manager with encrypted Windows DPAPI credentials, atomic bulk import, assignment, round-robin distribution, explicit direct mode and background tunnel checks. Route every Telegram client and reauthentication stage through assigned options with no direct fallback; preserve account/session identity. Add bounded nonblocking upload diagnostics, per-account and total logical speed, duration, retries, FloodWait, event-loop lag and MTProto sender counts. Explicit cancellable sequential A/B byte-upload test uses one existing session, one unchanged file, fixed512KiB parts, no publication and paired run IDs. Preserve all0034 rolling statistics and upload limits; fail closed on corrupt routing config."
+  "version": "4.3.8.0036",
+  "display_version": "0036",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0036/TelegramAdminManager_v0036_update.zip",
+  "sha256": "edbf08a9ec21a2d431eadcaf865f7ac3c436ed26e6d80996a1145832d610532d",
+  "notes": "0036: add per-account MTProto proxies alongside SOCKS5 using Telethon RandomizedIntermediate. Encrypt secrets with Windows DPAPI, preserve existing assignments and sessions, import MTProto links or HOST:PORT:SECRET atomically with SOCKS5 lines. Accept standard32hex anddd secrets, reject unsupported FakeTLS. Separate masked MTProto editor and protocol labels; TCP reachability checks explicitly do not confirm MTProto authentication. Preserve fail-closed routing and existing upload diagnostics and controls."
 }
