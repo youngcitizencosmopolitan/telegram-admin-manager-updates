@@ -1,0 +1,22 @@
+--- a/app/tests/test_proxy_client_routing.py
++++ b/app/tests/test_proxy_client_routing.py
+@@ -36,6 +36,19 @@
+             app._new_telegram_client('sessions/saved',1,'hash')
+         factory.assert_not_called()
+ 
++    def test_mtproto_transport_reaches_factory_and_direct_benchmark_has_no_override(self):
++        app = self.app()
++        class MTTransport: pass
++        app.proxy_manager.options.return_value = {'connection': MTTransport,
++            'proxy': ('proxy.example',443,'0'*32)}
++        with patch.object(main, 'TelegramClient') as factory:
++            app._new_telegram_client('sessions/saved',1,'hash',proxy_session='saved')
++            self.assertIs(factory.call_args.kwargs['connection'],MTTransport)
++            self.assertEqual(factory.call_args.kwargs['proxy'],('proxy.example',443,'0'*32))
++            app._new_telegram_client('sessions/saved',1,'hash',_connection_options={})
++            self.assertNotIn('proxy',factory.call_args.kwargs)
++            self.assertNotIn('connection',factory.call_args.kwargs)
++
+     def test_batch_routes_through_same_factory(self):
+         pane = BatchUploaderPane.__new__(BatchUploaderPane)
+         pane.app = SimpleNamespace(_new_telegram_client=Mock(return_value='client'))

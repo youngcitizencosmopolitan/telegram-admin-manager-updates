@@ -1,0 +1,111 @@
+--- a/app/tam_ui/proxy_manager.py
++++ b/app/tam_ui/proxy_manager.py
+@@ -17,12 +17,12 @@
+         self.rowconfigure(4, weight=1)
+         tools = ttk.Frame(self)
+         tools.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+-        for text, command in [('Добавить', self.add_proxy), ('Изменить', self.edit_selected),
++        for text, command in [('Добавить SOCKS5', self.add_proxy), ('Добавить MTProto', self.add_mtproto), ('Изменить', self.edit_selected),
+                               ('Удалить', self.delete_selected), ('Импорт списком', self.import_proxies),
+                               ('Проверить выбранный', self.check_selected), ('Обновить', self.refresh)]:
+             ttk.Button(tools, text=text, command=command).pack(side='left', padx=(0, 5))
+         self.proxy_tree = self._tree(1, ('host', 'port', 'status'),
+-                                    ('SOCKS5 сервер', 'Порт', 'Проверка'), 'browse')
++                                    ('Протокол / сервер', 'Порт', 'Проверка'), 'browse')
+         ttk.Label(self, text='Изменения маршрута применяются при следующем подключении. '
+                   'При ошибке прокси прямое подключение автоматически не включается.',
+                   wraplength=900).grid(row=2, column=0, sticky='w', pady=8)
+@@ -79,7 +79,8 @@
+         self._proxies = {str(proxy['id']): proxy for proxy in proxies}
+         for proxy_id, proxy in self._proxies.items():
+             self.proxy_tree.insert('', 'end', iid=proxy_id,
+-                values=(proxy['host'], proxy['port'], self._results.get(proxy_id, 'Не проверен')))
++                values=(f"{'MTProto' if proxy.get('protocol') == 'mtproto' else 'SOCKS5'} · {proxy['host']}",
++                        proxy['port'], self._results.get(proxy_id, 'Не проверен')))
+         for session, display, route in rows:
+             self.account_tree.insert('', 'end', iid=session, values=(display, route))
+         self.proxy_tree.selection_set([item for item in selected if self.proxy_tree.exists(item)])
+@@ -133,7 +134,49 @@
+     def edit_selected(self):
+         proxy_id = self._selected_proxy()
+         if proxy_id is not None and self._allowed():
+-            self._proxy_dialog(proxy_id)
++            if self._proxies.get(proxy_id, {}).get('protocol') == 'mtproto':
++                self._mtproto_dialog(proxy_id)
++            else:
++                self._proxy_dialog(proxy_id)
++
++    def add_mtproto(self):
++        if self._allowed():
++            self._mtproto_dialog()
++
++    def _mtproto_dialog(self, proxy_id=None):
++        dialog = tk.Toplevel(self)
++        dialog.title('Изменить MTProto прокси' if proxy_id else 'Добавить MTProto прокси')
++        dialog.transient(self.winfo_toplevel())
++        dialog.resizable(False, False)
++        values = self._proxies.get(proxy_id, {})
++        fields = {}
++        for row, (key, label) in enumerate([('host', 'Сервер'), ('port', 'Порт'), ('secret', 'Секрет')]):
++            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky='w', padx=10, pady=5)
++            entry = ttk.Entry(dialog, width=44, show='*' if key == 'secret' else '')
++            entry.grid(row=row, column=1, padx=10, pady=5)
++            if key in ('host', 'port'):
++                entry.insert(0, str(values.get(key, '')))
++            fields[key] = entry
++        keep = tk.BooleanVar(master=dialog, value=bool(proxy_id))
++        if proxy_id:
++            ttk.Checkbutton(dialog, text='Сохранить текущий секрет', variable=keep).grid(
++                row=3, column=0, columnspan=2, sticky='w', padx=10)
++        ttk.Label(dialog, text='Поддерживаются секрет из 32 шестнадцатеричных символов и dd + 32 символа.\n'
++                  'FakeTLS (ee) не поддерживается используемой версией Telethon.',
++                  wraplength=510).grid(row=4, column=0, columnspan=2, sticky='w', padx=10, pady=8)
++        def save():
++            data = {key: entry.get() for key, entry in fields.items()}
++            if proxy_id:
++                operation = lambda: self.manager.update_mtproto(
++                    proxy_id, **data, keep_credentials=keep.get() and not data['secret'])
++            else:
++                operation = lambda: self.manager.add_mtproto(**data)
++            if self._mutate(operation):
++                dialog.destroy()
++        ttk.Button(dialog, text='Сохранить', command=save).grid(row=5, column=0, padx=10, pady=10)
++        ttk.Button(dialog, text='Отмена', command=dialog.destroy).grid(row=5, column=1, sticky='e', padx=10, pady=10)
++        fields['host'].focus_set()
++        dialog.grab_set()
+ 
+     def _proxy_dialog(self, proxy_id=None):
+         dialog = tk.Toplevel(self)
+@@ -169,9 +212,12 @@
+         if not self._allowed():
+             return
+         dialog = tk.Toplevel(self)
+-        dialog.title('Импорт SOCKS5 прокси')
++        dialog.title('Импорт прокси')
+         dialog.transient(self.winfo_toplevel())
+-        ttk.Label(dialog, text='Один прокси на строку: host:port или host:port:login:password.\n'
++        ttk.Label(dialog, text='Один прокси на строку. SOCKS5: host:port или host:port:login:password.\n'
++                  'MTProto: host:port:secret, tg://proxy?server=…&port=…&secret=…\n'
++                  'или https://t.me/proxy?server=…&port=…&secret=…\n'
++                  'MTProto: секрет 32 hex или dd + 32 hex. FakeTLS (ee) не поддерживается.\n'
+                   'Импорт выполняется целиком: при ошибке ни одна строка не сохраняется.').pack(padx=10, pady=10)
+         body = tk.Text(dialog, width=72, height=14)
+         body.pack(fill='both', expand=True, padx=10)
+@@ -190,12 +236,15 @@
+         self._checking = True
+         self._results[proxy_id] = 'Проверка…'
+         self.refresh()
+-        self.status_var.set('Проверка SOCKS5…')
++        self.status_var.set('Проверка прокси…')
+         def worker():
+             try:
+                 result = self.manager.check(proxy_id, timeout=8)
+                 if result.get('ok'):
+-                    text = f"Доступен · {float(result['latency_ms']):.1f} мс"
++                    if result.get('scope') == 'tcp':
++                        text = f"TCP доступен · MTProto не подтверждён · {float(result['latency_ms']):.1f} мс"
++                    else:
++                        text = f"Доступен · {float(result['latency_ms']):.1f} мс"
+                 else:
+                     text = result.get('error') or 'Проверка не пройдена'
+             except Exception:

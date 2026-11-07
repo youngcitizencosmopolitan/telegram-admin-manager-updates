@@ -1,0 +1,29 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0035"
++APP_VERSION = "0036"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -365,7 +365,7 @@
+                 raise ValueError('Выбери непустой файл до 2 ГБ для одинаковых условий теста.')
+             options = self.proxy_manager.options(session)
+             if not options:
+-                raise ValueError('Сначала назначь аккаунту SOCKS5-прокси.')
++                raise ValueError('Сначала назначь аккаунту прокси.')
+             proxy_id = self.store.data['account_proxies'][session]
+             api_id, api_hash = self._api_credentials()
+         except Exception as exc:
+@@ -381,7 +381,7 @@
+         def run():
+             asyncio.run(compare_routes(make_client, self.upload_diagnostics, session, path, options,
+                 f'proxy:{proxy_id}', lambda: self._closed or self._proxy_benchmark_stop.is_set()))
+-        self.run_worker(run, 'Сравнение: один файл, прямое подключение / SOCKS5…')
++        self.run_worker(run, 'Сравнение: один файл, прямое подключение / назначенный прокси…')
+ 
+     def __init__(self):
+         super().__init__()
