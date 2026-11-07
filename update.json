@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0036",
-  "display_version": "0036",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0036/TelegramAdminManager_v0036_update.zip",
-  "sha256": "edbf08a9ec21a2d431eadcaf865f7ac3c436ed26e6d80996a1145832d610532d",
-  "notes": "0036: add per-account MTProto proxies alongside SOCKS5 using Telethon RandomizedIntermediate. Encrypt secrets with Windows DPAPI, preserve existing assignments and sessions, import MTProto links or HOST:PORT:SECRET atomically with SOCKS5 lines. Accept standard32hex anddd secrets, reject unsupported FakeTLS. Separate masked MTProto editor and protocol labels; TCP reachability checks explicitly do not confirm MTProto authentication. Preserve fail-closed routing and existing upload diagnostics and controls."
+  "version": "4.3.8.0037",
+  "display_version": "0037",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0037/TelegramAdminManager_v0037_update.zip",
+  "sha256": "25d7e162dd0d096f664311254087e0d501c42ca0d93583d10fdf8968c2f4166f",
+  "notes": "0037: quiet the visible journal by default, retaining original full disk and event logs. Hide known routine upload/cache/successful connection chatter; show first/changed connection failures and recovery, summarize identical repeated failures at most once per five minutes with bounded thread-safe state. Add a persistent detailed-journal checkbox. Stop forcing readers to the bottom when new messages arrive; auto-follow continues when already at the end. Upload, connection retry and scan behavior are unchanged."
 }
