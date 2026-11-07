@@ -1,0 +1,84 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -426,13 +426,19 @@
+ 
+ 
+ def _monitor_transfer_summary_text(
+-    *, speed: float, done_files: int, total_files: int, remaining: int, eta: float | None
++    *, speed: float, done_files: int, total_files: int, remaining: int, eta: float | None,
++    window_rates: dict[int, float] | None = None,
+ ) -> str:
+     remaining_text = _fmt_bytes(remaining) if remaining else "0 Б"
+-    return (
++    text = (
+         f"Осталось загрузить: {remaining_text} · файлов: {done_files} / {total_files} · "
+         f"скорость: {_fmt_speed(speed)} · ETA: {_fmt_eta(eta)}"
+     )
++    if window_rates is not None:
++        text += ' · Факт: ' + ' · '.join(
++            f'{minutes} мин: {_fmt_speed(window_rates[minutes]) if window_rates[minutes] > 0 else "0 Б/с"}'
++            for minutes in (10, 30, 60))
++    return text
+ 
+ 
+ def _parse_human_bytes(text: str) -> float:
+@@ -966,9 +972,12 @@
+         self.monitor_transfer_summary_var = tk.StringVar(
+             value="Осталось загрузить: 0 Б · файлов: 0 / 0 · скорость: — · ETA: —"
+         )
+-        ttk.Label(
++        summary_label = ttk.Label(
+             p, textvariable=self.monitor_transfer_summary_var, font=("Segoe UI", 10, "bold")
+-        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
++        )
++        summary_label.grid(row=1, column=0, sticky="ew", pady=(0, 8))
++        p.bind('<Configure>', lambda event: summary_label.configure(wraplength=max(300, event.width-16)), add='+')
++        self.app.after(1000, self._refresh_transfer_rates)
+ 
+         cache_bar = ttk.LabelFrame(p, text="Кэш Telegram", padding=7)
+         cache_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+@@ -5679,7 +5688,34 @@
+         if hasattr(self.app, "_refresh_account_status_panel"):
+             self._ui_latest(('accounts',), self.app._refresh_account_status_panel)
+ 
++    def _refresh_transfer_rates(self) -> None:
++        """One bounded, background aggregate per 15 seconds, even while idle."""
++        if getattr(self, '_transfer_rates_loading', False):
++            return
++        reader = getattr(getattr(self.app, 'state_db', None), 'transfer_window_rates', None)
++        if reader is None:
++            return
++        self._transfer_rates_loading = True
++        def read():
++            try:
++                rates = reader()
++            except Exception:
++                rates = None
++            def finish():
++                self._transfer_rates_loading = False
++                self._transfer_window_rates = rates
++                values = getattr(self, '_last_dashboard_values', None)
++                if values is not None:
++                    self._set_dashboard(*values)
++                else:
++                    self.monitor_transfer_summary_var.set(_monitor_transfer_summary_text(
++                        speed=0, done_files=0, total_files=0, remaining=0, eta=None, window_rates=rates))
++                self.app.after(15000, self._refresh_transfer_rates)
++            self.app.ui_call(finish)
++        threading.Thread(target=read, daemon=True).start()
++
+     def _set_dashboard(self, speed: float, done_files: int, total_files: int, remaining: int, eta: float | None, failures: int, pct: float, active_count: int = 0) -> None:
++        self._last_dashboard_values = (speed, done_files, total_files, remaining, eta, failures, pct, active_count)
+         blocked = self._unconfirmed_count()
+         self.total_speed_var.set(_fmt_speed(speed))
+         self.done_var.set(f"{done_files} / {total_files}")
+@@ -5693,7 +5729,8 @@
+         if hasattr(self, "monitor_transfer_summary_var"):
+             self.monitor_transfer_summary_var.set(
+                 _monitor_transfer_summary_text(
+-                    speed=speed, done_files=done_files, total_files=total_files, remaining=remaining, eta=eta
++                    speed=speed, done_files=done_files, total_files=total_files, remaining=remaining, eta=eta,
++                    window_rates=getattr(self, '_transfer_window_rates', None),
+                 ) + (f' · Неподтверждено: {blocked}' if blocked else '')
+             )
+ 
