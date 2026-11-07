@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/app/tests/test_proxy_manager_ui.py
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,153 @@
 +import queue
 +import threading
 +import tkinter as tk
@@ -36,7 +36,12 @@
 +
 +class ProxyPaneTests(unittest.TestCase):
 +    def setUp(self):
-+        self.root = tk.Tk()
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            if 'display' in str(exc).lower():
++                self.skipTest(f'Tk display is unavailable: {exc}')
++            raise
 +        self.root.withdraw()
 +        self.manager = FakeManager()
 +        self.callbacks = queue.Queue()
