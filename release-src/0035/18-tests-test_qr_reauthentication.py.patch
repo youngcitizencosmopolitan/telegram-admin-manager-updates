@@ -1,0 +1,10 @@
+--- a/app/tests/test_qr_reauthentication.py
++++ b/app/tests/test_qr_reauthentication.py
+@@ -41,6 +41,7 @@
+             ui_ask=lambda fn: fn(), ui_call=lambda fn: fn(), log=lambda text: None,
+             refresh_account_list=lambda: None)
+         self.app._account_from_me = main.TelegramAdminManager._account_from_me
++        self.app._new_telegram_client = lambda *args, **kw: main.TelegramAdminManager._new_telegram_client(self.app, *args, **kw)
+         self.app.ui_ask_async = lambda fn: main.TelegramAdminManager.ui_ask_async(self.app, fn)
+         self.app._save_account = lambda account: main.TelegramAdminManager._save_account(self.app, account)
+         self.app._delete_session_files = main.TelegramAdminManager._delete_session_files

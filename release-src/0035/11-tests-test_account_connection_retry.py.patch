@@ -1,0 +1,10 @@
+--- a/app/tests/test_account_connection_retry.py
++++ b/app/tests/test_account_connection_retry.py
+@@ -113,6 +113,7 @@
+         app = self.pane.app
+         app.batch_uploader = self.pane
+         app._api_credentials = lambda: (1, 'synthetic-hash')
++        app._new_telegram_client = lambda *args, **kw: main.TelegramAdminManager._new_telegram_client(app, *args, **kw)
+         app.accounts_for = lambda capability: self.accounts
+         app.store.data = {}
+         app.group_state_cache = SimpleNamespace(cached_controller=lambda *_:cached, mark_admins=lambda *_args, **_kwargs:None)

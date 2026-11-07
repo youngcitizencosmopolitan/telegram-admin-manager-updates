@@ -1,0 +1,26 @@
+--- /dev/null
++++ b/app/tests/test_upload_observer.py
+@@ -0,0 +1,23 @@
++import asyncio
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_core.upload_observer import observe_upload_loop
++
++
++class UploadObserverTests(unittest.IsolatedAsyncioTestCase):
++    async def test_observer_counts_live_senders_and_clears_on_cancel(self):
++        lags, counts = [], []
++        collector = SimpleNamespace(lag=lags.append, transports=counts.append)
++        client = SimpleNamespace(is_connected=lambda:True,
++            _borrowed_senders={2:(None, SimpleNamespace(is_connected=lambda:True))})
++        calls = []
++        async def tick(seconds):
++            calls.append(seconds)
++            if len(calls)>1: raise asyncio.CancelledError()
++        with patch('tam_core.upload_observer.asyncio.sleep',tick):
++            with self.assertRaises(asyncio.CancelledError):
++                await observe_upload_loop(collector,lambda:[client])
++        self.assertEqual(counts,[2,0])
++        self.assertEqual(lags[-1],0)

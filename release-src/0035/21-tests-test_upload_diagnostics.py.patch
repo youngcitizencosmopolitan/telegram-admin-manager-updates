@@ -1,0 +1,193 @@
+--- /dev/null
++++ b/app/tests/test_upload_diagnostics.py
+@@ -0,0 +1,190 @@
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from tam_core.state_db import StateDatabase
++
++
++class UploadDiagnosticsTests(unittest.TestCase):
++    def setUp(self):
++        from tam_core.upload_diagnostics import UploadDiagnostics
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.db = StateDatabase(Path(self.temp.name) / 'state.db')
++        self.service = UploadDiagnostics(self.db)
++        self.addCleanup(self.service.flush)
++
++    def test_progress_totals_include_concurrent_uploads_and_elapsed_waits(self):
++        with patch('tam_core.upload_diagnostics.time.monotonic', return_value=10):
++            self.service.begin('a', 's', 'a.mp4', 1000, 'direct')
++            self.service.begin('b', 's', 'b.mp4', 2000, 'proxy:7')
++        self.service.progress('a', 400)
++        self.service.progress('a', 200)  # retried callback must not subtract bytes
++        self.service.progress('b', 800)
++        self.service.event('a', 'retry')
++        self.service.event('a', 'flood')
++        self.service.event('b', 'error')
++        with patch('tam_core.upload_diagnostics.time.monotonic', return_value=14):
++            snap = self.service.snapshot()
++            self.service.finish('a', True)
++        self.assertEqual(snap['total']['active'], 2)
++        self.assertEqual(snap['accounts']['s']['bytes'], 1200)
++        self.assertEqual(snap['total']['speed'], 300)
++        self.assertEqual(snap['total']['retries'], 1)
++        self.assertEqual(snap['total']['floods'], 1)
++        row = self.service.history()[0]
++        self.assertEqual(row['bytes'], 1000)
++        self.assertEqual(row['duration'], 4)
++        self.assertEqual(row['speed'], 250)
++        self.service.finish('a', True)
++        self.assertEqual(len(self.service.history()), 1)
++
++    def test_history_survives_restart_and_comparison_matches_account_file_size(self):
++        from tam_core.upload_diagnostics import UploadDiagnostics
++        for index, (session, path, size, route, duration, success) in enumerate([
++            ('s', 'a', 1000, 'direct', 10, True),
++            ('s', 'a', 1000, 'proxy:7', 5, True),
++            ('s2', 'a', 1000, 'proxy:7', 1, True),
++            ('s', 'b', 1000, 'proxy:7', 1, True),
++            ('s', 'a', 2000, 'proxy:7', 1, True),
++            ('s', 'a', 1000, 'proxy:7', 1, False),
++        ]):
++            self.service.record_comparison(session, path, size, route, duration, success,
++                                           comparison_id='pair' if index < 2 else f'partial-{index}')
++        self.service.flush()
++        restored = UploadDiagnostics(self.db)
++        self.assertEqual(len(restored.history()), 6)
++        comparisons = restored.comparisons()
++        self.assertEqual(len(comparisons), 1)
++        self.assertEqual(comparisons[0]['direct_speed'], 100)
++        self.assertEqual(comparisons[0]['proxy_speed'], 200)
++        self.assertEqual(comparisons[0]['ratio'], 2)
++
++    def test_storage_failure_and_invalid_callbacks_cannot_break_upload(self):
++        self.service.begin('a', 's', 'a', 10, 'socks5://user:secret@host')
++        self.assertEqual(self.service.snapshot()['active'][0]['route'], 'unknown')
++        self.service.progress('missing', 10)
++        self.service.event('missing', 'error')
++        with patch('tam_core.upload_diagnostics.sqlite3.connect', side_effect=RuntimeError('offline')):
++            self.service.finish('a', False)
++            self.assertTrue(self.service.flush())
++            self.assertEqual(self.service.history(), [])
++        self.assertEqual(self.service.snapshot()['total']['active'], 0)
++
++    def test_history_bound_and_limit(self):
++        for i in range(1005):
++            self.service.record_comparison('s', str(i), 10, 'direct', 1, True)
++            if i % 32 == 0:
++                self.service.flush()
++        self.assertEqual(len(self.service.history(2000)), 1000)
++        self.assertEqual(len(self.service.history(3)), 3)
++        self.assertEqual(self.service.history(1)[0]['path'], '1004')
++
++class DiagnosticsPaneTests(unittest.TestCase):
++    def test_stop_requests_comparison_cancellation(self):
++        from types import SimpleNamespace
++        from tam_ui.upload_diagnostics import DiagnosticsPane
++        stopped = []
++        pane = object.__new__(DiagnosticsPane)
++        pane.app = SimpleNamespace(stop_proxy_comparison=lambda: stopped.append(True))
++        pane._stop_comparison()
++        self.assertEqual(stopped, [True])
++
++    def test_comparison_guard_prevents_file_picker_and_dispatch(self):
++        from types import SimpleNamespace
++        from tam_ui.upload_diagnostics import DiagnosticsPane
++        dispatched = []
++        pane = object.__new__(DiagnosticsPane)
++        pane.app = SimpleNamespace(_proxy_changes_allowed=lambda: False,
++                                   start_proxy_comparison=lambda *args: dispatched.append(args))
++        with patch('tam_ui.upload_diagnostics.filedialog.askopenfilename') as picker:
++            pane._compare()
++        picker.assert_not_called()
++        self.assertEqual(dispatched, [])
++
++    def test_comparison_dispatch_uses_selected_account_and_file(self):
++        from types import SimpleNamespace
++        from tam_ui.upload_diagnostics import DiagnosticsPane
++        dispatched = []
++        pane = object.__new__(DiagnosticsPane)
++        pane.app = SimpleNamespace(_proxy_changes_allowed=lambda: True,
++                                   start_proxy_comparison=lambda *args: dispatched.append(args))
++        pane.account_box = SimpleNamespace(current=lambda: 1)
++        pane._accounts = [SimpleNamespace(session='first'), SimpleNamespace(session='selected')]
++        with patch('tam_ui.upload_diagnostics.filedialog.askopenfilename', return_value='C:/video.mp4'):
++            pane._compare()
++        self.assertEqual(dispatched, [('selected', 'C:/video.mp4')])
++
++class CompletedDiagnosticsTests(unittest.TestCase):
++    setUp = UploadDiagnosticsTests.setUp
++    def test_observer_metrics_handle_invalid_samples(self):
++        self.service.lag(0.125)
++        self.service.transports(4)
++        self.service.lag(float('nan'))
++        self.service.transports('invalid')
++        self.assertEqual(self.service.snapshot()['loop_lag'], 0.125)
++        self.assertEqual(self.service.snapshot()['transports'], 4)
++
++    def test_benchmark_begin_marks_pair_and_completed_events_remain_visible(self):
++        with patch('tam_core.upload_diagnostics.time.monotonic', return_value=10):
++            self.service.begin('a', 's', 'a', 100, 'direct', comparison=True, comparison_id='test-pair')
++            self.service.begin('b', 's', 'a', 100, 'proxy:7', comparison=True, comparison_id='test-pair')
++        self.service.event('a', 'retry')
++        self.service.event('a', 'flood')
++        with patch('tam_core.upload_diagnostics.time.monotonic', return_value=12):
++            self.service.finish('a', True)
++            self.service.finish('b', True)
++        snap = self.service.snapshot()
++        self.assertEqual(snap['total']['active'], 0)
++        self.assertEqual(snap['accounts']['s']['retries'], 1)
++        self.assertEqual(snap['total']['floods'], 1)
++        self.assertEqual(len(self.service.comparisons()), 1)
++
++class PersistenceAndPairingTests(unittest.TestCase):
++    setUp = UploadDiagnosticsTests.setUp
++
++    def test_locked_database_does_not_delay_finish_and_queue_stays_bounded(self):
++        import time
++        with self.db.session() as conn:
++            conn.execute('BEGIN IMMEDIATE')
++            self.service.begin('a', 's', 'a', 10, 'direct')
++            started = time.perf_counter()
++            self.service.finish('a', True)
++            elapsed = time.perf_counter() - started
++            self.assertLess(elapsed, 0.2)
++            for i in range(400):
++                self.service.record_comparison('s', str(i), 10, 'direct', 1, True)
++            self.assertLessEqual(self.service.pending_count(), 129)
++            self.assertFalse(self.service.flush(timeout=0))
++        self.assertTrue(self.service.flush(timeout=10))
++        self.assertEqual(self.service.snapshot()['total']['active'], 0)
++
++    def test_legacy_table_migrates_without_pairing_old_rows(self):
++        from tam_core.upload_diagnostics import UploadDiagnostics
++        self.service.record_comparison('s', 'a', 10, 'direct', 1, True, comparison_id='old')
++        self.service.flush()
++        with self.db.session() as conn:
++            conn.execute('ALTER TABLE upload_diagnostics DROP COLUMN comparison_id')
++        restored = UploadDiagnostics(self.db)
++        rows = restored.history()
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0]['comparison_id'], '')
++        self.assertEqual(restored.comparisons(rows), [])
++
++    def test_pairing_ignores_legacy_partial_and_inconsistent_runs(self):
++        def row(run, route, **changes):
++            result = dict(comparison=1, comparison_id=run, route=route, session='s',
++                          path='a', size=100, bytes=100, success=True, duration=2)
++            result.update(changes)
++            return result
++        rows = [row('', 'direct'), row('', 'proxy:7'),
++                row('partial-a', 'direct'), row('partial-b', 'proxy:7'),
++                row('changed', 'direct'), row('changed', 'proxy:7', size=101),
++                row('failed', 'direct'), row('failed', 'proxy:7', success=False),
++                row('ambiguous', 'direct'), row('ambiguous', 'proxy:7'), row('ambiguous', 'proxy:8'),
++                row('valid', 'direct'), row('valid', 'proxy:7', duration=1)]
++        comparisons = self.service.comparisons(rows)
++        self.assertEqual(len(comparisons), 1)
++        self.assertEqual(comparisons[0]['comparison_id'], 'valid')
++        self.assertEqual(comparisons[0]['ratio'], 2)

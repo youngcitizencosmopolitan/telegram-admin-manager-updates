@@ -1,0 +1,257 @@
+--- /dev/null
++++ b/app/tam_core/upload_diagnostics.py
+@@ -0,0 +1,254 @@
++"""Best-effort upload telemetry; timing includes retries and FloodWait sleeps.
++
++Progress is the highest reported logical file offset, not network wire bytes.
++Snapshots are memory-only; callers load history on a background thread.
++"""
++from __future__ import annotations
++
++from collections import deque
++import math
++import re
++import sqlite3
++import threading
++import time
++
++
++class UploadDiagnostics:
++    def __init__(self, db):
++        self.db = db
++        self._lock = threading.RLock()
++        self._active = {}
++        self._recent = deque(maxlen=1000)
++        self._completed_events = {}
++        self._loop_lag = 0.0
++        self._transports = 0
++        self._pending = deque(maxlen=128)
++        self._pending_condition = threading.Condition()
++        self._worker = None
++        self._writing = False
++        try:
++            with db.session() as conn:
++                conn.execute('''CREATE TABLE IF NOT EXISTS upload_diagnostics (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
++                    session TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
++                    route TEXT NOT NULL, duration REAL NOT NULL, bytes INTEGER NOT NULL,
++                    success INTEGER NOT NULL, errors INTEGER NOT NULL,
++                    retries INTEGER NOT NULL, floods INTEGER NOT NULL,
++                    comparison INTEGER NOT NULL DEFAULT 0)''')
++                columns = {r[1] for r in conn.execute('PRAGMA table_info(upload_diagnostics)')}
++                if 'comparison_id' not in columns:
++                    conn.execute("ALTER TABLE upload_diagnostics ADD COLUMN comparison_id TEXT NOT NULL DEFAULT ''")
++        except Exception:
++            pass
++
++    @staticmethod
++    def _route(route):
++        route = str(route)
++        return route if route == 'direct' or re.fullmatch(r'proxy:[A-Za-z0-9_-]{1,80}', route) else 'unknown'
++
++    def begin(self, key, session, path, size, route, comparison=False, comparison_id=''):
++        try:
++            row = dict(session=str(session), path=str(path), size=max(0, int(size)),
++                       route=self._route(route), bytes=0, errors=0, retries=0, floods=0,
++                       started=time.monotonic(), created_at=time.time(), comparison=int(bool(comparison)),
++                       comparison_id=str(comparison_id))
++            with self._lock:
++                self._active[key] = row
++        except Exception:
++            pass
++
++    def progress(self, key, current):
++        try:
++            with self._lock:
++                if key in self._active:
++                    row = self._active[key]
++                    row['bytes'] = max(row['bytes'], min(row['size'], max(0, int(current))))
++        except Exception:
++            pass
++
++    def event(self, key, kind):
++        try:
++            field = {'retry': 'retries', 'error': 'errors', 'flood': 'floods', 'floodwait': 'floods'}.get(str(kind).lower())
++            with self._lock:
++                if field and key in self._active:
++                    self._active[key][field] += 1
++        except Exception:
++            pass
++
++    def lag(self, seconds):
++        try:
++            seconds = float(seconds)
++            if math.isfinite(seconds):
++                with self._lock:
++                    self._loop_lag = max(0, seconds)
++        except Exception:
++            pass
++
++    def transports(self, count):
++        """Record observed MTProto senders; this is not an OS socket count."""
++        try:
++            count = max(0, int(count))
++            with self._lock:
++                self._transports = count
++        except Exception:
++            pass
++
++    def finish(self, key, success):
++        try:
++            with self._lock:
++                row = self._active.pop(key, None)
++                if row is None:
++                    return
++                row['duration'] = max(0, time.monotonic() - row.pop('started'))
++                row['success'] = bool(success)
++                if success:
++                    row['bytes'] = row['size']
++                elif not row['errors']:
++                    row['errors'] = 1
++                row['speed'] = row['bytes'] / row['duration'] if row['duration'] else 0
++                counts = self._completed_events.setdefault(row['session'], dict(errors=0, retries=0, floods=0))
++                for field in counts:
++                    counts[field] += row[field]
++                self._recent.appendleft(dict(row))
++            self._persist(row)
++        except Exception:
++            pass
++
++    def _persist(self, row):
++        """Never wait for disk in an upload callback; discard oldest pending on overload."""
++        with self._pending_condition:
++            self._pending.append(dict(row))
++            if self._worker is None:
++                self._worker = threading.Thread(target=self._persist_worker,
++                                                name='upload-diagnostics-write', daemon=True)
++                self._worker.start()
++            self._pending_condition.notify_all()
++
++    def _persist_worker(self):
++        while True:
++            with self._pending_condition:
++                if not self._pending:
++                    self._pending_condition.wait(1)
++                    if not self._pending:
++                        self._worker = None
++                        self._pending_condition.notify_all()
++                        return
++                row = self._pending.popleft()
++                self._writing = True
++            try:
++                self._write_row(row)
++            except Exception:
++                pass
++            finally:
++                with self._pending_condition:
++                    self._writing = False
++                    self._pending_condition.notify_all()
++
++    def _write_row(self, row):
++        try:
++            keys = ('created_at', 'session', 'path', 'size', 'route', 'duration', 'bytes',
++                    'success', 'errors', 'retries', 'floods', 'comparison', 'comparison_id')
++            conn = sqlite3.connect(self.db.path, timeout=0.05)
++            try:
++                conn.execute('PRAGMA busy_timeout=50')
++                with conn:
++                    conn.execute('INSERT INTO upload_diagnostics (' + ','.join(keys) + ') VALUES (' + ','.join('?' for _ in keys) + ')', tuple(row[k] for k in keys))
++                    conn.execute('DELETE FROM upload_diagnostics WHERE id NOT IN (SELECT id FROM upload_diagnostics ORDER BY id DESC LIMIT 1000)')
++            finally:
++                conn.close()
++        except Exception:
++            pass
++
++    def pending_count(self):
++        with self._pending_condition:
++            return len(self._pending) + int(self._writing)
++
++    def flush(self, timeout=10):
++        """Wait only from history/background callers; upload callbacks never call this."""
++        deadline = time.perf_counter() + max(0, timeout)
++        with self._pending_condition:
++            while self._pending or self._writing:
++                remaining = deadline - time.perf_counter()
++                if remaining <= 0:
++                    return False
++                self._pending_condition.wait(remaining)
++        return True
++
++    def record_comparison(self, session, path, size, route, duration, success, error='', comparison_id=''):
++        try:
++            duration = float(duration)
++            if not math.isfinite(duration):
++                return
++            size = max(0, int(size))
++            row = dict(created_at=time.time(), session=str(session), path=str(path), size=size,
++                       route=self._route(route), duration=max(0, duration), bytes=size if success else 0,
++                       success=bool(success), errors=int(bool(error) or not success), retries=0,
++                       floods=0, comparison=1, comparison_id=str(comparison_id))
++            row['speed'] = row['bytes'] / duration if duration > 0 else 0
++            with self._lock:
++                self._recent.appendleft(dict(row))
++            self._persist(row)
++        except Exception:
++            pass
++
++    def snapshot(self):
++        with self._lock:
++            active = []
++            accounts = {}
++            total = dict(active=0, bytes=0, speed=0, errors=0, retries=0, floods=0)
++            for session, counts in self._completed_events.items():
++                accounts[session] = dict(active=0, bytes=0, speed=0, **counts)
++                for field, count in counts.items():
++                    total[field] += count
++            now = time.monotonic()
++            for row in self._active.values():
++                item = dict(row)
++                item['duration'] = max(0, now - item.pop('started'))
++                item['speed'] = item['bytes'] / item['duration'] if item['duration'] else 0
++                active.append(item)
++                account = accounts.setdefault(item['session'], dict(active=0, bytes=0, speed=0, errors=0, retries=0, floods=0))
++                for aggregate in (account, total):
++                    aggregate['active'] += 1
++                    for field in ('bytes', 'speed', 'errors', 'retries', 'floods'):
++                        aggregate[field] += item[field]
++            return dict(active=active, accounts=accounts, total=total,
++                        recent=[dict(r) for r in self._recent], loop_lag=self._loop_lag,
++                        transports=self._transports)
++
++    def history(self, limit=200):
++        try:
++            self.flush()
++            limit = min(1000, max(0, int(limit)))
++            with self.db.session() as conn:
++                rows = [dict(r) for r in conn.execute('SELECT * FROM upload_diagnostics ORDER BY id DESC LIMIT ?', (limit,))]
++            for row in rows:
++                row['speed'] = row['bytes'] / row['duration'] if row['duration'] else 0
++            return rows
++        except Exception:
++            return []
++
++    def comparisons(self, rows=None):
++        if rows is None:
++            rows = self.history(1000)
++        groups = {}
++        for row in rows:
++            if not row.get('comparison') or not row.get('comparison_id'):
++                continue
++            groups.setdefault(row['comparison_id'], []).append(row)
++        results = []
++        for comparison_id, pair in groups.items():
++            if len(pair) != 2 or any(not r.get('success') or r.get('duration', 0) <= 0 for r in pair):
++                continue
++            direct_rows = [r for r in pair if r['route'] == 'direct']
++            proxy_rows = [r for r in pair if r['route'].startswith('proxy:')]
++            if len(direct_rows) != 1 or len(proxy_rows) != 1:
++                continue
++            a, b = direct_rows[0], proxy_rows[0]
++            if any(a[k] != b[k] for k in ('session', 'path', 'size')):
++                continue
++            direct, proxy = a['bytes'] / a['duration'], b['bytes'] / b['duration']
++            results.append(dict(session=a['session'], path=a['path'], size=a['size'], route=b['route'],
++                                comparison_id=comparison_id, direct_speed=direct, proxy_speed=proxy,
++                                ratio=proxy / direct if direct else 0,
++                                direct_samples=1, proxy_samples=1))
++        return results

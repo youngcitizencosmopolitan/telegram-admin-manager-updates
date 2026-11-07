@@ -1,0 +1,214 @@
+--- /dev/null
++++ b/app/tam_ui/proxy_manager.py
+@@ -0,0 +1,211 @@
++"""Classic ttk proxy settings. Network checks never run on Tk's thread."""
++import threading
++import tkinter as tk
++from tkinter import messagebox, ttk
++
++
++class ProxyPane(ttk.Frame):
++    def __init__(self, parent, app):
++        super().__init__(parent, padding=10)
++        self.app = app
++        self.manager = app.proxy_manager
++        self._checking = False
++        self._results = {}
++        self._proxies = {}
++        self.columnconfigure(0, weight=1)
++        self.rowconfigure(1, weight=1)
++        self.rowconfigure(4, weight=1)
++        tools = ttk.Frame(self)
++        tools.grid(row=0, column=0, sticky='ew', pady=(0, 8))
++        for text, command in [('Добавить', self.add_proxy), ('Изменить', self.edit_selected),
++                              ('Удалить', self.delete_selected), ('Импорт списком', self.import_proxies),
++                              ('Проверить выбранный', self.check_selected), ('Обновить', self.refresh)]:
++            ttk.Button(tools, text=text, command=command).pack(side='left', padx=(0, 5))
++        self.proxy_tree = self._tree(1, ('host', 'port', 'status'),
++                                    ('SOCKS5 сервер', 'Порт', 'Проверка'), 'browse')
++        ttk.Label(self, text='Изменения маршрута применяются при следующем подключении. '
++                  'При ошибке прокси прямое подключение автоматически не включается.',
++                  wraplength=900).grid(row=2, column=0, sticky='w', pady=8)
++        actions = ttk.Frame(self)
++        actions.grid(row=3, column=0, sticky='ew', pady=(0, 8))
++        for text, command in [('Назначить выбранный прокси', self.assign_selected),
++                              ('Прямое подключение', self.assign_direct),
++                              ('Распределить по кругу', self.distribute_selected)]:
++            ttk.Button(actions, text=text, command=command).pack(side='left', padx=(0, 5))
++        self.account_tree = self._tree(4, ('account', 'route'), ('Аккаунт', 'Текущий маршрут'), 'extended')
++        self.status_var = tk.StringVar(value='')
++        ttk.Label(self, textvariable=self.status_var).grid(row=5, column=0, sticky='w', pady=(8, 0))
++        self.refresh()
++
++    def _tree(self, row, columns, labels, selectmode):
++        body = ttk.Frame(self)
++        body.grid(row=row, column=0, sticky='nsew')
++        body.columnconfigure(0, weight=1)
++        body.rowconfigure(0, weight=1)
++        tree = ttk.Treeview(body, columns=columns, show='headings', selectmode=selectmode, height=7)
++        for column, label in zip(columns, labels):
++            tree.heading(column, text=label)
++            tree.column(column, width=220, minwidth=70)
++        tree.grid(row=0, column=0, sticky='nsew')
++        scroll = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
++        scroll.grid(row=0, column=1, sticky='ns')
++        tree.configure(yscrollcommand=scroll.set)
++        return tree
++
++    def _allowed(self):
++        if self.app._proxy_changes_allowed():
++            return True
++        messagebox.showwarning('Прокси', 'Дождитесь завершения операций и остановите мониторинг перед изменением прокси.', parent=self)
++        return False
++
++    def _error(self, error):
++        # Only the core's explicitly sanitized exception is safe for presentation.
++        from tam_core.proxies import ProxyError
++        text = str(error) if isinstance(error, ProxyError) else 'Не удалось выполнить операцию с прокси.'
++        messagebox.showerror('Прокси', text, parent=self)
++
++    def refresh(self):
++        try:
++            proxies = self.manager.list_proxies()
++            accounts = self.app.store.accounts()
++            rows = [(account.session, account.display, self.manager.route_label(account.session)) for account in accounts]
++        except Exception as error:
++            self._error(error)
++            return
++        selected = self.proxy_tree.selection()
++        account_selected = self.account_tree.selection()
++        self.proxy_tree.delete(*self.proxy_tree.get_children())
++        self.account_tree.delete(*self.account_tree.get_children())
++        self._proxies = {str(proxy['id']): proxy for proxy in proxies}
++        for proxy_id, proxy in self._proxies.items():
++            self.proxy_tree.insert('', 'end', iid=proxy_id,
++                values=(proxy['host'], proxy['port'], self._results.get(proxy_id, 'Не проверен')))
++        for session, display, route in rows:
++            self.account_tree.insert('', 'end', iid=session, values=(display, route))
++        self.proxy_tree.selection_set([item for item in selected if self.proxy_tree.exists(item)])
++        self.account_tree.selection_set([item for item in account_selected if self.account_tree.exists(item)])
++
++    def _selected_proxy(self):
++        selected = self.proxy_tree.selection()
++        return selected[0] if selected else None
++
++    def _mutate(self, operation):
++        if not self._allowed():
++            return False
++        try:
++            operation()
++        except Exception as error:
++            self._error(error)
++            self.refresh()
++            return False
++        self.refresh()
++        return True
++
++    def assign_selected(self):
++        proxy_id = self._selected_proxy()
++        if proxy_id is not None:
++            self._assign(proxy_id)
++
++    def assign_direct(self):
++        self._assign(None)
++
++    def _assign(self, proxy_id):
++        sessions = self.account_tree.selection()
++        if sessions:
++            self._mutate(lambda: [self.manager.assign(session, proxy_id) for session in sessions])
++
++    def distribute_selected(self):
++        sessions = list(self.account_tree.selection())
++        if sessions:
++            self._mutate(lambda: self.manager.distribute(sessions))
++
++    def delete_selected(self):
++        proxy_id = self._selected_proxy()
++        if proxy_id is None or not self._allowed():
++            return
++        if messagebox.askyesno('Удаление прокси', 'Удалить выбранный прокси? Назначенный аккаунтам прокси удалить нельзя.', parent=self):
++            self._mutate(lambda: self.manager.delete(proxy_id))
++
++    def add_proxy(self):
++        if self._allowed():
++            self._proxy_dialog()
++
++    def edit_selected(self):
++        proxy_id = self._selected_proxy()
++        if proxy_id is not None and self._allowed():
++            self._proxy_dialog(proxy_id)
++
++    def _proxy_dialog(self, proxy_id=None):
++        dialog = tk.Toplevel(self)
++        dialog.title('Изменить SOCKS5 прокси' if proxy_id else 'Добавить SOCKS5 прокси')
++        dialog.transient(self.winfo_toplevel())
++        dialog.resizable(False, False)
++        values = self._proxies.get(proxy_id, {})
++        fields = {}
++        for row, (key, label) in enumerate([('host', 'Сервер'), ('port', 'Порт'), ('username', 'Логин'), ('password', 'Пароль')]):
++            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky='w', padx=10, pady=5)
++            entry = ttk.Entry(dialog, width=38, show='*' if key == 'password' else '')
++            entry.grid(row=row, column=1, padx=10, pady=5)
++            if key in ('host', 'port'):
++                entry.insert(0, str(values.get(key, '')))
++            fields[key] = entry
++        keep = tk.BooleanVar(master=dialog, value=bool(proxy_id))
++        if proxy_id:
++            ttk.Checkbutton(dialog, text='Сохранить текущий логин и пароль', variable=keep).grid(row=4, column=0, columnspan=2, padx=10, sticky='w')
++        def save():
++            data = {key: entry.get() for key, entry in fields.items()}
++            if proxy_id:
++                operation = lambda: self.manager.update(proxy_id, **data, keep_credentials=keep.get() and not data['username'] and not data['password'])
++            else:
++                operation = lambda: self.manager.add(**data)
++            if self._mutate(operation):
++                dialog.destroy()
++        ttk.Button(dialog, text='Сохранить', command=save).grid(row=5, column=0, padx=10, pady=10)
++        ttk.Button(dialog, text='Отмена', command=dialog.destroy).grid(row=5, column=1, padx=10, pady=10, sticky='e')
++        fields['host'].focus_set()
++        dialog.grab_set()
++
++    def import_proxies(self):
++        if not self._allowed():
++            return
++        dialog = tk.Toplevel(self)
++        dialog.title('Импорт SOCKS5 прокси')
++        dialog.transient(self.winfo_toplevel())
++        ttk.Label(dialog, text='Один прокси на строку: host:port или host:port:login:password.\n'
++                  'Импорт выполняется целиком: при ошибке ни одна строка не сохраняется.').pack(padx=10, pady=10)
++        body = tk.Text(dialog, width=72, height=14)
++        body.pack(fill='both', expand=True, padx=10)
++        def save():
++            if self._mutate(lambda: self.manager.import_lines(body.get('1.0', 'end-1c'))):
++                dialog.destroy()
++        ttk.Button(dialog, text='Импортировать', command=save).pack(side='left', padx=10, pady=10)
++        ttk.Button(dialog, text='Отмена', command=dialog.destroy).pack(side='right', padx=10, pady=10)
++        dialog.grab_set()
++        body.focus_set()
++
++    def check_selected(self):
++        proxy_id = self._selected_proxy()
++        if proxy_id is None or self._checking:
++            return
++        self._checking = True
++        self._results[proxy_id] = 'Проверка…'
++        self.refresh()
++        self.status_var.set('Проверка SOCKS5…')
++        def worker():
++            try:
++                result = self.manager.check(proxy_id, timeout=8)
++                if result.get('ok'):
++                    text = f"Доступен · {float(result['latency_ms']):.1f} мс"
++                else:
++                    text = result.get('error') or 'Проверка не пройдена'
++            except Exception:
++                text = 'Не удалось проверить прокси.'
++            def finish():
++                self._checking = False
++                if not self.winfo_exists():
++                    return
++                self._results[proxy_id] = text
++                self.status_var.set(text)
++                self.refresh()
++            self.app.ui_call(finish)
++        threading.Thread(target=worker, name='proxy-check', daemon=True).start()

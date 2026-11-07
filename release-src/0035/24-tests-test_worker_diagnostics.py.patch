@@ -1,0 +1,47 @@
+--- /dev/null
++++ b/app/tests/test_worker_diagnostics.py
+@@ -0,0 +1,44 @@
++import asyncio
++import unittest
++from unittest.mock import patch
++
++import test_prefetch_upload_boundary as fixture
++from tam_core.upload_diagnostics import UploadDiagnostics
++
++
++class WorkerDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    read = fixture.PrefetchUploadTests.read
++    file = fixture.PrefetchUploadTests.file
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    async def test_real_worker_records_one_success_and_no_lingering_active_upload(self):
++        path = self.file()
++        self.pane.app.upload_diagnostics = collector = UploadDiagnostics(self.history.db)
++        await asyncio.wait_for(self.run_task(), 5)
++        self.assertEqual(collector.snapshot()['total']['active'], 0)
++        rows = collector.history()
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0]['path'], str(path))
++        self.assertTrue(rows[0]['success'])
++        self.assertEqual(rows[0]['size'], path.stat().st_size)
++        self.assertEqual(rows[0]['route'], 'direct')
++        self.assertGreater(rows[0]['duration'], 0)
++
++    async def test_stop_during_flood_wait_clears_item_immediately(self):
++        self.file()
++        self.pane.app.upload_diagnostics = collector = UploadDiagnostics(self.history.db)
++        class Wait(Exception): seconds=1
++        async def sending(path): raise Wait()
++        async def stopped(seconds):
++            self.stop.set()
++            return False
++        self.pane._sleep_stop = stopped
++        with patch('batch_uploader.TELETHON_WAIT_ERRORS',(Wait,)):
++            await asyncio.wait_for(self.run_task(sending),5)
++        self.assertEqual(collector.snapshot()['total']['active'],0)
++        rows=collector.history()
++        self.assertEqual(len(rows),1)
++        self.assertEqual(rows[0]['floods'],1)
++        self.assertFalse(rows[0]['success'])

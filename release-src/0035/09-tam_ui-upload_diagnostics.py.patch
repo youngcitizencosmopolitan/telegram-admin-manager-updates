@@ -1,0 +1,161 @@
+--- /dev/null
++++ b/app/tam_ui/upload_diagnostics.py
+@@ -0,0 +1,158 @@
++"""Upload diagnostics view. Workers never access Tk widgets."""
++from pathlib import Path
++from queue import Empty, Queue
++import threading
++import time
++import tkinter as tk
++from tkinter import filedialog, messagebox, ttk
++
++
++def _speed(value):
++    return f'{value / 1024 / 1024:.2f} МБ/с'
++
++
++class DiagnosticsPane(ttk.Frame):
++    def __init__(self, parent, app):
++        super().__init__(parent, padding=8)
++        self.frame = self
++        self.app = app
++        self._accounts = []
++        self._history_queue = Queue()
++        self._history_busy = False
++        self._last_history = 0
++        self._timer = None
++        self._timer_owner = self.winfo_toplevel()
++        self.columnconfigure(0, weight=1)
++        self.summary = tk.StringVar(value='Нет активных загрузок')
++        ttk.Label(self, textvariable=self.summary).grid(row=0, column=0, sticky='w')
++        ttk.Label(self, text='Скорость = переданные байты / полное время, включая повторы и FloodWait. '
++                  'Байты отражают прогресс файла, а не сетевой трафик.', wraplength=1050).grid(row=1, column=0, sticky='w', pady=4)
++        self.active_tree = self._tree(2, 'Активные загрузки', (
++            ('session', 'Аккаунт', 140), ('path', 'Файл', 180), ('route', 'Маршрут', 100),
++            ('duration', 'Время', 70), ('speed', 'Скорость', 95), ('events', 'Ош./повт./Flood', 130)), 4)
++        self.account_tree = self._tree(4, 'Итого по аккаунтам', (
++            ('session', 'Аккаунт', 180), ('active', 'Активно', 80), ('speed', 'Скорость', 100),
++            ('bytes', 'МБ', 90), ('events', 'Ош./повт./Flood', 140)), 3)
++        tools = ttk.Frame(self)
++        tools.grid(row=6, column=0, sticky='ew', pady=8)
++        self.account_box = ttk.Combobox(tools, state='readonly', width=28)
++        self.account_box.pack(side='left')
++        self.compare_button = ttk.Button(tools, text='Выбрать файл и сравнить A/B', command=self._compare)
++        self.compare_button.pack(side='left', padx=6)
++        ttk.Button(tools, text='Остановить тест', command=self._stop_comparison).pack(side='left', padx=(0, 6))
++        ttk.Button(tools, text='Обновить историю', command=self._request_history).pack(side='left')
++        ttk.Label(self, text='Тест загружает две копии файла: напрямую и через назначенный прокси. '
++                  'Без публикации. Один аккаунт и один файл; лимиты загрузки не меняются.', wraplength=1050).grid(row=7, column=0, sticky='w')
++        self.comparison_tree = self._tree(8, 'Сравнение одинакового файла и аккаунта (успешные тесты)', (
++            ('session', 'Аккаунт', 140), ('path', 'Файл', 160), ('route', 'Прокси', 90),
++            ('direct', 'Напрямую', 100), ('proxy', 'Через прокси', 100), ('ratio', 'Прокси / прямо', 110)), 3)
++        self.history_tree = self._tree(10, 'Последние загрузки', (
++            ('session', 'Аккаунт', 130), ('path', 'Файл', 160), ('route', 'Маршрут', 100),
++            ('duration', 'Время', 80), ('speed', 'Скорость', 100),
++            ('status', 'Результат', 90), ('events', 'Ош./повт./Flood', 130)), 5)
++        self.bind('<Destroy>', self._destroyed, add='+')
++        self._tick()
++
++    def _tree(self, row, title, columns, height):
++        ttk.Label(self, text=title).grid(row=row, column=0, sticky='w', pady=(6, 2))
++        body = ttk.Frame(self)
++        body.grid(row=row + 1, column=0, sticky='nsew')
++        body.columnconfigure(0, weight=1)
++        tree = ttk.Treeview(body, columns=[c[0] for c in columns], show='headings', height=height)
++        for key, label, width in columns:
++            tree.heading(key, text=label)
++            tree.column(key, width=width, minwidth=55)
++        tree.grid(row=0, column=0, sticky='nsew')
++        vertical = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
++        vertical.grid(row=0, column=1, sticky='ns')
++        scroll = ttk.Scrollbar(body, orient='horizontal', command=tree.xview)
++        scroll.grid(row=1, column=0, sticky='ew')
++        tree.configure(xscrollcommand=scroll.set, yscrollcommand=vertical.set)
++        return tree
++
++    @staticmethod
++    def _replace(tree, rows):
++        tree.delete(*tree.get_children())
++        for row in rows:
++            tree.insert('', 'end', values=row)
++
++    @staticmethod
++    def _events(row):
++        return f"{row['errors']} / {row['retries']} / {row['floods']}"
++
++    def _tick(self):
++        try:
++            snap = self.app.upload_diagnostics.snapshot()
++            total = snap['total']
++            self.summary.set(f"Активно: {total['active']} | Всего: {_speed(total['speed'])} | "
++                             f"Ошибки / повторы / FloodWait: {self._events(total)} | "
++                             f"Задержка цикла: {snap['loop_lag'] * 1000:.0f} мс | "
++                             f"MTProto отправителей: {snap.get('transports', 0)}")
++            self._replace(self.active_tree, [(r['session'], Path(r['path']).name, r['route'],
++                          f"{r['duration']:.1f} с", _speed(r['speed']), self._events(r)) for r in snap['active']])
++            self._replace(self.account_tree, [(session, r['active'], _speed(r['speed']),
++                          f"{r['bytes'] / 1024 / 1024:.2f}", self._events(r)) for session, r in snap['accounts'].items()])
++            selected = self.account_box.current()
++            old_session = self._accounts[selected].session if 0 <= selected < len(self._accounts) else None
++            self._accounts = self.app.store.accounts()
++            self.account_box['values'] = [f'{a.label or a.session} ({a.session})' for a in self._accounts]
++            if self._accounts:
++                index = next((i for i, a in enumerate(self._accounts) if a.session == old_session), 0)
++                self.account_box.current(index)
++            allowed = bool(self._accounts) and self.app._proxy_changes_allowed()
++            self.compare_button.configure(state='normal' if allowed else 'disabled')
++            try:
++                rows, comparisons = self._history_queue.get_nowait()
++            except Empty:
++                pass
++            else:
++                self._history_busy = False
++                self._replace(self.history_tree, [(r['session'], Path(r['path']).name, r['route'],
++                              f"{r['duration']:.1f} с", _speed(r['speed']), 'Успех' if r['success'] else 'Ошибка',
++                              self._events(r)) for r in rows])
++                self._replace(self.comparison_tree, [(r['session'], Path(r['path']).name, r['route'],
++                              _speed(r['direct_speed']), _speed(r['proxy_speed']), f"{r['ratio']:.2f}x") for r in comparisons])
++            if time.monotonic() - self._last_history >= 15:
++                self._request_history()
++        finally:
++            if self.winfo_exists():
++                self._timer = self._timer_owner.after(1000, self._tick)
++
++    def _request_history(self):
++        if self._history_busy:
++            return
++        self._history_busy = True
++        self._last_history = time.monotonic()
++        service = self.app.upload_diagnostics
++        def load():
++            try:
++                rows = service.history(1000)
++                result = (rows[:200], service.comparisons(rows))
++            except Exception:
++                result = ([], [])
++            self._history_queue.put(result)
++        threading.Thread(target=load, name='upload-diagnostics-history', daemon=True).start()
++
++    def _compare(self):
++        if not self.app._proxy_changes_allowed():
++            return
++        index = self.account_box.current()
++        if not 0 <= index < len(self._accounts):
++            return
++        path = filedialog.askopenfilename(parent=self, title='Файл для двух тестовых загрузок без публикации')
++        if path and self.app._proxy_changes_allowed():
++            try:
++                self.app.start_proxy_comparison(self._accounts[index].session, path)
++            except Exception as exc:
++                messagebox.showerror('Сравнение загрузок', str(exc), parent=self)
++
++    def _stop_comparison(self):
++        self.app.stop_proxy_comparison()
++
++    def _destroyed(self, event):
++        if event.widget is self and self._timer is not None:
++            try:
++                self._timer_owner.after_cancel(self._timer)
++            except tk.TclError:
++                pass
++            self._timer = None
