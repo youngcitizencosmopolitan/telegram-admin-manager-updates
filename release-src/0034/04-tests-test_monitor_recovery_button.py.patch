@@ -1,0 +1,11 @@
+--- a/app/tests/test_monitor_recovery_button.py
++++ b/app/tests/test_monitor_recovery_button.py
+@@ -21,7 +21,7 @@
+         self.window.geometry('1190x810')
+         self.pane = BatchUploaderPane.__new__(BatchUploaderPane)
+         self.pane.monitor_parent = self.window
+-        self.pane.app = SimpleNamespace(store=SimpleNamespace(data={}))
++        self.pane.app = SimpleNamespace(store=SimpleNamespace(data={}), after=Mock())
+         self.pane._register_sortable_tree = Mock()
+         self.pane.retry_unfinished_uploads = Mock()
+ 

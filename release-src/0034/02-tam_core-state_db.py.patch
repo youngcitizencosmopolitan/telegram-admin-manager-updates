@@ -1,0 +1,21 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -1124,6 +1124,18 @@
+         return out
+ 
+     # ---------- transfer statistics ----------
++    def transfer_window_rates(self, *, now: float | None = None) -> dict[int, float]:
++        """Confirmed file bytes per wall-clock window, credited at completion."""
++        now = time.time() if now is None else float(now)
++        with self.session() as conn:
++            row = conn.execute('SELECT '
++                'COALESCE(SUM(CASE WHEN created_at>=? THEN size ELSE 0 END),0), '
++                'COALESCE(SUM(CASE WHEN created_at>=? THEN size ELSE 0 END),0), '
++                'COALESCE(SUM(size),0) FROM transfer_stats '
++                'WHERE created_at>=? AND created_at<=? AND success=1',
++                (now-600, now-1800, now-3600, now)).fetchone()
++        return {minutes: int(row[i])/float(minutes*60) for i, minutes in enumerate((10, 30, 60))}
++
+     def transfer_stat_record(
+         self, *, session: str, account_label: str, task: str, target: str, path: str,
+         size: int, duration: float, success: bool, error: str = "", created_at: float | None = None,

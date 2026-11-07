@@ -1,14 +1,14 @@
 {
-  "version": "0033",
-  "base_version": "0032",
-  "manifest_version": "4.3.8.0033",
-  "display_version": "0033",
+  "version": "0034",
+  "base_version": "0033",
+  "manifest_version": "4.3.8.0034",
+  "display_version": "0034",
   "patch_files": [
-    "release-src/0033/01-batch_uploader.py.patch",
-    "release-src/0033/02-tam_core-repositories.py.patch",
-    "release-src/0033/03-tam_core-state_db.py.patch",
-    "release-src/0033/04-telegram_admin_manager.py.patch",
-    "release-src/0033/05-tests-test_automatic_reservation_recovery.py.patch"
+    "release-src/0034/01-batch_uploader.py.patch",
+    "release-src/0034/02-tam_core-state_db.py.patch",
+    "release-src/0034/03-telegram_admin_manager.py.patch",
+    "release-src/0034/04-tests-test_monitor_recovery_button.py.patch",
+    "release-src/0034/05-tests-test_rolling_transfer_rates.py.patch"
   ],
-  "notes": "0033: persist upload prepublication phase and automatically reclaim interrupted preparation and video transfer claims on restart. Fence publication by exact claim token before sending. Preserve current claims, confirmed history, legacy unknown results and ambiguous publications; those still require review to avoid duplicate posts."
+  "notes": "0034: show effective successful upload throughput over the last 10, 30 and 60 wall-clock minutes in the monitoring summary. Credit file bytes on confirmed completion, include pauses and idle time, exclude failures and partial uploads. Read persisted statistics with a bounded indexed aggregate off the Tk thread every 15 seconds, coalesce refreshes, expire old values while idle and wrap summary text to available width. No additional Telegram requests."
 }
