@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0037",
-  "display_version": "0037",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0037/TelegramAdminManager_v0037_update.zip",
-  "sha256": "25d7e162dd0d096f664311254087e0d501c42ca0d93583d10fdf8968c2f4166f",
-  "notes": "0037: quiet the visible journal by default, retaining original full disk and event logs. Hide known routine upload/cache/successful connection chatter; show first/changed connection failures and recovery, summarize identical repeated failures at most once per five minutes with bounded thread-safe state. Add a persistent detailed-journal checkbox. Stop forcing readers to the bottom when new messages arrive; auto-follow continues when already at the end. Upload, connection retry and scan behavior are unchanged."
+  "version": "4.3.8.0038",
+  "display_version": "0038",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0038/TelegramAdminManager_v0038_update.zip",
+  "sha256": "e4be6125c7d15d8d090788d0560fe73ba16482865551024f90c2b654abed7cc7",
+  "notes": "0038: независимые линии мониторинга и ручных загрузок; редактирование правил, подписей, аккаунтов и лимитов без остановки мониторинга. Параметры применяются к следующим файлам; текущий файл завершается со своими прежними настройками. Множественный выбор Ctrl/Shift, Ctrl+A/Ctrl+C, копирование строк/путей/ссылок и массовое редактирование отмеченных полей. Окно «Операции…» с прогрессом и отдельной отменой. Общие лимиты загрузки и защита от дублей сохранены; исправлена очистка сессий и фоновых задач при отмене и ошибках подключения. Для установки необходим обычный перезапуск приложения."
 }
