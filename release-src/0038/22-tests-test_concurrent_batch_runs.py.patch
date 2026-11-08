@@ -1,0 +1,207 @@
+--- /dev/null
++++ b/app/tests/test_concurrent_batch_runs.py
+@@ -0,0 +1,204 @@
++import asyncio
++import queue
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from batch_uploader import BatchUploaderPane
++from tam_core.repositories import ConfigStore, MonitorRuleStore
++from tam_core.runtime import AsyncRuntime
++
++
++class SyntheticPane(BatchUploaderPane):
++    async def _run_batch(self, tasks, *args, **kwargs):
++        for task in tasks:
++            tid = task["id"]
++            self.task_states[tid] = {"name": tid, "total_files": 1, "active": {}, "success": 0}
++            self.test_events[tid][0].set()
++        self._emit_dashboard(force=True)
++        while not self.stop_event.is_set():
++            if all(event[1].is_set() for tid, event in self.test_events.items() if tid in self.live_tasks):
++                break
++            await asyncio.to_thread(self.stop_event.wait, .02)
++        for task in tasks:
++            self.task_states[task["id"]]["success"] = int(not self.stop_event.is_set())
++        return set()
++
++
++class ConcurrentBatchRunTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.runtime = AsyncRuntime("batch-run-test")
++        self.addCleanup(self.runtime.shutdown)
++        self.ui = queue.Queue()
++        self.store = ConfigStore(Path(self.tmp.name)/"config.json")
++        self.rules = MonitorRuleStore(self.store.db)
++        pane = self.pane = SyntheticPane.__new__(SyntheticPane)
++        noop = lambda *a, **kw: None
++        pane.app = SimpleNamespace(_runtime_enabled=True, run_async=self.runtime.run,
++            store=self.store, monitor_rules=self.rules, ui_call=self.ui.put, log=noop,
++            _friendly_error=str, _busy=False)
++        pane.pending_batches = []
++        pane._queue_lock = threading.RLock()
++        pane._live_task_lock = threading.RLock()
++        pane._publication_state = {}
++        pane.live_tasks, pane.task_states, pane.account_health = {}, {}, {}
++        pane.task_pause_events = {}
++        pane.stop_event, pane.pause_all_event = threading.Event(), threading.Event()
++        pane.pause_all_event.set()
++        pane.monitor_last_signatures, pane.monitor_pending_signatures = {}, {}
++        pane.monitor_prepared_targets, pane.monitor_runtime = set(), {}
++        pane.current_batch_id, pane.current_batch_ids = None, set()
++        pane.queue_halt_requested, pane.queue_worker_active, pane.running = False, False, False
++        pane._current_batch_snapshot = []
++        pane._set_controls_running = pane._refresh_queue_status = pane._queue_task_row = pane._set_queue_row = noop
++        pane.refresh_monitor_tab = pane._emit_dashboard = noop
++        pane._effective_global_parallel = lambda tasks: 4
++        pane.test_events = {}
++
++    def add(self, tid, monitor=False):
++        task = {"id": tid, "name": tid, "folder": "synthetic", "target": "@target", "monitor_folder": monitor}
++        if monitor:
++            self.rules.put(task)
++            task = self.rules.get(tid)
++        else:
++            self.store.update({"upload_tasks": self.store.snapshot().get("upload_tasks",[])+[task]})
++        self.pane.pending_batches.append({"id": "q-"+tid,"task_ids":[tid], "source": "Мониторинг" if monitor else "Вручную", "task_snapshots":[task]})
++        self.pane.test_events[tid] = (threading.Event(),threading.Event())
++        return task
++
++    def pump_until(self, condition):
++        while not condition():
++            try: callback = self.ui.get(timeout=3)
++            except queue.Empty: self.fail("Completion callback did not arrive")
++            callback()
++
++    def tearDown(self):
++        self.pane.stop()
++        for events in self.pane.test_events.values(): events[1].set()
++        for run in list(getattr(self.pane,"_active_runs",{}).values()): run.thread.join(3)
++        while not self.ui.empty(): self.ui.get_nowait()()
++
++    def test_manual_and_monitor_have_independent_state_and_completion(self):
++        self.add("manual")
++        self.add("monitor",monitor=True)
++        self.pane._ensure_queue_worker()
++        for started,_ in self.pane.test_events.values(): self.assertTrue(started.wait(3))
++        self.pane._sync_run_states()
++        runs = self.pane._active_runs
++        self.assertEqual({r.lane for r in runs.values()},{"manual","monitor"})
++        controllers = [r.controller for r in runs.values()]
++        self.assertIsNot(controllers[0].stop_event,controllers[1].stop_event)
++        self.assertIsNot(controllers[0].task_states,controllers[1].task_states)
++        self.assertIs(controllers[0]._publication_state,controllers[1]._publication_state)
++        self.assertEqual(set(self.pane.task_states),{"manual","monitor"})
++        self.pane.test_events["manual"][1].set()
++        self.pump_until(lambda: len(self.pane._active_runs)==1)
++        self.assertEqual(next(iter(self.pane._active_runs.values())).lane,"monitor")
++        self.assertTrue(self.pane.running)
++        self.assertIn("monitor",self.pane.task_states)
++        self.assertEqual(len({rid for rid,tid in self.pane.run_task_states}),2)
++        self.pane.test_events["monitor"][1].set()
++        self.pump_until(lambda: not self.pane._active_runs)
++        self.assertFalse(self.pane.running)
++
++    def test_cancel_one_lane_leaves_other_running(self):
++        self.add("manual")
++        self.add("monitor",monitor=True)
++        self.pane._ensure_queue_worker()
++        for started,_ in self.pane.test_events.values(): self.assertTrue(started.wait(3))
++        self.assertTrue(self.pane.set_task_paused("manual",True))
++        manual = next(r for r in self.pane._active_runs.values() if r.lane=="manual")
++        monitor = next(r for r in self.pane._active_runs.values() if r.lane=="monitor")
++        self.assertFalse(manual.controller.task_pause_events["manual"].is_set())
++        self.assertTrue(monitor.controller.task_pause_events["monitor"].is_set())
++        self.assertTrue(self.pane.cancel_task("manual"))
++        self.pump_until(lambda: manual.id not in self.pane._active_runs)
++        self.assertFalse(monitor.controller.stop_event.is_set())
++        self.assertTrue(monitor.thread.is_alive())
++        self.assertEqual([item["id"] for item in self.pane.pending_batches],["q-manual"])
++
++    def test_paused_queued_task_stays_pending_and_cancel_callback_runs_once(self):
++        self.add("quick")
++        item = self.pane.pending_batches[0]
++        item["task_snapshots"][0]["_ephemeral"] = True
++        calls = []
++        self.pane._quick_callbacks = {"quick": lambda: calls.append("finished")}
++        self.assertTrue(self.pane.set_task_paused("quick",True))
++        self.pane._ensure_queue_worker()
++        self.assertFalse(getattr(self.pane,"_active_runs",{}))
++        self.assertEqual(item["paused_task_ids"],["quick"])
++        self.assertTrue(self.pane.cancel_task("quick"))
++        self.assertFalse(self.pane.cancel_task("quick"))
++        self.assertEqual(calls,["finished"])
++        self.assertEqual(self.pane.pending_batches,[])
++
++    def test_same_task_id_waits_in_other_lane_until_original_completes(self):
++        self.add("shared",monitor=True)
++        task = self.rules.get("shared")
++        # Put a manual snapshot of the same logical task in the other lane.
++        self.store.update({"upload_tasks":[task]})
++        self.pane.pending_batches.insert(0,{"id":"q-manual","task_ids":["shared"],"source":"Вручную","task_snapshots":[task]})
++        self.pane._ensure_queue_worker()
++        self.assertTrue(self.pane.test_events["shared"][0].wait(3))
++        self.assertEqual(len(self.pane._active_runs),1)
++        self.assertEqual(len(self.pane.pending_batches),1)
++        first_run = next(iter(self.pane._active_runs))
++        self.pane.test_events["shared"][1].set()
++        self.pump_until(lambda: first_run not in self.pane._active_runs)
++        self.pump_until(lambda: not self.pane._active_runs)
++        self.assertEqual(len({run_id for run_id,tid in self.pane.run_task_states}),2)
++
++    def test_active_quick_cancel_does_not_restore_item_and_callback_runs_once(self):
++        self.add("quick")
++        item = self.pane.pending_batches[0]
++        item["task_snapshots"][0]["_ephemeral"] = True
++        calls = []
++        self.pane._quick_callbacks = {"quick":lambda: calls.append("finished")}
++        self.pane._ensure_queue_worker()
++        self.assertTrue(self.pane.test_events["quick"][0].wait(3))
++        self.assertTrue(self.pane.cancel_task("quick"))
++        self.pump_until(lambda: not self.pane._active_runs)
++        self.assertEqual(calls,["finished"])
++        self.assertEqual(self.pane.pending_batches,[])
++        self.assertFalse(self.pane.cancel_task("quick"))
++
++
++    def test_quick_enqueue_is_ephemeral_manual_task_with_explicit_paths(self):
++        captured = []
++        self.pane._enqueue_batch = lambda tasks, **kwargs: captured.append((tasks,kwargs))
++        path = Path(self.tmp.name) / "video.mp4"
++        task_id = self.pane.enqueue_quick_upload({"target":"@target","files":[str(path)],"caption":"caption"})
++        task, options = captured[0][0][0], captured[0][1]
++        self.assertEqual(task["id"],task_id)
++        self.assertTrue(task["_ephemeral"])
++        self.assertFalse(task["monitor_folder"])
++        self.assertEqual(task["_explicit_files"],[str(path)])
++        self.assertEqual(options["source"],"Быстрая загрузка")
++        self.assertEqual(self.pane._latest_task_settings(task)["caption"],"caption")
++
++    def test_quick_enqueue_failure_finishes_callback_once(self):
++        calls = []
++        def fail(*args,**kw): raise RuntimeError("synthetic queue failure")
++        self.pane._enqueue_batch = fail
++        with self.assertRaises(RuntimeError):
++            self.pane.enqueue_quick_upload({"target":"@target"},lambda: calls.append("finished"))
++        self.assertEqual(calls,["finished"])
++        self.assertEqual(self.pane._quick_callbacks,{})
++
++    def test_task_disabled_after_queueing_does_not_start_or_count_send_failures(self):
++        self.add('disabled')
++        tasks = self.store.snapshot()['upload_tasks']
++        tasks[0]['enabled'] = False
++        self.store.update({'upload_tasks': tasks})
++        self.pane.test_events['disabled'][1].set()
++        self.pane._ensure_queue_worker()
++        self.pump_until(lambda: not self.pane._active_runs)
++        self.assertFalse(self.pane.test_events['disabled'][0].is_set())
++        self.assertNotIn('disabled', self.pane.task_states)
++
++
++if __name__ == "__main__": unittest.main()

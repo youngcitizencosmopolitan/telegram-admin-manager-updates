@@ -1,0 +1,271 @@
+--- /dev/null
++++ b/app/tests/test_live_rule_revisions.py
+@@ -0,0 +1,268 @@
++import asyncio
++import threading
++from types import SimpleNamespace
++import tempfile
++import unittest
++from pathlib import Path
++from tam_core.state_db import StateDatabase
++from tam_core.repositories import MonitorRuleStore
++
++class RuleRevisionTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.db = StateDatabase(Path(self.tmp.name) / "state.db")
++        self.rules = MonitorRuleStore(self.db)
++        self.rules.put({"id": "r", "folder": "a", "target": "one", "monitor_folder": True})
++
++    def test_stale_edit_cannot_overwrite_new_caption(self):
++        stale = self.rules.get("r")
++        fresh = self.rules.update_fields("r", {"caption": "new"})
++        self.assertGreater(fresh["revision"], stale["revision"])
++        stale["caption"] = "old"
++        with self.assertRaises(ValueError):
++            self.rules.put(stale)
++        self.assertEqual(self.rules.get("r")["caption"], "new")
++
++    def test_deleted_stale_rule_cannot_resurrect(self):
++        stale = self.rules.get("r")
++        self.rules.delete("r")
++        with self.assertRaises(ValueError):
++            self.rules.put(stale)
++        self.assertEqual(self.rules.get("r"), {})
++
++    def test_scan_commit_is_atomic_and_route_guarded(self):
++        old = self.rules.get("r")
++        self.rules.update_fields("r", {"target": "two"})
++        accepted = self.rules.commit_scan("r", old["route_revision"], {"monitor_seen_initialized": True}, {"old.mp4"})
++        self.assertEqual(accepted, {})
++        self.assertEqual(self.rules.seen_files("r"), set())
++        self.assertNotIn("monitor_seen_initialized", self.rules.get("r"))
++
++    def test_caption_change_keeps_route_and_scan_preserves_caption(self):
++        old = self.rules.get("r")
++        new = self.rules.update_fields("r", {"caption": "new"})
++        self.assertEqual(new["route_revision"], old["route_revision"])
++        accepted = self.rules.commit_scan("r", old["route_revision"], {"monitor_seen_initialized": True}, {"file.mp4"})
++        self.assertEqual(accepted["caption"], "new")
++        self.assertEqual(self.rules.seen_files("r"), {"file.mp4"})
++
++if __name__ == "__main__": unittest.main()
++
++
++class ConcurrentScanTests(RuleRevisionTests):
++    def test_scan_finishing_after_route_edit_or_delete_is_discarded(self):
++        for action in (lambda: self.rules.update_fields("r", {"target": "new"}), lambda: self.rules.delete("r")):
++            old = self.rules.get("r")
++            ready, finish = threading.Event(), threading.Event()
++            result = []
++            def scan():
++                ready.set()
++                if not finish.wait(2):
++                    raise RuntimeError("test barrier timeout")
++                result.append(self.rules.commit_scan("r", old["route_revision"], {"monitor_signature": "stale"}, {"stale.mp4"}))
++            worker = threading.Thread(target=scan)
++            worker.start()
++            self.assertTrue(ready.wait(2))
++            action()
++            finish.set()
++            worker.join(2)
++            self.assertFalse(worker.is_alive())
++            self.assertEqual(result, [{}])
++            self.assertEqual(self.rules.seen_files("r"), set())
++
++
++class LivePermitTests(unittest.IsolatedAsyncioTestCase):
++    async def test_reduction_drains_existing_permits_and_gates_new_work(self):
++        from tam_core.live_rules import LiveSemaphore
++        limit = [2]
++        sem = LiveSemaphore(lambda: limit[0])
++        await sem.__aenter__()
++        await sem.__aenter__()
++        limit[0] = 1
++        started, entered = asyncio.Event(), asyncio.Event()
++        async def waiting():
++            started.set()
++            async with sem:
++                entered.set()
++        waiter = asyncio.create_task(waiting())
++        await started.wait()
++        self.assertFalse(entered.is_set())
++        await sem.__aexit__()
++        self.assertEqual(sem.active, 1)
++        self.assertFalse(entered.is_set())
++        await sem.__aexit__()
++        await asyncio.wait_for(waiter, 1)
++        self.assertTrue(entered.is_set())
++        self.assertEqual(sem.active, 0)
++
++    async def test_network_bridge_uses_app_runtime(self):
++        from batch_uploader import BatchUploaderPane
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        seen = []
++        pane.app = SimpleNamespace(run_async=lambda coro: seen.append(coro) or "runtime")
++        async def work(): return 1
++        coro = work()
++        try:
++            self.assertEqual(pane._run_async(coro), "runtime")
++            self.assertEqual(seen, [coro])
++        finally:
++            coro.close()
++
++
++class WorkerSnapshotTests(unittest.IsolatedAsyncioTestCase):
++    from test_prefetch_upload_boundary import PrefetchUploadTests as Fixture
++    asyncSetUp = Fixture.asyncSetUp
++    asyncTearDown = Fixture.asyncTearDown
++    file = Fixture.file
++    read = Fixture.read
++
++    async def test_caption_and_publish_options_freeze_until_file_finishes(self):
++        first, second = self.file("a.mp4", b"first"), self.file("b.mp4", b"second")
++        repo = MonitorRuleStore(self.history.db)
++        self.rule.update(monitor_folder=True, caption="old", silent=False)
++        repo.put(self.rule)
++        self.rule = repo.get("r1")
++        self.pane.app.monitor_rules = repo
++        uploading, edited = asyncio.Event(), asyncio.Event()
++        sent = []
++        owner = self
++        class Client:
++            async def upload_file(self, path, **kwargs):
++                if Path(path) == first:
++                    uploading.set()
++                    await asyncio.wait_for(edited.wait(), 2)
++                return SimpleNamespace(path=path, name=Path(path).name)
++            async def send_file(self, entity, file, **kwargs):
++                sent.append((Path(file.path), kwargs))
++                return SimpleNamespace(id=len(sent))
++        async def edit():
++            await asyncio.wait_for(uploading.wait(), 2)
++            repo.update_fields("r1", {"caption": "new", "silent": True})
++            edited.set()
++        editor = asyncio.create_task(edit())
++        await asyncio.wait_for(self.pane._run_one_task(dict(self.rule), {"s1": (self.account, Client())}, {"s1": False},
++            {"s1": self.account_lock}, asyncio.Semaphore(1), asyncio.Semaphore(2), asyncio.Semaphore(2), preparation=self.pool), 5)
++        await editor
++        self.assertEqual([(p, k["caption"], k["silent"]) for p,k in sent], [(first,"old",False),(second,"new",True)])
++
++    async def test_delete_during_transfer_finishes_current_and_assigns_no_next_file(self):
++        first, second = self.file("a.mp4", b"first"), self.file("b.mp4", b"second")
++        repo = MonitorRuleStore(self.history.db)
++        self.rule.update(monitor_folder=True)
++        repo.put(self.rule)
++        self.rule = repo.get("r1")
++        self.pane.app.monitor_rules = repo
++        sent = []
++        class Client:
++            async def upload_file(client, path, **kwargs):
++                repo.delete("r1")
++                return SimpleNamespace(path=path, name=Path(path).name)
++            async def send_file(client, entity, file, **kwargs):
++                sent.append(Path(file.path))
++                return SimpleNamespace(id=1)
++        await asyncio.wait_for(self.pane._run_one_task(dict(self.rule), {"s1": (self.account, Client())}, {"s1": False},
++            {"s1": self.account_lock}, asyncio.Semaphore(1), asyncio.Semaphore(2), asyncio.Semaphore(2), preparation=self.pool), 5)
++        self.assertEqual(sent, [first])
++        self.assertEqual(repo.get("r1"), {})
++        self.assertTrue(self.history.fingerprint_completed(b"first".hex(), "group"))
++
++
++class ConfigSnapshotTests(unittest.TestCase):
++    def test_account_refresh_cannot_restore_removed_account_or_old_label(self):
++        from tam_core.repositories import ConfigStore
++        from tam_core.models import Account
++        with tempfile.TemporaryDirectory() as folder:
++            store = ConfigStore(Path(folder) / "config.json")
++            first = Account("first", "old label", "111", 1)
++            removed = Account("removed", "removed", "222", 2)
++            store.set_accounts([first, removed])
++            stale_observations = store.accounts()
++            stale_observations[0].premium = True
++            stale_observations[0].username = "fresh_server_name"
++            first.label = "edited label"
++            store.set_accounts([first])
++            store.refresh_accounts(stale_observations)
++            accounts = store.accounts()
++            self.assertEqual([a.session for a in accounts], ["first"])
++            self.assertEqual(accounts[0].label, "edited label")
++            self.assertTrue(accounts[0].premium)
++            self.assertEqual(accounts[0].username, "fresh_server_name")
++            snapshot = store.snapshot()
++            snapshot["accounts"][0]["label"] = "alias mutation"
++            self.assertEqual(store.accounts()[0].label, "edited label")
++
++    def test_bulk_patch_validates_whole_command_before_writing(self):
++        with tempfile.TemporaryDirectory() as folder:
++            rules = MonitorRuleStore(StateDatabase(Path(folder) / "state.db"))
++            for rid in ("a", "b"):
++                rules.put({"id": rid, "caption": "before"})
++            with self.assertRaises(ValueError):
++                rules.patch_many(["a", "b"], {"caption": "after", "parallel": 0})
++            self.assertEqual([r["caption"] for r in rules.all()], ["before", "before"])
++
++    def test_unrelated_package_save_preserves_independent_monitor_edits(self):
++        with tempfile.TemporaryDirectory() as folder:
++            rules = MonitorRuleStore(StateDatabase(Path(folder) / "state.db"))
++            task = {"id": "a", "folder": "a", "target": "one", "monitor_folder": True, "caption": "old", "silent": False}
++            rules.sync_from_task(task)
++            rules.update_fields("a", {"caption": "new"})
++            rules.sync_from_task(dict(task, silent=True), previous=task)
++            self.assertEqual(rules.get("a")["caption"], "new")
++            self.assertTrue(rules.get("a")["silent"])
++
++    def test_bulk_editor_only_converts_checked_fields(self):
++        from tam_ui.bulk_editor import selected_patch
++        patch = selected_patch([("parallel", False, "— разные значения —", int),
++                                ("caption", True, "new", str), ("silent", True, "Нет", bool)])
++        self.assertEqual(patch, {"caption": "new", "silent": False})
++
++    def test_explicit_linked_task_reenable_restores_with_new_generation(self):
++        with tempfile.TemporaryDirectory() as folder:
++            rules = MonitorRuleStore(StateDatabase(Path(folder) / "state.db"))
++            task = {"id": "a", "folder": "a", "target": "one", "monitor_folder": True}
++            rules.sync_from_task(task)
++            stale = rules.get("a")
++            rules.delete("a")
++            rules.sync_from_task(task)
++            self.assertEqual(rules.get("a"), {})
++            disabled = dict(task, monitor_folder=False)
++            rules.sync_from_task(task, previous=disabled)
++            restored = rules.get("a")
++            self.assertGreater(restored["revision"], stale["revision"])
++            self.assertGreater(restored["route_revision"], stale["route_revision"])
++            self.assertEqual(rules.commit_scan("a", stale["route_revision"], {"monitor_signature": "stale"}), {})
++            with self.assertRaises(ValueError): rules.put(stale)
++
++    def test_route_aba_cannot_reuse_original_assignment(self):
++        from tam_core.live_rules import route_matches
++        with tempfile.TemporaryDirectory() as folder:
++            rules = MonitorRuleStore(StateDatabase(Path(folder) / "state.db"))
++            rules.put({"id": "a", "folder": "a", "target": "one"})
++            stale = rules.get("a")
++            rules.update_fields("a", {"target": "two"})
++            current = rules.update_fields("a", {"target": "one"})
++            self.assertFalse(route_matches(stale,current))
++
++
++class ClientBoundaryTests(unittest.IsolatedAsyncioTestCase):
++    async def test_file_boundary_releases_old_and_fresh_route_handle(self):
++        from batch_uploader import BatchUploaderPane
++        events = []
++        class Handle:
++            def __init__(self, label): self.label = label
++            async def connect(self): events.append(("connect", self.label))
++            async def disconnect(self): events.append(("disconnect", self.label))
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.app = SimpleNamespace(_runtime_enabled=True, _api_credentials=lambda: (123,"newkey"))
++        pane.sessions_dir = Path("synthetic")
++        def factory(path, api_id, api_hash, **kw):
++            events.append(("factory",api_id,api_hash))
++            return Handle("fresh")
++        pane._new_telegram_client = factory
++        old = Handle("old")
++        clients = {"s": (object(), old)}
++        async with pane._file_client_lease("s",clients,old) as current:
++            self.assertIs(current,clients["s"][1])
++            events.append(("transfer",current.label))
++        self.assertEqual(events, [("disconnect","old"),("factory",123,"newkey"),("connect","fresh"),("transfer","fresh"),("disconnect","fresh")])

@@ -1,0 +1,2437 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -12,10 +12,13 @@
+ import unicodedata
+ import uuid
+ from collections import deque
++from contextlib import asynccontextmanager, AsyncExitStack
+ from pathlib import Path, PureWindowsPath
+ from typing import Any
+ 
+ from video_preview import PreviewError, make_video_thumbnail
++from tam_core.batch_runs import BatchRun
++from tam_core.live_rules import LiveSemaphore, RevisionedSeenStore, immutable_settings, route_changed, route_matches, validate_patch
+ from tam_core.file_metadata import has_active_writer, stat_identity
+ from tam_core.folder_events import FolderSnapshotIndex
+ from tam_core.folder_scan import FolderWalker
+@@ -33,6 +36,7 @@
+     wait_seconds as telegram_wait_seconds,
+ )
+ from tam_ui.task_editor import TaskEditor
++from tam_ui.table_clipboard import actions_for, capture_view, install_table_actions, restore_view, single_selection, telegram_link
+ 
+ import tkinter as tk
+ from tkinter import filedialog, messagebox, simpledialog, ttk
+@@ -116,20 +120,20 @@
+     uploaded twice. Thumbnail/caption/topic options remain in send_kwargs.
+     """
+     attributes, mime_type = None, None
+-    if _media_kind(path) == 'video' and telethon_utils is not None:
+-        # Passing only an InputFile handle loses duration/dimensions inferred
+-        # from the original path. Read them off the Telegram event loop.
+-        attributes, mime_type = await asyncio.to_thread(telethon_utils.get_attributes,
+-            str(path), supports_streaming=bool(send_kwargs.get('supports_streaming', False)),
+-            thumb=send_kwargs.get('thumb'))
+-        attributes = [copy.copy(a) for a in attributes]
+-        for attribute in attributes:
+-            if hasattr(attribute, 'supports_streaming'):
+-                attribute.supports_streaming = bool(send_kwargs.get('supports_streaming', False))
+-
+     async def upload():
++        nonlocal attributes, mime_type
+         if before_upload is not None:
+             await before_upload()
++        if _media_kind(path) == 'video' and telethon_utils is not None:
++            # Passing only an InputFile handle loses duration/dimensions inferred
++            # from the original path. Read them off the Telegram event loop.
++            attributes, mime_type = await asyncio.to_thread(telethon_utils.get_attributes,
++                str(path), supports_streaming=bool(send_kwargs.get('supports_streaming', False)),
++                thumb=send_kwargs.get('thumb'))
++            attributes = [copy.copy(a) for a in attributes]
++            for attribute in attributes:
++                if hasattr(attribute, 'supports_streaming'):
++                    attribute.supports_streaming = bool(send_kwargs.get('supports_streaming', False))
+         return await client.upload_file(str(path), part_size_kb=512, file_size=int(size),
+             progress_callback=send_kwargs.get('progress_callback'))
+     uploaded = await uploader(upload) if uploader is not None else await upload()
+@@ -378,6 +382,62 @@
+     CRYPTG_AVAILABLE = True
+ except ImportError:
+     CRYPTG_AVAILABLE = False
++
++
++class _FileBody:
++    """Innermost context of one file attempt: tells acquisition failures from body failures."""
++
++    def __init__(self, on_exception):
++        self.on_exception = on_exception
++        self.finished = False
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc, tb):
++        self.finished = True
++        if exc is not None:
++            self.on_exception()
++        return False
++
++
++async def _disconnect_settled(client: Any) -> None:
++    """Close a handle no registry owns yet; further cancellation cannot abandon it."""
++    if client is None:
++        return
++
++    async def close() -> None:
++        await client.disconnect()
++
++    cleanup = asyncio.create_task(close())
++    while not cleanup.done():
++        try:
++            await asyncio.shield(cleanup)
++        except asyncio.CancelledError:
++            continue
++        except Exception:
++            break
++    if not cleanup.cancelled():
++        cleanup.exception()
++
++
++async def _settled_thread_result(function: Any, *args: Any) -> tuple[Any, asyncio.CancelledError | None]:
++    """Finish blocking work whose result must be seen; return it with any pending cancel."""
++    work = asyncio.create_task(asyncio.to_thread(function, *args))
++    cancelled = None
++    while not work.done():
++        try:
++            await asyncio.shield(work)
++        except asyncio.CancelledError as exc:
++            cancelled = exc
++        except Exception:
++            break
++    try:
++        return work.result(), cancelled
++    except Exception:
++        if cancelled is not None:
++            raise cancelled
++        raise
+ 
+ 
+ class BatchUploadStopped(Exception):
+@@ -544,6 +604,7 @@
+                 self._build_unified_monitor_ui()
+             else:
+                 self._build_monitor_ui()
++        self._install_table_actions()
+         self.refresh_tasks()
+         self.refresh_monitor_tab()
+         if self.activity_sort_col and hasattr(self, "activity"):
+@@ -590,6 +651,140 @@
+         )
+         return status, claim_token
+ 
++    def _run_async(self, coro):
++        runner = getattr(self.app, "run_async", None)
++        if callable(runner):
++            operation = getattr(self, "_run_operation", None)
++            if operation is not None and "operation" in inspect.signature(runner).parameters:
++                return runner(coro, operation=operation)
++            return runner(coro)
++        return asyncio.run(coro)
++
++    def _latest_task_settings(self, task):
++        tid = str(task.get("id", ""))
++        if task.get("_ephemeral"):
++            return immutable_settings(task)
++        if task.get("monitor_folder") and hasattr(self.app, "monitor_rules"):
++            latest = self.app.monitor_rules.get(tid)
++            if (not latest or not latest.get("monitor_folder")
++                    or not route_matches(task, latest)):
++                return None
++        else:
++            latest = next((t for t in self.tasks() if str(t.get("id", "")) == tid), None)
++            # Legacy isolated task tests have no persisted task list.
++            if latest is None:
++                if callable(getattr(self.app.store, "patch_upload_task", None)):
++                    return None
++                with getattr(self, "_live_task_lock", threading.RLock()):
++                    latest = dict(getattr(self, "live_tasks", {}).get(tid, task))
++            if not latest.get("enabled", True) or not route_matches(task, latest):
++                return None
++        return immutable_settings(dict(task, **latest))
++
++    @asynccontextmanager
++    async def _app_slot(self, name, *args):
++        """Enter a shared runtime slot; Stop during its wait ends the file cleanly."""
++        slot = getattr(self.app, name, None)
++        if not callable(slot):
++            yield
++            return
++        acquired = False
++        try:
++            async with slot(*args, stop_event=self.stop_event):
++                acquired = True
++                yield
++        except asyncio.CancelledError:
++            # The runtime reports Stop by cancelling the wait; a real task cancel must propagate.
++            current = asyncio.current_task()
++            if not acquired and self.stop_event.is_set() and not (current and current.cancelling()):
++                raise BatchUploadStopped() from None
++            raise
++
++    def _shared_transfer_slot(self, session):
++        return self._app_slot("transfer_slot", session)
++
++    def _network_slot(self):
++        return self._app_slot("network_slot")
++
++    @asynccontextmanager
++    async def _task_admission(self, task_sem, task_id):
++        """Hold this rule's permit, and wait out its pause, before any shared account resource."""
++        async with task_sem:
++            if not await self._wait_gate(task_id):
++                raise BatchUploadStopped()
++            yield
++
++    @asynccontextmanager
++    async def _borrow_client(self, session, fallback):
++        if not getattr(self.app, "__dict__", {}).get("_runtime_enabled", False):
++            yield fallback
++            return
++        api_id, api_hash = self.app._api_credentials()
++        client = self._new_telegram_client(str(self.sessions_dir / session), api_id, api_hash,
++                                           flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD)
++        try:
++            await client.connect()
++            yield client
++        finally:
++            await client.disconnect()
++
++    async def _prepare_live_forum_topics(self, task, clients, resolved):
++        async with AsyncExitStack() as stack:
++            borrowed = {}
++            for session, (account, client) in sorted(clients.items(), key=lambda pair: str(pair[0]).casefold()):
++                if session in resolved:
++                    borrowed[session] = (account, await stack.enter_async_context(self._borrow_client(session, client)))
++            return await self._prepare_forum_topics(task, borrowed, resolved)
++
++    @asynccontextmanager
++    async def _file_client_lease(self, session, clients, fallback):
++        if not getattr(self.app, "__dict__", {}).get("_runtime_enabled", False):
++            yield fallback
++            return
++        account, previous = clients[session]
++        # The account lock encloses this lease, so a current file is never interrupted.
++        # Releasing idle ownership lets a waiting authorization change run first.
++        await previous.disconnect()
++        api_id, api_hash = self.app._api_credentials()
++        client = self._new_telegram_client(str(self.sessions_dir / session), api_id, api_hash,
++                                           flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD)
++        try:
++            await client.connect()
++        except BaseException:
++            await _disconnect_settled(client)
++            raise
++        clients[session] = (account, client)
++        try:
++            yield client
++        finally:
++            await client.disconnect()
++
++    def _task_parallel_limit(self, task):
++        latest = self._latest_task_settings(task)
++        if latest is None:
++            return 1
++        return 100 if latest.get("parallel_auto", True) else max(1, min(100, int(latest.get("parallel", 2) or 2)))
++
++    def _invalidate_monitor_queue(self, tids):
++        tids = set(map(str, tids))
++        with self._queue_lock:
++            for item in list(self.pending_batches):
++                if not _is_monitor_queue_item(item):
++                    continue
++                item["task_ids"] = [tid for tid in item.get("task_ids", []) if str(tid) not in tids]
++                item["task_snapshots"] = [t for t in item.get("task_snapshots", []) if str(t.get("id", "")) not in tids]
++                for tid in tids:
++                    item.get("monitor_signatures", {}).pop(tid, None)
++                if item["task_ids"]:
++                    self.app.store.db.queue_mark(str(item["id"]), "waiting", item)
++                else:
++                    self.pending_batches.remove(item)
++                    self.app.store.db.queue_mark(str(item["id"]), "invalidated", item)
++        for tid in tids:
++            self.monitor_pending_signatures.pop(tid, None)
++            self.monitor_last_signatures.pop(tid, None)
++        self._refresh_queue_status()
++
+     def _new_telegram_client(self, session_path, api_id, api_hash, **kwargs):
+         factory = getattr(self.app, '_new_telegram_client', None)
+         if factory is not None:
+@@ -623,7 +818,9 @@
+             lambda: [pair[1] for pair in clients.values()])
+ 
+     def tasks(self) -> list[dict[str, Any]]:
+-        raw = self.app.store.data.get("upload_tasks", [])
++        snapshot = getattr(self.app.store, "snapshot", None)
++        data = snapshot() if callable(snapshot) else copy.deepcopy(self.app.store.data)
++        raw = data.get("upload_tasks", [])
+         return [dict(x) for x in raw if isinstance(x, dict)]
+ 
+     def monitor_rules(self) -> list[dict[str, Any]]:
+@@ -634,21 +831,34 @@
+             return []
+ 
+     def save_tasks(self, tasks: list[dict[str, Any]]) -> None:
+-        self.app.store.data["upload_tasks"] = tasks
++        previous = {str(task.get("id", "")): task for task in self.tasks()}
++        fields = {"upload_tasks": copy.deepcopy(tasks)}
+         try:
+-            self.app.store.data["batch_global_parallel"] = max(1, min(100, int(self.global_parallel_var.get())))
++            fields["batch_global_parallel"] = max(1, min(100, int(self.global_parallel_var.get())))
+         except Exception:
+             pass
+         try:
+-            self.app.store.data["batch_global_parallel_auto"] = bool(self.global_parallel_auto_var.get())
++            fields["batch_global_parallel_auto"] = bool(self.global_parallel_auto_var.get())
+         except Exception:
+             pass
+-        self.app.store.save()
++        update = getattr(self.app.store, "update", None)
++        if callable(update):
++            update(fields)
++        else:
++            self.app.store.data.update(fields)
++            self.app.store.save()
+         # Monitoring is now an independent entity. Package edits can update/create
+         # their linked rule, but a package deletion never deletes the monitor rule.
+         for task in tasks:
+             try:
+-                self.app.monitor_rules.sync_from_task(task)
++                old = previous.get(str(task.get("id", "")))
++                if old == task:
++                    continue
++                sync = self.app.monitor_rules.sync_from_task
++                if "previous" in inspect.signature(sync).parameters:
++                    sync(task, previous=old)
++                else:
++                    sync(task)
+             except Exception as exc:
+                 self.app.log(f"Мониторинг: не удалось синхронизировать правило {task.get('name', '')} — {exc}")
+ 
+@@ -777,7 +987,7 @@
+         tasks_frame.columnconfigure(0, weight=1)
+         tasks_frame.rowconfigure(0, weight=1)
+         cols = ("on", "route", "accounts", "files", "size", "status", "progress", "speed", "eta", "admin", "parallel")
+-        self.tree = ttk.Treeview(tasks_frame, columns=cols, show="tree headings", selectmode="browse")
++        self.tree = ttk.Treeview(tasks_frame, columns=cols, show="tree headings", selectmode="extended")
+         self.task_heading_labels = {
+             "#0": "Название",
+             "on": "Вкл", "route": "Папка → канал", "accounts": "Акк.", "files": "Файлы",
+@@ -836,7 +1046,7 @@
+             queue_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+             queue_frame.columnconfigure(0, weight=1)
+             qcols = ("source", "tasks", "status", "created")
+-            self.queue_tree = ttk.Treeview(queue_frame, columns=qcols, show="headings", height=5, selectmode="browse")
++            self.queue_tree = ttk.Treeview(queue_frame, columns=qcols, show="headings", height=5, selectmode="extended")
+             for col, title, width in (("source", "Источник", 110), ("tasks", "Задания", 520), ("status", "Статус", 150), ("created", "Добавлено", 85)):
+                 self.queue_tree.heading(col, text=title)
+                 self.queue_tree.column(col, width=width, minwidth=70, anchor="w")
+@@ -864,7 +1074,7 @@
+         activity_frame.columnconfigure(0, weight=1)
+         activity_frame.rowconfigure(0, weight=1)
+         acols = ("task", "account", "size", "progress", "speed", "status")
+-        self.activity = ttk.Treeview(activity_frame, columns=acols, show="tree headings", selectmode="browse", height=8)
++        self.activity = ttk.Treeview(activity_frame, columns=acols, show="tree headings", selectmode="extended", height=8)
+         self.activity_heading_labels = {
+             "#0": "Файл", "task": "Задание", "account": "Аккаунт", "size": "Размер",
+             "progress": "%", "speed": "Скорость", "status": "Статус",
+@@ -943,7 +1153,7 @@
+         frame.columnconfigure(0, weight=1)
+         frame.rowconfigure(0, weight=1)
+         cols = ("on", "source", "folder", "target", "interval", "last", "next", "admins", "topics", "new", "queue", "state")
+-        self.monitor_tree = ttk.Treeview(frame, columns=cols, show="tree headings", selectmode="browse")
++        self.monitor_tree = ttk.Treeview(frame, columns=cols, show="tree headings", selectmode="extended")
+         headings = {
+             "#0": "Правило", "on": "Мон.", "source": "Источник", "folder": "Папка", "target": "Группа",
+             "interval": "Интервал", "last": "Последняя проверка", "next": "Следующая",
+@@ -1032,7 +1242,7 @@
+         body.add(rules_panel, stretch="always", minsize=260)
+ 
+         cols = ("on", "folder", "target", "caption", "interval", "new", "queue", "progress", "speed", "eta", "state")
+-        self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="browse")
++        self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="extended")
+         headings = {
+             "#0": "Правило", "on": "Мон.", "folder": "Папка", "target": "Группа",
+             "caption": "Подпись", "interval": "Интервал", "new": "Новые", "queue": "Работа",
+@@ -1084,7 +1294,7 @@
+         ttk.Label(activity_tools, textvariable=self.queue_status_var).pack(side="right")
+ 
+         acols = ("task", "account", "size", "progress", "speed", "status")
+-        self.activity = ttk.Treeview(activity_panel, columns=acols, show="tree headings", selectmode="browse", height=8)
++        self.activity = ttk.Treeview(activity_panel, columns=acols, show="tree headings", selectmode="extended", height=8)
+         self.activity_heading_labels = {
+             "#0": "Файл", "task": "Правило", "account": "Аккаунт", "size": "Размер",
+             "progress": "%", "speed": "Скорость", "status": "Статус",
+@@ -1111,6 +1321,56 @@
+         self.activity_rows = {}
+         self.activity_paths = {}
+ 
++    def _install_table_actions(self) -> None:
++        """Clipboard wiring for the main tables; each owner keeps its own menu."""
++        def task_of(iid: str) -> dict[str, Any]:
++            index = self._task_index(iid)
++            return self.tasks()[index] if index is not None else {}
++
++        def rule_of(iid: str) -> dict[str, Any]:
++            return self.app.monitor_rules.get(iid) or {}
++
++        tables = (
++            ('tree', ('#0', 'on', 'route', 'accounts', 'files', 'size', 'status', 'progress', 'speed', 'eta', 'admin', 'parallel'),
++             {'path_of': lambda iid: task_of(iid).get('folder', ''), 'id_of': str,
++              'link_of': lambda iid: telegram_link(task_of(iid).get('target', ''))}, False),
++            ('monitor_tree', ('#0', 'on', 'source', 'folder', 'target', 'caption', 'interval', 'last', 'next', 'admins', 'topics', 'new', 'queue', 'progress', 'speed', 'eta', 'state'),
++             {'path_of': lambda iid: rule_of(iid).get('folder', ''), 'id_of': str,
++              'link_of': lambda iid: telegram_link(rule_of(iid).get('target', ''))}, False),
++            ('queue_tree', ('source', 'tasks', 'status', 'created'), {'id_of': str}, True),
++            ('activity', ('#0', 'task', 'account', 'size', 'progress', 'speed', 'status'),
++             {'path_of': lambda iid: self.activity_paths.get(iid, ''),
++              'labels': {'paths': ('Копировать полный путь', 'Копировать пути ({n})')}}, False),
++        )
++        for name, columns, options, install_menu in tables:
++            tree = getattr(self, name, None)
++            if tree is not None:
++                install_table_actions(tree, columns=columns, install_menu=install_menu, **options)
++
++    def _show_copy_only_menu(self, tree: ttk.Treeview, event: tk.Event, selected: list[str]) -> bool:
++        """With several rows selected, single-object commands are not offered."""
++        if len(selected) <= 1:
++            return False
++        if tree is getattr(self, "tree", None) or tree is getattr(self, "monitor_tree", None):
++            monitor = tree is getattr(self, "monitor_tree", None)
++            menu = tk.Menu(tree, tearoff=False)
++            menu.add_command(label="Общие параметры выбранных…", command=lambda: self.edit_selected_fields(monitor=monitor))
++            menu.add_command(label="Включить/выключить выбранные", command=self.toggle_selected_monitor_rule if monitor else self.toggle_task_enabled)
++            menu.add_command(label="Дублировать выбранные", command=self.duplicate_selected_monitor_rules if monitor else self.duplicate_task)
++            menu.add_command(label="Остановить выбранные запуски", command=self.stop_selected_runs)
++            menu.add_command(label="Пауза выбранных", command=lambda: self.set_selected_tasks_paused(True))
++            menu.add_command(label="Продолжить выбранные", command=lambda: self.set_selected_tasks_paused(False))
++            menu.add_command(label="Удалить выбранные", command=self.remove_selected_monitor_rule if monitor else self.remove_task)
++            menu.add_separator()
++            actions_for(tree).add_copy_items(menu)
++            try:
++                menu.tk_popup(event.x_root, event.y_root)
++            finally:
++                menu.grab_release()
++            return True
++        actions_for(tree).show_copy_menu(event)
++        return True
++
+     def _update_monitor_details(self) -> None:
+         if not hasattr(self, 'monitor_view'):
+             return
+@@ -1131,6 +1391,12 @@
+         data['accounts'] = f'{len(selected)} выбрано · Premium: {premium}'
+         target = str(rule.get('target', ''))
+         data['target'] = self.app.group_display_name(target) if hasattr(self.app, 'group_display_name') else target
++        runtime = getattr(self, "monitor_runtime", {}).get(tid, {})
++        applied = runtime.get("settings_revision")
++        settings_state = "Применено"
++        if tid in getattr(self, "live_tasks", {}) and applied is not None and int(applied) < int(rule.get("revision", 0)):
++            settings_state = "Ожидает следующего файла; текущий завершится с прежними параметрами"
++        data["status"] = str(data.get("status", "")) + " · Настройки: " + settings_state
+         self.monitor_view.show_details(data)
+ 
+     def _upsert_monitor_row(self, parent, position, *, iid, text, values):
+@@ -1241,8 +1507,7 @@
+     def _monitor_selected_tid(self) -> str | None:
+         if not hasattr(self, "monitor_tree"):
+             return None
+-        sel = self.monitor_tree.selection()
+-        return str(sel[0]) if sel else None
++        return single_selection(self.monitor_tree)
+ 
+     @staticmethod
+     def _clock(ts: Any) -> str:
+@@ -1261,7 +1526,7 @@
+                     return
+             except Exception:
+                 pass
+-        selected = self._monitor_selected_tid()
++        selected = tuple(self.monitor_tree.selection()) if hasattr(self.monitor_tree, "selection") else ()
+         rules = self.monitor_rules()
+         self._prune_unconfirmed(rules)
+         queued = self._queued_task_ids()
+@@ -1358,9 +1623,9 @@
+             for iid in self.monitor_tree.get_children(''):
+                 if iid not in retained:
+                     self.monitor_tree.delete(iid)
+-        if selected and self.monitor_tree.exists(selected):
+-            if self.monitor_tree.selection() != (selected,):
+-                self.monitor_tree.selection_set(selected)
++        selected = tuple(iid for iid in selected if self.monitor_tree.exists(iid))
++        if selected and tuple(self.monitor_tree.selection()) != selected:
++            self.monitor_tree.selection_set(selected)
+         self.monitor_summary_var.set(
+             f"Правил: {enabled_count}/{len(rules)} · выполняется: {active_count} · кэш групп: {len(self.app.group_state_cache.all_entries())}"
+         )
+@@ -1461,7 +1726,7 @@
+                 except Exception as exc:
+                     self.app.log(f"Мониторинг: не удалось обновить снимок очереди — {exc}")
+         self.app.log(f"Мониторинг: выбрано аккаунтов {len(selected)} для всех правил ({len(rule_ids)}). "
+-                     "Текущая пачка завершится с прежним составом; следующие используют выбранный список.")
++                     "Текущий файл завершится с прежним составом; следующие используют выбранный список.")
+         self.refresh_monitor_tab(force=True)
+         return len(rule_ids)
+ 
+@@ -1484,7 +1749,7 @@
+         body.pack(fill="both", expand=True)
+         ttk.Label(body, text=f"Один список аккаунтов для всех правил: {len(rules)}", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+         ttk.Label(body, text="Список заменит участников существующих правил. Новые аккаунты автоматически не добавляются. "
+-                  "Текущая пачка завершится с прежним составом.",
++                  "Текущий файл завершится с прежними параметрами.",
+                   wraplength=590).pack(anchor="w", pady=(6, 10))
+         area = ttk.Frame(body)
+         area.pack(fill="both", expand=True)
+@@ -1553,18 +1818,107 @@
+             self.monitor_tree.see(rule["id"])
+         self.app.log(f"Мониторинг: добавлено независимое правило — {rule.get('name', rule['id'])}.")
+ 
++    def _selected_monitor_ids(self):
++        return list(map(str, self.monitor_tree.selection())) if hasattr(self, "monitor_tree") else []
++
++    def _selected_task_ids(self):
++        return list(map(str, self.tree.selection()))
++
++    @staticmethod
++    def _validate_field_patch(fields):
++        validate_patch(fields)
++
++    def edit_selected_fields(self, *, monitor=False):
++        from tam_ui.bulk_editor import BulkFieldEditor
++        ids = self._selected_monitor_ids() if monitor else self._selected_task_ids()
++        records = [self.app.monitor_rules.get(tid) for tid in ids] if monitor else [t for t in self.tasks() if str(t.get("id", "")) in ids]
++        records = [r for r in records if r]
++        if not records:
++            return
++        dialog = BulkFieldEditor(self.app, records, monitor=monitor, validate=self._validate_field_patch,
++            accounts=self.app.store.accounts())
++        self.app.wait_window(dialog)
++        if dialog.result:
++            if monitor:
++                self.patch_selected_monitor_rules(dialog.result)
++            else:
++                self.patch_selected_tasks(dialog.result)
++
++    def patch_selected_monitor_rules(self, fields):
++        self._validate_field_patch(fields)
++        ids = self._selected_monitor_ids()
++        originals = {tid: self.app.monitor_rules.get(tid) for tid in ids}
++        changed_routes = [tid for tid, rule in originals.items() if rule and route_changed(rule, dict(rule, **fields))]
++        if changed_routes and not messagebox.askyesno("Изменение маршрутов", f"Изменяется маршрутов: {len(changed_routes)}. Все подходящие уже существующие файлы будут проверены для нового назначения. Продолжить?", parent=self.app):
++            return 0
++        changed = self.app.monitor_rules.patch_many(ids, fields)
++        for tid, old in originals.items():
++            if old and tid in getattr(self, "live_tasks", {}):
++                self.monitor_runtime.setdefault(tid, {}).setdefault("settings_revision", old.get("revision", 0))
++        invalid = set(changed_routes) | {tid for tid, rule in changed.items() if not rule.get("monitor_folder", True)}
++        if invalid:
++            self._invalidate_monitor_queue(invalid)
++        self.refresh_monitor_tab(force=True)
++        self.app.log(f"Мониторинг: применено к правилам: {len(changed)}; текущие файлы завершатся с прежними параметрами.")
++        return len(changed)
++
++    def patch_selected_tasks(self, fields):
++        self._validate_field_patch(fields)
++        ids = set(self._selected_task_ids())
++        tasks = self.tasks()
++        invalid = self._confirm_linked_task_routes([t for t in tasks if str(t.get("id", "")) in ids], fields)
++        if invalid is None:
++            return 0
++        changed = 0
++        for task in tasks:
++            if str(task.get("id", "")) in ids:
++                task.update(copy.deepcopy(fields))
++                changed += 1
++        self.save_tasks(tasks)
++        if invalid:
++            self._invalidate_monitor_queue(invalid)
++        self.refresh_tasks()
++        self.app.log(f"Пакет: применено к заданиям: {changed}.")
++        return changed
++
++    def duplicate_selected_monitor_rules(self):
++        clones = []
++        for tid in self._selected_monitor_ids():
++            rule = self.app.monitor_rules.get(tid)
++            if not rule:
++                continue
++            clone = copy.deepcopy(rule)
++            clone.update(id=uuid.uuid4().hex[:12], name=f"{rule.get('name', 'Правило')} — копия", monitor_folder=False)
++            for key in list(clone):
++                if key in {"revision", "route_revision"} or key.startswith("monitor_seen") or key in {"monitor_signature", "monitor_last_success", "monitor_last_detection", "monitor_last_new_count"}:
++                    clone.pop(key)
++            self.app.monitor_rules.put(clone)
++            clones.append(clone["id"])
++        self.refresh_monitor_tab(force=True)
++        if clones:
++            self.monitor_tree.selection_set(clones)
++        self.app.log(f"Мониторинг: создано выключенных копий: {len(clones)}.")
++        return len(clones)
++
++    def set_selected_tasks_paused(self, paused):
++        ids = set(self._selected_task_ids()) | set(self._selected_monitor_ids())
++        changed = 0
++        for tid in ids:
++            event = self.task_pause_events.get(tid)
++            if event is not None:
++                event.clear() if paused else event.set()
++                self._queue_task_row(tid, status="Пауза после текущего" if paused else "Продолжение…")
++                changed += 1
++        self.app.log(f"Задания: {'пауза' if paused else 'продолжение'} — {changed}.")
++        return changed
++
+     def toggle_selected_monitor_rule(self) -> None:
+-        tid = self._monitor_selected_tid()
+-        if not tid:
+-            return
+-        rule = self.app.monitor_rules.get(tid)
+-        if not rule:
+-            return
+-        enabled = not bool(rule.get("monitor_folder", False))
+-        rule["monitor_folder"] = enabled
+-        self.app.monitor_rules.put(rule)
+-        self._set_linked_task_monitor_flag(tid, enabled)
+-        self.refresh_monitor_tab()
++        ids = self._selected_monitor_ids()
++        rules = [self.app.monitor_rules.get(tid) for tid in ids]
++        enabled = not all(rule.get("monitor_folder", False) for rule in rules)
++        self.patch_selected_monitor_rules({"monitor_folder": enabled})
++        for tid in ids:
++            self._set_linked_task_monitor_flag(tid, enabled)
+ 
+     def edit_monitor_rule(self) -> None:
+         tid = self._monitor_selected_tid()
+@@ -1596,14 +1950,22 @@
+                 if key in original:
+                     updated[key] = original.get(key)
+         else:
+-            self.app.monitor_rules.reset_seen_files(tid)
+             for key in (
+                 "monitor_signature", "monitor_last_success",
+                 "monitor_seen_initialized",
+                 "monitor_last_new_count", "monitor_last_detection",
+             ):
+                 updated.pop(key, None)
++        if not same_identity and not messagebox.askyesno(
++            "Изменение маршрута мониторинга",
++            "Новый маршрут проверит все подходящие уже имеющиеся файлы папки и может отправить их новому получателю. Сохранить изменение?",
++            parent=self.app,
++        ):
++            return
++        updated["revision"] = original.get("revision", 0)
+         self.app.monitor_rules.put(updated)
++        if not same_identity:
++            self._invalidate_monitor_queue([tid])
+         if str(updated.get("caption", "")) != str(original.get("caption", "")):
+             self._propagate_monitor_caption(tid, str(updated.get("caption", "")))
+         self._set_linked_task_monitor_flag(tid, bool(updated.get("monitor_folder", False)))
+@@ -1674,7 +2036,7 @@
+         with self._live_task_lock:
+             live = self.live_tasks.get(str(tid))
+             if isinstance(live, dict):
+-                live["caption"] = str(caption)
++                self.live_tasks[str(tid)] = dict(live, caption=str(caption))
+                 live_changed = True
+         return len(changed_waiting), live_changed
+ 
+@@ -1692,10 +2054,11 @@
+     ) -> str | None:
+         tid = str(task.get("id", ""))
+         template = str(task.get("caption", ""))
+-        with self._live_task_lock:
+-            live = self.live_tasks.get(tid)
+-            if isinstance(live, dict):
+-                template = str(live.get("caption", template))
++        if not task.get("_caption_frozen"):
++            with self._live_task_lock:
++                live = self.live_tasks.get(tid)
++                if isinstance(live, dict):
++                    template = str(live.get("caption", template))
+         numbering = task.get('_monitor_numbering')
+         if numbering is not None and ('{index}' in template or '{total}' in template):
+             if numbering['positions'] is None:
+@@ -1709,7 +2072,7 @@
+         tid = self._monitor_selected_tid()
+         if not tid:
+             return
+-        if self.running:
++        if self.running and not getattr(self.app, "_concurrent_enabled", lambda: False)():
+             messagebox.showinfo("Telegram Admin Manager", "Сейчас идёт загрузка. Добавь правило в очередь или дождись освобождения Telegram-сессий.", parent=self.app)
+             return
+         rule = self.app.monitor_rules.get(tid)
+@@ -1727,7 +2090,7 @@
+             self.app.monitor_rules.put(rule)
+         self.app.group_state_cache.invalidate_topics(str(rule.get("target", "")))
+         self.refresh_monitor_tab()
+-        self.app.run_worker(lambda r=dict(rule): asyncio.run(self._sync_topics_standalone(r)), "Синхронизирую темы форума…")
++        self.app.run_worker(lambda r=dict(rule): self._run_async(self._sync_topics_standalone(r)), "Синхронизирую темы форума…")
+ 
+     @staticmethod
+     def _monitor_task_for_queue(rule: dict[str, Any]) -> dict[str, Any]:
+@@ -1768,13 +2131,9 @@
+ 
+ 
+     def enqueue_selected_monitor_rule(self) -> None:
+-        tid = self._monitor_selected_tid()
+-        if not tid:
+-            return
+-        rule = self.app.monitor_rules.get(tid)
+-        if not rule:
+-            return
+-        self._enqueue_batch([self._monitor_task_for_queue(rule)], source="Мониторинг вручную", notify=False, dedupe=True)
++        rules = [self.app.monitor_rules.get(tid) for tid in self._selected_monitor_ids()]
++        tasks = [self._monitor_task_for_queue(rule) for rule in rules if rule and rule.get("monitor_folder", True)]
++        self._enqueue_batch(tasks, source="Мониторинг вручную", notify=False, dedupe=True)
+         self.refresh_monitor_tab()
+ 
+     def clear_selected_group_cache(self) -> None:
+@@ -1858,24 +2217,15 @@
+         messagebox.showinfo('Незавершённые отправки', f'Снято старых резервов: {count}.\nИстория подтверждённых загрузок сохранена.', parent=self.app)
+ 
+     def remove_selected_monitor_rule(self) -> None:
+-        tid = self._monitor_selected_tid()
+-        if not tid:
+-            return
+-        rule = self.app.monitor_rules.get(tid)
+-        if not rule:
+-            return
+-        if not messagebox.askyesno(
+-            "Telegram Admin Manager",
+-            f"Удалить правило мониторинга «{rule.get('name', 'Правило')}»?\n\nПакетное задание, если оно существует, останется.",
+-            parent=self.app,
+-        ):
+-            return
+-        self._set_linked_task_monitor_flag(tid, False)
+-        self.app.monitor_rules.delete(tid)
+-        self.monitor_last_signatures.pop(tid, None)
+-        self.monitor_pending_signatures.pop(tid, None)
+-        self.monitor_runtime.pop(tid, None)
+-        self.app.log(f"Мониторинг: правило удалено отдельно — {rule.get('name', tid)}.")
++        ids = [tid for tid in self._selected_monitor_ids() if self.app.monitor_rules.get(tid)]
++        if not ids or not messagebox.askyesno("Telegram Admin Manager", f"Удалить правил мониторинга: {len(ids)}? Пакетные задания и история отправок сохранятся.", parent=self.app):
++            return
++        for tid in ids:
++            self._set_linked_task_monitor_flag(tid, False)
++            self.app.monitor_rules.delete(tid)
++            self.monitor_runtime.pop(tid, None)
++        self._invalidate_monitor_queue(ids)
++        self.app.log(f"Мониторинг: удалено правил: {len(ids)}.")
+         self.refresh_monitor_tab()
+ 
+     def _set_monitor_interval(self, tid: str, value: int) -> None:
+@@ -1887,10 +2237,11 @@
+         self.refresh_monitor_tab()
+ 
+     def _show_monitor_context(self, event: tk.Event) -> None:
+-        iid = self.monitor_tree.identify_row(event.y)
+-        if not iid:
+-            return
+-        self.monitor_tree.selection_set(iid)
++        actions = actions_for(self.monitor_tree)
++        selected = actions.prepare_context(event)
++        if not selected or self._show_copy_only_menu(self.monitor_tree, event, selected):
++            return
++        iid = selected[0]
+         rule = self.app.monitor_rules.get(iid)
+         if not rule:
+             return
+@@ -1906,8 +2257,14 @@
+         menu.add_command(label="🔄 Синхронизировать темы", command=self.sync_selected_monitor_topics)
+         menu.add_command(label="🧠 Сбросить кэш группы", command=self.clear_selected_group_cache)
+         menu.add_separator()
++        menu.add_command(label="Общие параметры выбранных правил…", command=lambda: self.edit_selected_fields(monitor=True))
+         menu.add_command(label="✎ Изменить правило…", command=self.edit_monitor_rule)
+-        menu.add_command(label="Удалить только правило мониторинга", command=self.remove_selected_monitor_rule)
++        menu.add_command(label="Дублировать выбранные правила (выключенные)", command=self.duplicate_selected_monitor_rules)
++        menu.add_command(label="Пауза выбранных", command=lambda: self.set_selected_tasks_paused(True))
++        menu.add_command(label="Продолжить выбранные", command=lambda: self.set_selected_tasks_paused(False))
++        menu.add_command(label="Удалить выбранные правила мониторинга", command=self.remove_selected_monitor_rule)
++        menu.add_separator()
++        actions.add_copy_items(menu)
+         try:
+             menu.tk_popup(event.x_root, event.y_root)
+         finally:
+@@ -2013,8 +2370,22 @@
+                 }
+         return out
+ 
++    def _confirm_linked_task_routes(self, tasks, fields):
++        changed = []
++        for task in tasks:
++            store = getattr(self.app, "monitor_rules", None)
++            current = store.get(str(task.get("id", ""))) if store else None
++            if current and route_changed(task, dict(task, **fields)):
++                changed.append(str(task.get("id", "")))
++        if changed and not messagebox.askyesno("Изменение маршрутов", f"Изменяется маршрутов мониторинга: {len(changed)}. Все подходящие уже существующие файлы будут проверены для нового назначения. Продолжить?", parent=self.app):
++            return None
++        return changed
++
+     def _patch_task(self, tid: str, **fields: Any) -> None:
+         tasks = self.tasks()
++        invalid = self._confirm_linked_task_routes([t for t in tasks if str(t.get("id", "")) == str(tid)], fields)
++        if invalid is None:
++            return
+         changed = False
+         for i, task in enumerate(tasks):
+             if str(task.get("id", "")) != tid:
+@@ -2029,14 +2400,14 @@
+             break
+         if not changed:
+             return
+-        # Keep the live object in sync for options read for every next file
+-        # (caption/silent/streaming/delay etc.). Worker topology changes such as
+-        # account set / parallelism are persisted immediately and take full effect
+-        # on the next run.
+-        live = self.live_tasks.get(tid)
+-        if live is not None:
+-            live.update(fields)
++        # Publish a replacement snapshot; in-flight files retain their own options.
++        with getattr(self, "_live_task_lock", threading.RLock()):
++            live = self.live_tasks.get(tid)
++            if live is not None:
++                self.live_tasks[tid] = dict(live, **fields)
+         self.save_tasks(tasks)
++        if invalid:
++            self._invalidate_monitor_queue(invalid)
+         runtime_rows: dict[str, tuple[Any, ...]] = {}
+         if self.running:
+             for row_id in self.tree.get_children(""):
+@@ -2058,11 +2429,11 @@
+                     if pos < len(old_vals):
+                         new_vals[pos] = old_vals[pos]
+                 self.tree.item(row_id, values=new_vals)
+-        if self.tree.exists(tid):
++        if self.tree.exists(tid) and tid not in self.tree.selection():
+             self.tree.selection_set(tid)
+         topology = {"use_all_accounts", "account_sessions", "parallel_auto", "parallel", "auto_admin", "join_if_needed", "forum_topics_from_subfolders", "forum_auto_create_topics"}
+         if self.running and topology.intersection(fields):
+-            self.app.log("Пакет: изменение состава аккаунтов/параллельности сохранено; полностью применится со следующего запуска задания.")
++            self.app.log("Пакет: изменение состава аккаунтов/параллельности сохранено; применяется к следующим файлам; текущая передача завершится.")
+         if not self.running and {"send_videos", "send_photos", "recursive"}.intersection(fields):
+             self.scan_one(tid)
+         self.refresh_monitor_tab()
+@@ -2075,15 +2446,20 @@
+         self._patch_task(tid, **{field: not bool(task.get(field, default))})
+ 
+     def _show_task_context(self, event: tk.Event) -> None:
+-        iid = self.tree.identify_row(event.y)
+-        if not iid:
+-            return
+-        self.tree.selection_set(iid)
++        actions = actions_for(self.tree)
++        selected = actions.prepare_context(event)
++        if not selected or self._show_copy_only_menu(self.tree, event, selected):
++            return
++        iid = selected[0]
+         idx = self._task_index(iid)
+         if idx is None:
+             return
+         task = self.tasks()[idx]
+         menu = tk.Menu(self.tree, tearoff=False)
++        menu.add_command(label="Общие параметры выбранных заданий…", command=self.edit_selected_fields)
++        menu.add_command(label="Включить/выключить выбранные", command=self.toggle_task_enabled)
++        menu.add_command(label="Дублировать выбранные", command=self.duplicate_task)
++        menu.add_command(label="Удалить выбранные", command=self.remove_task)
+         menu.add_command(label="➕ Добавить это задание в очередь", command=lambda: self.start(True))
+         if self.running and iid in self.task_pause_events:
+             ev = self.task_pause_events[iid]
+@@ -2182,6 +2558,8 @@
+         menu.add_command(label="✎ Все настройки…", command=self.edit_task)
+         menu.add_command(label="⧉ Дублировать", command=self.duplicate_task)
+         menu.add_command(label="Удалить", command=self.remove_task)
++        menu.add_separator()
++        actions.add_copy_items(menu)
+         try:
+             menu.tk_popup(event.x_root, event.y_root)
+         finally:
+@@ -2233,7 +2611,7 @@
+         dlg.grab_set()
+ 
+     def scan_one(self, tid: str) -> None:
+-        if self.running or self.app._busy:
++        if (self.running or self.app._busy) and not getattr(self.app, "_concurrent_enabled", lambda: False)():
+             messagebox.showwarning("Telegram Admin Manager", "Сканирование доступно после завершения текущей операции.", parent=self.app)
+             return
+         idx = self._task_index(tid)
+@@ -2341,16 +2719,17 @@
+                     self.activity_rows.pop(key, None)
+ 
+     def _show_activity_context(self, event: tk.Event) -> None:
+-        iid = self.activity.identify_row(event.y)
+-        if not iid:
+-            return
+-        self.activity.selection_set(iid)
++        actions = actions_for(self.activity)
++        selected = actions.prepare_context(event)
++        if not selected or self._show_copy_only_menu(self.activity, event, selected):
++            return
++        iid = selected[0]
+         path = self.activity_paths.get(iid)
+         menu = tk.Menu(self.activity, tearoff=False)
+         menu.add_command(label='Открыть правило', command=self._open_activity_rule)
+         menu.add_command(label="Копировать имя файла", command=lambda: self._copy_text(str(self.activity.item(iid, "text"))))
++        actions.add_copy_items(menu)
+         if path is not None:
+-            menu.add_command(label="Копировать полный путь", command=lambda p=path: self._copy_text(str(p)))
+             menu.add_command(label="Открыть папку", command=lambda p=path: self._open_folder(p.parent))
+         menu.add_separator()
+         menu.add_command(label="Убрать строку из списка", command=lambda: self._remove_activity_row(iid))
+@@ -2363,7 +2742,10 @@
+         iid = self.activity.identify_row(event.y) if event is not None else next(iter(self.activity.selection()), '')
+         # Keys are created by the uploader as '<task id>:<absolute path>'.
+         key = next((key for key, row in self.activity_rows.items() if row == iid), '')
+-        tid = key.partition(':')[0]
++        parts = key.split(':', 2)
++        known_runs = {run_id for run_id, _tid in getattr(self, "run_task_states", {})}
++        known_runs.update(getattr(self, "_active_runs", {}))
++        tid = parts[1] if len(parts) > 1 and parts[0] in known_runs else parts[0]
+         if not tid or not self.monitor_tree.exists(tid):
+             return
+         self.monitor_tree.selection_set(tid)
+@@ -2399,7 +2781,7 @@
+ 
+     def refresh_tasks(self) -> None:
+         self._migrate_legacy_task_if_needed()
+-        selected = self.selected_task_id()
++        view_state = capture_view(self.tree)
+         for iid in self.tree.get_children():
+             self.tree.delete(iid)
+         accounts_by_session = {a.session: a for a in self.app.store.accounts()}
+@@ -2459,9 +2841,7 @@
+             )
+         if changed:
+             self.save_tasks(tasks)
+-        if selected and self.tree.exists(selected):
+-            self.tree.selection_set(selected)
+-            self.tree.see(selected)
++        restore_view(self.tree, view_state)
+         if self.task_sort_col:
+             self._apply_sort(self.tree, self.task_sort_col, self.task_sort_reverse)
+             self._update_sort_headings(self.tree, self.task_heading_labels, self.task_sort_col, self.task_sort_reverse)
+@@ -2482,8 +2862,7 @@
+         return tid
+ 
+     def selected_task_id(self) -> str | None:
+-        sel = self.tree.selection()
+-        return sel[0] if sel else None
++        return single_selection(self.tree)
+ 
+     def _task_index(self, tid: str | None) -> int | None:
+         if not tid:
+@@ -2536,58 +2915,49 @@
+         if monitor_identity_same and original.get("monitor_signature"):
+             updated["monitor_signature"] = original.get("monitor_signature")
+             updated["monitor_last_success"] = original.get("monitor_last_success", 0)
++        invalid = self._confirm_linked_task_routes([original], updated)
++        if invalid is None:
++            return
+         tasks[idx] = updated
+         self.save_tasks(tasks)
++        if invalid:
++            self._invalidate_monitor_queue(invalid)
+         self.refresh_tasks()
+         self.tree.selection_set(updated["id"])
+ 
+     def duplicate_task(self) -> None:
+-        tid = self.selected_task_id()
+-        idx = self._task_index(tid)
+-        if idx is None:
+-            return
++        ids = set(self._selected_task_ids())
++        tasks, result, clones = self.tasks(), [], []
++        for task in tasks:
++            result.append(task)
++            if str(task.get("id", "")) in ids:
++                clone = copy.deepcopy(task)
++                clone.update(id=uuid.uuid4().hex[:12], name=f"{clone.get('name', 'Задание')} — копия", monitor_folder=False)
++                for key in ("revision", "route_revision", "monitor_signature", "monitor_last_success"):
++                    clone.pop(key, None)
++                result.append(clone)
++                clones.append(clone["id"])
++        self.save_tasks(result)
++        self.refresh_tasks()
++        if clones:
++            self.tree.selection_set(clones)
++        self.app.log(f"Пакет: создано копий: {len(clones)}.")
++
++    def toggle_task_enabled(self) -> None:
++        ids = set(self._selected_task_ids())
++        selected = [t for t in self.tasks() if str(t.get("id", "")) in ids]
++        self.patch_selected_tasks({"enabled": not all(t.get("enabled", True) for t in selected)})
++
++    def remove_task(self) -> None:
++        ids = set(self._selected_task_ids())
+         tasks = self.tasks()
+-        clone = dict(tasks[idx])
+-        clone["id"] = uuid.uuid4().hex[:12]
+-        clone["name"] = f"{clone.get('name', 'Задание')} — копия"
+-        clone.pop("monitor_signature", None)
+-        clone.pop("monitor_last_success", None)
+-        tasks.insert(idx + 1, clone)
+-        self.save_tasks(tasks)
++        count = sum(str(t.get("id", "")) in ids for t in tasks)
++        if not count or not messagebox.askyesno("Telegram Admin Manager", f"Удалить пакетных заданий: {count}? История отправок и независимые правила мониторинга сохранятся.", parent=self.app):
++            return
++        self.app.store.data["batch_legacy_migration_done"] = True
++        self.save_tasks([t for t in tasks if str(t.get("id", "")) not in ids])
+         self.refresh_tasks()
+-        self.tree.selection_set(clone["id"])
+-
+-    def toggle_task_enabled(self) -> None:
+-        tid = self.selected_task_id()
+-        idx = self._task_index(tid)
+-        if idx is None:
+-            return
+-        tasks = self.tasks()
+-        tasks[idx]["enabled"] = not bool(tasks[idx].get("enabled", True))
+-        self.save_tasks(tasks)
+-        self.refresh_tasks()
+-        if tid and self.tree.exists(tid):
+-            self.tree.selection_set(tid)
+-
+-    def remove_task(self) -> None:
+-        tid = self.selected_task_id()
+-        idx = self._task_index(tid)
+-        if idx is None:
+-            return
+-        monitor_survives = bool(self.app.monitor_rules.get(str(tid)))
+-        extra = "\n\nПравило мониторинга останется и продолжит работать отдельно." if monitor_survives else ""
+-        if not messagebox.askyesno(
+-            "Telegram Admin Manager",
+-            "Удалить выбранное пакетное задание? История уже отправленных файлов останется." + extra,
+-            parent=self.app,
+-        ):
+-            return
+-        tasks = self.tasks()
+-        tasks.pop(idx)
+-        # Explicit deletion is authoritative, including when it leaves zero tasks.
+-        self.app.store.data["batch_legacy_migration_done"] = True
+-        self.save_tasks(tasks)
+-        self.refresh_tasks()
++        self.app.log(f"Пакет: удалено заданий: {count}.")
+ 
+     def move_task(self, delta: int) -> None:
+         tid = self.selected_task_id()
+@@ -2653,6 +3023,9 @@
+ 
+     def _scan_task_files(self, task: dict[str, Any], *, include_oversized: bool = False) -> tuple[list[Path], int]:
+         task.pop('_monitor_numbering', None)
++        if task.get("_explicit_files") is not None:
++            files = [Path(path) for path in task["_explicit_files"] if Path(path).is_file() and _media_kind(Path(path)) in {"video", "photo"}]
++            return files, sum(path.stat().st_size for path in files)
+         if not include_oversized:
+             selection = selected_delta_files(task, getattr(self, '_folder_indexes', None), _telegram_upload_lane)
+             if selection is not None:
+@@ -2697,7 +3070,7 @@
+         return files, total
+ 
+     def scan_all(self) -> None:
+-        if self.running or self.app._busy:
++        if (self.running or self.app._busy) and not getattr(self.app, "_concurrent_enabled", lambda: False)():
+             messagebox.showwarning("Telegram Admin Manager", "Сначала дождись окончания текущей операции.", parent=self.app)
+             return
+         tasks = self.tasks()
+@@ -2825,15 +3198,16 @@
+         return signature
+ 
+     def _effective_global_parallel(self, tasks: list[dict[str, Any]]) -> int:
+-        accounts_by_session = {a.session: a for a in self.app.store.accounts()}
+-        if self.global_parallel_auto_var.get():
++        snapshot = getattr(self.app.store, "snapshot", None)
++        config = snapshot() if callable(snapshot) else dict(self.app.store.data)
++        if config.get("batch_global_parallel_auto", True):
+             # Auto means "all currently eligible accounts", including accounts
+             # hot-added after the batch starts. One worker per session still
+             # prevents a single account from occupying multiple upload slots.
+             value = 100
+         else:
+             try:
+-                value = max(1, min(100, int(self.global_parallel_var.get())))
++                value = max(1, min(100, int(config.get("batch_global_parallel", 4))))
+             except Exception:
+                 value = 1
+         policy = self.app.safety_policy()
+@@ -2845,7 +3219,7 @@
+         if TelegramClient is None:
+             self.app._show_missing_dependency()
+             return
+-        if self.running or self.app._busy:
++        if (self.running or self.app._busy) and not getattr(self.app, "_concurrent_enabled", lambda: False)():
+             messagebox.showwarning("Telegram Admin Manager", "Сначала дождись окончания текущей операции.", parent=self.app)
+             return
+         tid = tid or self.selected_task_id()
+@@ -2868,7 +3242,7 @@
+         self.refresh_monitor_tab()
+ 
+         def work() -> None:
+-            asyncio.run(self._sync_topics_standalone(task))
++            self._run_async(self._sync_topics_standalone(task))
+ 
+         self.app.run_worker(work, "Синхронизирую темы форума…")
+ 
+@@ -2954,6 +3328,8 @@
+         self.monitor_prepared_targets.clear()
+         self.monitor_runtime.clear()
+         self.monitor_active = True
++        begin = getattr(self.app, "begin_operation", None)
++        self._monitor_operation = begin("Мониторинг папок", kind="monitoring", cancel=self.stop_monitoring) if callable(begin) else None
+         self.monitor_btn.configure(text="⏹ Остановить мониторинг")
+         self.refresh_monitor_tab()
+         self.app.log(
+@@ -2999,8 +3375,12 @@
+                 if bool(t.get("monitor_folder", False))
+             ]
+             if not current:
+-                self.app.log("Мониторинг: больше нет включённых правил; останавливаюсь.")
+-                return
++                for tid in list(self._folder_indexes):
++                    await asyncio.to_thread(self._folder_indexes.pop(tid).close)
++                    seen_states.pop(tid, None)
++                # Remain subscribed so re-enabling/adding a rule needs no restart.
++                await asyncio.sleep(0.25)
++                continue
+             current_ids = {str(t.get('id', '')) for t in current}
+             for tid in set(self._folder_indexes) - current_ids:
+                 await asyncio.to_thread(self._folder_indexes.pop(tid).close)
+@@ -3022,6 +3402,12 @@
+                 runtime.update({"last_check": wall_now, "next_check": wall_now + interval, "state": "Сканирование…"})
+                 self._ui_latest(('monitor',), self.refresh_monitor_tab)
+                 signature, current_files = await asyncio.to_thread(self._scan_monitor_snapshot, task)
++                getter = getattr(self.app.monitor_rules, "get", None)
++                latest = getter(tid) if callable(getter) else task
++                if not latest or not latest.get("monitor_folder", True) or not route_matches(task, latest):
++                    next_due.pop(tid, None)
++                    seen_states.pop(tid, None)
++                    continue
+                 index = self._folder_indexes.get(tid)
+                 detected_at = time.time()
+ 
+@@ -3035,20 +3421,29 @@
+                         if index is not None and hasattr(index, 'membership_changes'):
+                             seen = seen_states.setdefault(tid, MonitorSeenState())
+                             updated_rule, new_count, initialized = await asyncio.to_thread(
+-                                seen.sync, index, self.app.monitor_rules, task, detected_at)
++                                seen.sync, index, RevisionedSeenStore(self.app.monitor_rules, task) if hasattr(self.app.monitor_rules, "commit_scan") else self.app.monitor_rules, task, detected_at)
+                         else:
+                             previous_files = self.app.monitor_rules.seen_files(tid)
+                             updated_rule, new_count, initialized = self._update_monitor_seen_state(
+                                 task, previous_files=previous_files, current_files=current_files, now=detected_at)
+                             if initialized or current_files != previous_files:
+-                                self.app.monitor_rules.replace_seen_files(tid, current_files)
++                                if hasattr(self.app.monitor_rules, "commit_scan"):
++                                    if not self.app.monitor_rules.commit_scan(tid, task.get("route_revision", 1), {}, current_files):
++                                        continue
++                                else:
++                                    self.app.monitor_rules.replace_seen_files(tid, current_files)
+                         if updated_rule != task:
+                             fields = {key: updated_rule[key] for key in (
+                                 "monitor_seen_initialized", "monitor_last_new_count", "monitor_last_detection"
+                             ) if key in updated_rule and updated_rule.get(key) != task.get(key)}
+                             # A scan may overlap an account/caption edit in the UI.
+                             # Commit detection fields only, then use the latest rule.
+-                            task = self.app.monitor_rules.update_fields(tid, fields)
++                            if hasattr(self.app.monitor_rules, "commit_scan"):
++                                task = self.app.monitor_rules.commit_scan(tid, task.get("route_revision", 1), fields)
++                            else:
++                                task = self.app.monitor_rules.update_fields(tid, fields)
++                            if not task:
++                                continue
+                     except Exception as exc:
+                         self.app.log(f"Мониторинг: не удалось сохранить снимок файлов {task.get('name', tid)} — {exc}")
+                     # This column describes this scan, not the last historical
+@@ -3117,6 +3512,11 @@
+             index.ack_work(int(delta.get('cutoff', -1)))
+ 
+     def _finish_monitoring(self) -> None:
++        end = getattr(self.app, "end_operation", None)
++        operation = getattr(self, "_monitor_operation", None)
++        if callable(end) and operation is not None:
++            end(operation)
++            self._monitor_operation = None
+         self.monitor_active = False
+         self.monitor_btn.configure(text="👁 Включить мониторинг", state="normal")
+         for runtime in self.monitor_runtime.values():
+@@ -3126,14 +3526,18 @@
+         self.app.log("Мониторинг папок остановлен. Очередь загрузок сохранена в текущем сеансе.")
+ 
+     def _persist_monitor_signature(
+-        self, tid: str, signature: str, *, processed_before: float | None = None
++        self, tid: str, signature: str, *, processed_before: float | None = None, route_revision: int | None = None
+     ) -> None:
+         rule = self.app.monitor_rules.get(tid)
+         if not rule:
+             return
+-        self.app.monitor_rules.update_fields(tid, {
+-            "monitor_signature": str(signature), "monitor_last_success": time.time(),
+-        })
++        fields = {"monitor_signature": str(signature), "monitor_last_success": time.time()}
++        commit = getattr(self.app.monitor_rules, "commit_scan", None)
++        if callable(commit):
++            if not commit(tid, rule.get("route_revision", 1) if route_revision is None else route_revision, fields):
++                return
++        else:
++            self.app.monitor_rules.update_fields(tid, fields)
+         runtime = self.monitor_runtime.get(tid, {})
+         cutoff = time.time() if processed_before is None else processed_before
+         # A completed older snapshot must not erase arrivals found during upload.
+@@ -3201,6 +3605,8 @@
+ 
+     def _queued_task_ids(self) -> set[str]:
+         ids: set[str] = set()
++        for run in list(getattr(self, "_active_runs", {}).copy().values()):
++            ids.update(run.task_ids)
+         with self._queue_lock:
+             for item in self.pending_batches:
+                 ids.update(str(x) for x in item.get("task_ids", []) if x)
+@@ -3217,6 +3623,9 @@
+         monitor_signatures: dict[str, str] | None = None,
+         dedupe: bool = True,
+     ) -> None:
++        if str(source).casefold().startswith("мониторинг"):
++            tasks = [task for task in tasks if (current := self.app.monitor_rules.get(str(task.get("id", ""))))
++                     and current.get("monitor_folder") and route_matches(task, current)]
+         if not tasks:
+             return
+         ids = [str(t.get("id", "")) for t in tasks if str(t.get("id", ""))]
+@@ -3273,11 +3682,10 @@
+         else:
+             text = "Очередь пуста"
+         self.queue_status_var.set(text)
+-        self.resume_queue_btn.configure(
+-            state="normal" if (pending and not self.queue_worker_active) else "disabled"
+-        )
++        resumable = pending and (not self.queue_worker_active or bool(getattr(self, "_lane_halted", set())) or self.queue_halt_requested)
++        self.resume_queue_btn.configure(state="normal" if resumable else "disabled")
+         if hasattr(self, 'queue_view'):
+-            self.queue_view.resume_button.configure(state='normal' if pending and not self.queue_worker_active else 'disabled')
++            self.queue_view.resume_button.configure(state='normal' if resumable else 'disabled')
+             for button in (self.queue_view.pause_button, self.queue_view.stop_button):
+                 button.configure(state='normal' if current else 'disabled')
+         if self.unified_monitor and hasattr(self, "monitor_tree"):
+@@ -3286,6 +3694,9 @@
+     def remove_selected_queue_item(self) -> None:
+         sel = self.queue_tree.selection()
+         if not sel:
++            return
++        if len(sel) > 1:
++            messagebox.showinfo("Telegram Admin Manager", "Выбери один пакет, чтобы удалить его из очереди.", parent=self.app)
+             return
+         qid = sel[0]
+         if qid == self.current_batch_id or qid in getattr(self, "current_batch_ids", set()):
+@@ -3357,11 +3768,272 @@
+         return True
+ 
+     def resume_queue(self) -> None:
++        self.__dict__.setdefault("_lane_halted", set()).clear()
+         self.queue_halt_requested = False
+         self.stop_event.clear()
+         self._ensure_queue_worker()
+ 
++    def enqueue_quick_upload(self, settings, on_finished=None):
++        task = copy.deepcopy(settings)
++        task.update(id=uuid.uuid4().hex[:12], name=str(task.get("name") or "Быстрая загрузка"),
++                    enabled=True, monitor_folder=False, _ephemeral=True)
++        if "files" in task:
++            paths = [Path(path) for path in task.pop("files")]
++            if any(not path.is_absolute() for path in paths):
++                raise ValueError("Файлы быстрой загрузки должны иметь абсолютные пути.")
++            task["_explicit_files"] = [str(path) for path in paths]
++        self.__dict__.setdefault("_quick_callbacks", {})[task["id"]] = on_finished
++        try:
++            self._enqueue_batch([task], source="Быстрая загрузка", notify=False, dedupe=False)
++        except Exception:
++            callback = self._quick_callbacks.pop(task["id"], None)
++            if callable(callback):
++                callback()
++            raise
++        return task["id"]
++
++    def _managed_batch_enabled(self):
++        return bool(getattr(self.app, "__dict__", {}).get("_runtime_enabled", False)) and not getattr(self, "_is_run_controller", False)
++
++    def _sync_run_states(self):
++        runs = list(getattr(self, "_active_runs", {}).copy().values())
++        states = self.__dict__.setdefault("_completed_task_states", {}).copy()
++        live, pauses, health = {}, {}, {}
++        history = self.__dict__.setdefault("run_task_states", {})
++        for run in runs:
++            controller = run.controller
++            for tid, state in controller.task_states.copy().items():
++                snapshot = dict(state)
++                snapshot["active"] = {key: dict(transfer) for key, transfer in state.get("active", {}).copy().items()}
++                history[(run.id, str(tid))] = snapshot
++                states[str(tid)] = snapshot
++            with controller._live_task_lock:
++                live.update(controller.live_tasks)
++            pauses.update(controller.task_pause_events.copy())
++            health.update(controller.account_health.copy())
++            if run.operation is not None:
++                values = list(controller.task_states.copy().values())
++                done = sum(int(state.get("processed_files", 0)) for state in values)
++                total = sum(int(state.get("total_files", 0)) for state in values)
++                lane_name = "Ручная загрузка" if run.lane == "manual" else "Мониторинг"
++                run.operation.update(progress=(100.0 * done / total) if total else 0.0, detail=f"{lane_name}: файлов {done}/{total}")
++        self.task_states = states
++        with self._live_task_lock:
++            self.live_tasks = live
++        self.task_pause_events = pauses
++        self.account_health = health
++        self._running_account_total = len(health)
++        self.current_batch_ids = set().union(*(r.queue_ids for r in runs)) if runs else set()
++        self.current_batch_id = next(iter(self.current_batch_ids), None)
++        self.current_batch_source = ", ".join(dict.fromkeys(r.lane for r in runs))
++        self._current_batch_snapshot = [item for run in runs for item in run.items]
++
++    def _new_run_controller(self, items):
++        controller = object.__new__(type(self))
++        controller.__dict__.update(self.__dict__)
++        controller._is_run_controller = True
++        controller.pending_batches = list(items)
++        controller._queue_lock = threading.RLock()
++        controller._live_task_lock = threading.RLock()
++        controller.stop_event = threading.Event()
++        controller.pause_all_event = threading.Event()
++        controller.pause_all_event.set()
++        controller.task_pause_events = {}
++        controller.live_tasks = {}
++        controller.task_states = {}
++        controller.account_health = {}
++        controller._diagnostic_keys = set()
++        controller._last_dashboard_emit = 0.0
++        controller._last_run_error = None
++        controller._initial_task_paused = set()
++        controller._cancelled_ephemeral_ids = set()
++        controller.queue_halt_requested = False
++        controller.current_batch_ids = set()
++        controller.current_batch_id = None
++        controller._current_batch_snapshot = []
++        controller._refresh_queue_status = self._refresh_queue_status
++        controller.refresh_monitor_tab = self.refresh_monitor_tab
++        return controller
++
++    def _dispatch_managed_lanes(self):
++        runs = self.__dict__.setdefault("_active_runs", {})
++        self.__dict__.setdefault("_publication_state", {})
++        self.__dict__.setdefault("_lane_halted", set())
++        if self.queue_halt_requested:
++            return
++        occupied_lanes = {run.lane for run in runs.values()}
++        occupied_tasks = set().union(*(run.task_ids for run in runs.values())) if runs else set()
++        for lane in ("manual", "monitor"):
++            if lane in occupied_lanes or lane in self._lane_halted:
++                continue
++            with self._queue_lock:
++                candidates = [item for item in self.pending_batches if ("monitor" if _is_monitor_queue_item(item) else "manual") == lane]
++                if not candidates:
++                    continue
++                first = candidates[0]
++                if set(map(str, first.get("task_ids", []))).issubset(set(first.get("paused_task_ids", []))):
++                    continue
++                if occupied_tasks.intersection(map(str, first.get("task_ids", []))):
++                    self.app.log(f"Очередь {lane}: ожидает завершения этого же задания в другой линии.")
++                    continue
++                candidates = [item for item in candidates if not occupied_tasks.intersection(map(str, item.get("task_ids", [])))]
++                first = candidates.pop(0)
++                items = _take_monitor_pipeline_wave(first, candidates) if lane == "monitor" else [first]
++                item_ids = {str(item["id"]) for item in items}
++                self.pending_batches[:] = [item for item in self.pending_batches if str(item["id"]) not in item_ids]
++            controller = self._new_run_controller(items)
++            run = BatchRun(lane, items, controller)
++            runs[run.id] = run
++            # Share only publication timing; each run owns its mutable execution state.
++            controller._publication_state = self._publication_state
++            def dashboard(force=False, current=run):
++                self._sync_run_states()
++                self._emit_dashboard(force=force)
++            controller._emit_dashboard = dashboard
++            def paint_task(tid, current=run, **fields):
++                if any(other.id != current.id and str(tid) in other.task_ids for other in list(getattr(self, "_active_runs", {}).copy().values())):
++                    return
++                self._set_task_row(tid, **fields)
++            controller._set_task_row = paint_task
++            original_activity = self._queue_activity_update
++            controller._queue_activity_update = lambda key, *args, current=run, **kw: original_activity(f"{current.id}:{key}", *args, **kw)
++            begin = getattr(self.app, "begin_operation", None)
++            if callable(begin):
++                run.operation = begin("Ручная загрузка" if lane == "manual" else "Мониторинг: загрузка", kind="batch", cancel=lambda rid=run.id: self.cancel_run(rid))
++                controller._run_operation = run.operation
++            def execute(current=run):
++                try:
++                    current.controller._queue_worker()
++                    failures = sum(int(state.get("failed", 0)) + int(state.get("blocked", 0)) for state in current.controller.task_states.copy().values())
++                    if not current.controller.stop_event.is_set():
++                        current.error = getattr(current.controller, "_last_run_error", None)
++                        if current.error is None and failures:
++                            current.error = RuntimeError(f"Файлов с ошибками или неподтверждённым результатом: {failures}")
++                except Exception as exc:
++                    current.error = exc
++                    self.app.log(f"Очередь {current.lane}: {self.app._friendly_error(exc)}")
++                finally:
++                    self.app.ui_call(lambda rid=current.id: self._finish_managed_run(rid))
++            run.thread = threading.Thread(target=execute, daemon=True, name="batch-" + lane)
++            occupied_tasks.update(run.task_ids)
++            run.thread.start()
++        self.running = self.queue_worker_active = bool(runs)
++        self._sync_run_states()
++        self._set_controls_running(self.running)
++        self._refresh_queue_status()
++
++    def _finish_managed_run(self, run_id):
++        run = self.__dict__.setdefault("_active_runs", {}).get(run_id)
++        if run is None:
++            return
++        self._sync_run_states()
++        for tid, state in run.controller.task_states.copy().items():
++            finished = dict(state, active={})
++            self.__dict__.setdefault("run_task_states", {})[(run.id, str(tid))] = finished
++            self.__dict__.setdefault("_completed_task_states", {})[str(tid)] = finished
++        with self._queue_lock:
++            existing = {str(item["id"]) for item in self.pending_batches}
++            cancelled = getattr(run.controller, "_cancelled_ephemeral_ids", set())
++            restore = []
++            for item in run.controller.pending_batches:
++                if cancelled.intersection(map(str, item.get("task_ids", []))):
++                    self.app.store.db.queue_mark(str(item["id"]), "cancelled", item)
++                    self._set_queue_row(str(item["id"]), "Отменено")
++                elif str(item["id"]) not in existing:
++                    restore.append(item)
++            self.pending_batches[0:0] = restore
++        self._active_runs.pop(run_id, None)
++        end = getattr(self.app, "end_operation", None)
++        if callable(end) and run.operation is not None:
++            end(run.operation, error=run.error)
++        for tid in run.task_ids:
++            callback = self.__dict__.setdefault("_quick_callbacks", {}).pop(tid, None)
++            if callable(callback):
++                try:
++                    callback()
++                except Exception as exc:
++                    self.app.log(f"Обновление завершённой загрузки: {exc}")
++        self.running = self.queue_worker_active = bool(self._active_runs)
++        self._sync_run_states()
++        self._set_controls_running(self.running)
++        self._refresh_queue_status()
++        self._dispatch_managed_lanes()
++
++    def cancel_run(self, run_id):
++        run = getattr(self, "_active_runs", {}).get(str(run_id))
++        if run is not None:
++            self.__dict__.setdefault("_lane_halted", set()).add(run.lane)
++            run.cancel()
++            self.app.log(f"Остановка линии {run.lane}; другие линии продолжают работу.")
++
++    def set_task_paused(self, task_id, paused):
++        task_id = str(task_id)
++        for run in list(getattr(self, "_active_runs", {}).values()):
++            if task_id not in run.task_ids:
++                continue
++            event = run.controller.task_pause_events.get(task_id)
++            initial = run.controller.__dict__.setdefault("_initial_task_paused", set())
++            initial.add(task_id) if paused else initial.discard(task_id)
++            if event is not None:
++                event.clear() if paused else event.set()
++            self._queue_task_row(task_id, status="Пауза после текущего" if paused else "Продолжение…")
++            return True
++        changed = False
++        with self._queue_lock:
++            for item in self.pending_batches:
++                if task_id in map(str, item.get("task_ids", [])):
++                    paused_ids = set(item.get("paused_task_ids", []))
++                    paused_ids.add(task_id) if paused else paused_ids.discard(task_id)
++                    item["paused_task_ids"] = sorted(paused_ids)
++                    self.app.store.db.queue_mark(str(item["id"]), "waiting", item)
++                    changed = True
++        if changed and not paused:
++            self._ensure_queue_worker()
++        return changed
++
++    def cancel_task(self, task_id):
++        task_id = str(task_id)
++        for run in list(getattr(self, "_active_runs", {}).values()):
++            if task_id in run.task_ids:
++                ephemeral = any(str(task.get("id", "")) == task_id and task.get("_ephemeral") for item in run.items for task in item.get("task_snapshots", []))
++                if ephemeral:
++                    run.controller.__dict__.setdefault("_cancelled_ephemeral_ids", set()).add(task_id)
++                    run.cancel()
++                else:
++                    self.cancel_run(run.id)
++                return True
++        removed = False
++        with self._queue_lock:
++            for item in list(self.pending_batches):
++                if task_id not in map(str, item.get("task_ids", [])):
++                    continue
++                item["task_ids"] = [tid for tid in item["task_ids"] if str(tid) != task_id]
++                item["task_snapshots"] = [t for t in item.get("task_snapshots", []) if str(t.get("id", "")) != task_id]
++                if item["task_ids"]:
++                    self.app.store.db.queue_mark(str(item["id"]), "waiting", item)
++                else:
++                    self.pending_batches.remove(item)
++                    self.app.store.db.queue_mark(str(item["id"]), "cancelled", item)
++                    self._set_queue_row(str(item["id"]), "Отменено")
++                removed = True
++        if removed:
++            callback = self.__dict__.setdefault("_quick_callbacks", {}).pop(task_id, None)
++            if callable(callback):
++                callback()
++            self._refresh_queue_status()
++        return removed
++
++    def stop_selected_runs(self):
++        tasks = set(self._selected_task_ids()) | set(self._selected_monitor_ids())
++        queue_ids = set(self.queue_tree.selection())
++        for run in list(getattr(self, "_active_runs", {}).values()):
++            if run.task_ids.intersection(tasks) or run.queue_ids.intersection(queue_ids):
++                self.cancel_run(run.id)
++
+     def _ensure_queue_worker(self) -> None:
++        if self._managed_batch_enabled():
++            self._dispatch_managed_lanes()
++            return
+         if self.queue_worker_active:
+             self._refresh_queue_status()
+             return
+@@ -3375,7 +4047,8 @@
+             # append work. Only the Resume button is allowed to restart it.
+             self._refresh_queue_status()
+             return
+-        if self.app._busy and not self.running:
++        concurrent = getattr(self.app, "_concurrent_enabled", lambda: False)()
++        if self.app._busy and not self.running and not concurrent:
+             # Another operation (QR/admin/quick upload) owns Telegram sessions.
+             # Keep the work queued and let the user resume when that operation ends.
+             self.app.log("Очередь: задания ожидают — сейчас выполняется другая операция приложения.")
+@@ -3385,6 +4058,8 @@
+         self.queue_halt_requested = False
+         self.stop_event.clear()
+         self.queue_worker_active = True
++        begin = getattr(self.app, "begin_operation", None)
++        self._batch_operation = begin("Очередь загрузок", kind="batch", cancel=self.stop) if callable(begin) else None
+         self.running = True
+         self.pause_all_event.set()
+         self._set_controls_running(True)
+@@ -3430,7 +4105,7 @@
+             monitor_map = {
+                 str(t.get("id", "")): self._monitor_task_for_queue(t)
+                 for t in self.monitor_rules()
+-                if str(t.get("id", ""))
++                if str(t.get("id", "")) and t.get("monitor_folder", True)
+             }
+             tasks: list[dict[str, Any]] = []
+             task_by_id: dict[str, dict[str, Any]] = {}
+@@ -3450,13 +4125,23 @@
+                 for raw_tid in queued_item.get("task_ids", []):
+                     tid = str(raw_tid)
+                     if from_monitor:
+-                        task = monitor_map.get(tid) or snapshot_map.get(tid) or current_map.get(tid)
++                        task = monitor_map.get(tid)
+                     else:
+                         task = current_map.get(tid) or monitor_map.get(tid) or snapshot_map.get(tid)
+                     if task is None:
+                         continue
++                    if not from_monitor and not task.get("enabled", True):
++                        self.app.log(f"Очередь: задание {task.get('name', tid)} выключено; запуск пропущен.")
++                        continue
++                    if (not from_monitor and not task.get("_ephemeral") and tid not in current_map
++                            and callable(getattr(self.app.store, "patch_upload_task", None))):
++                        self.app.log(f"Очередь: задание {task.get('name', tid)} удалено; запуск пропущен.")
++                        continue
+                     if from_monitor:
+-                        task = task_for_dispatch(task, snapshot_map.get(tid, {}))
++                        queued = snapshot_map.get(tid, {})
++                        if queued and not route_matches(task, queued):
++                            continue
++                        task = task_for_dispatch(task, queued)
+                     resolved_ids.append(tid)
+                     task_by_id[tid] = dict(task)
+                     if tid not in seen_task_ids:
+@@ -3470,7 +4155,7 @@
+                         self.app.store.db.queue_mark(qid, "orphaned", queued_item)
+                     except Exception:
+                         pass
+-                    self.app.ui_call(lambda q=qid: self._set_queue_row(q, "Пропущено: нет снимка задания"))
++                    self.app.ui_call(lambda q=qid: self._set_queue_row(q, "Пропущено: задание удалено или выключено"))
+                     self.current_batch_ids.discard(qid)
+ 
+             if not tasks:
+@@ -3488,7 +4173,8 @@
+             for task in tasks:
+                 tid = str(task.get("id", ""))
+                 ev = threading.Event()
+-                ev.set()
++                if tid not in getattr(self, "_initial_task_paused", set()) and not any(tid in item.get("paused_task_ids", []) for item in active_items):
++                    ev.set()
+                 self.task_pause_events[tid] = ev
+                 self._queue_task_row(tid, status='Запуск…', progress='0%', speed='—', eta='—')
+ 
+@@ -3506,7 +4192,7 @@
+                                  for t in tasks}
+             batch_started_at = time.time()
+             try:
+-                result = asyncio.run(
++                result = self._run_async(
+                     self._run_batch(
+                         tasks, global_parallel,
+                         notify=any(bool(x.get("notify", False)) for x in active_items),
+@@ -3515,6 +4201,7 @@
+                 )
+                 hard_error_ids = result or set()
+             except Exception as exc:
++                self._last_run_error = exc
+                 hard_error_ids = {str(t.get("id", "")) for t in tasks}
+                 self.app.log(f"Очередь: пакет завершился ошибкой — {self.app._friendly_error(exc)}")
+ 
+@@ -3550,11 +4237,13 @@
+                             self.monitor_blocked_signatures[tid] = (sigs[tid], recovery_versions.get(tid, 0))
+                         success = (tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0
+                                    and not blocked_count and not was_stopped)
++                        current_rule = self.app.monitor_rules.get(tid)
++                        success = success and bool(current_rule and current_rule.get("monitor_folder", True) and route_matches(task, current_rule))
+                         if success and tid in sigs:
+                             getattr(self, 'monitor_blocked_signatures', {}).pop(tid, None)
+                             self._ack_monitor_work(task)
+                             self.monitor_last_signatures[tid] = sigs[tid]
+-                            self._persist_monitor_signature(tid, sigs[tid], processed_before=batch_started_at)
++                            self._persist_monitor_signature(tid, sigs[tid], processed_before=batch_started_at, route_revision=task.get("route_revision", 1))
+                             target = str(task.get("target", "")).strip()
+                             if target:
+                                 self.monitor_prepared_targets.add(target)
+@@ -3603,8 +4292,19 @@
+             return
+         tasks = self.tasks()
+         if selected_only:
+-            tid = self.selected_task_id()
+-            tasks = [t for t in tasks if str(t.get("id", "")) == tid]
++            ids = set(self._selected_task_ids())
++            selected = [t for t in tasks if str(t.get("id", "")) in ids]
++            tasks = [t for t in selected if t.get("enabled", True)]
++            disabled_names = ", ".join(str(t.get("name", "Задание")) for t in selected if not t.get("enabled", True))
++            if disabled_names and not tasks:
++                messagebox.showinfo(
++                    "Telegram Admin Manager",
++                    f"Выбранные задания выключены: {disabled_names}.\n\nВключите их, чтобы добавить в очередь.",
++                    parent=self.app,
++                )
++                return
++            if disabled_names:
++                self.app.log(f"Очередь: пропущены выключенные задания — {disabled_names}.")
+         else:
+             tasks = [t for t in tasks if t.get("enabled", True)]
+         if not tasks:
+@@ -3621,6 +4321,14 @@
+         self._ensure_queue_worker()
+ 
+     def toggle_pause_all(self) -> None:
++        if self._managed_batch_enabled():
++            runs = list(getattr(self, "_active_runs", {}).values())
++            pause = any(run.controller.pause_all_event.is_set() for run in runs)
++            for run in runs:
++                run.controller.pause_all_event.clear() if pause else run.controller.pause_all_event.set()
++            self.pause_all_event.clear() if pause else self.pause_all_event.set()
++            self._update_pause_labels()
++            return
+         if not self.running:
+             return
+         if self.pause_all_event.is_set():
+@@ -3644,18 +4352,18 @@
+                 button.configure(text=text)
+ 
+     def toggle_pause_selected(self) -> None:
+-        tid = self.selected_task_id()
+-        if not self.running or not tid or tid not in self.task_pause_events:
+-            return
+-        ev = self.task_pause_events[tid]
+-        if ev.is_set():
+-            ev.clear()
+-            self._queue_task_row(tid, status="Пауза после текущего")
+-        else:
+-            ev.set()
+-            self._queue_task_row(tid, status="Продолжаю…")
++        ids = set(self._selected_task_ids()) | set(self._selected_monitor_ids())
++        events = [self.task_pause_events[tid] for tid in ids if tid in self.task_pause_events]
++        if self.running and events:
++            self.set_selected_tasks_paused(any(ev.is_set() for ev in events))
+ 
+     def stop(self) -> None:
++        if self._managed_batch_enabled():
++            self.queue_halt_requested = True
++            for run in list(getattr(self, "_active_runs", {}).values()):
++                run.cancel()
++            self.app.log("Остановлены все линии загрузки; мониторинг папок продолжает работу.")
++            return
+         if not self.running:
+             return
+         # Stop only the active upload batch. Background folder monitoring stays
+@@ -3687,6 +4395,11 @@
+             self.monitor_btn.configure(state="normal")
+ 
+     def _finish_queue_worker(self) -> None:
++        end = getattr(self.app, "end_operation", None)
++        operation = getattr(self, "_batch_operation", None)
++        if callable(end) and operation is not None:
++            end(operation)
++            self._batch_operation = None
+         was_stopped = bool(self.stop_event.is_set())
+         self.queue_worker_active = False
+         self.running = False
+@@ -3774,6 +4487,10 @@
+                 if is_premium and not large_ok:
+                     premium_text += " (2–4 ГБ отключены)"
+                 self.app.log(f"Пакет: hot-add {account.display} подключён — {premium_text}")
++            except asyncio.CancelledError:
++                if clients.get(session, (None, None))[1] is not client:
++                    await _disconnect_settled(client)
++                raise
+             except Exception as exc:
+                 self._record_connection_failure(session, exc)
+                 self.app.log(f"Пакет: hot-add {account.display} не подключён — {self.app._friendly_error(exc)}")
+@@ -3803,6 +4520,7 @@
+             for session in self._effective_task_sessions(task, accounts_by_session):
+                 if session not in needed_sessions:
+                     needed_sessions.append(session)
++        needed_sessions.sort(key=lambda session: str(getattr(self, "sessions_dir", Path(".")) / session).casefold())
+         if not needed_sessions:
+             raise RuntimeError("В заданиях нет доступных авторизованных аккаунтов.")
+ 
+@@ -3810,6 +4528,8 @@
+         diagnostic_watch = asyncio.create_task(self._watch_upload_loop(clients))
+         premium_by_session: dict[str, bool] = {}
+         preparation = None
++        reconciler_task = None
++        rule_tasks = []
+         policy = self.app.safety_policy()
+         self.account_health = {s: h for s, h in self.account_health.items() if self.session_auth_required(s)} | {
+             session: {"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": "", "disabled": False}
+@@ -3844,6 +4564,9 @@
+                     if is_premium and not large_ok:
+                         premium_text += " (2–4 ГБ отключены)"
+                     self.app.log(f"Пакет: {account.display} подключён — {premium_text}")
++                except asyncio.CancelledError:
++                    await _disconnect_settled(client)
++                    raise
+                 except Exception as exc:
+                     friendly = self.app._friendly_error(exc)
+                     h = self.account_health.setdefault(session, {})
+@@ -3873,7 +4596,7 @@
+             self.app.ui_call(lambda: self.active_accounts_var.set(f"0 / {self._running_account_total}"))
+             account_locks = {s: asyncio.Lock() for s in clients}
+             hot_admin_locks: dict[str, asyncio.Lock] = {}
+-            global_sem = asyncio.Semaphore(global_parallel)
++            global_sem = LiveSemaphore(lambda: self._effective_global_parallel(tasks))
+             scan_sem = asyncio.Semaphore(2)
+             preparation = PreparationPool(self.stop_event)
+             preview_sem = preparation.slots
+@@ -3882,7 +4605,7 @@
+             async def reconcile_live_accounts() -> None:
+                 while not self.stop_event.is_set():
+                     added = await self._connect_hot_batch_accounts_once(
+-                        tasks, clients, premium_by_session, account_locks, api_id, api_hash
++                        [dict(latest) for task in tasks if (latest := self._latest_task_settings(task)) is not None], clients, premium_by_session, account_locks, api_id, api_hash
+                     )
+                     if added:
+                         live_pool_changed.set()
+@@ -3914,8 +4637,8 @@
+                     if drained_event is not None:
+                         drained_event.set()
+ 
+-            task_coros = [run_task(pos, task) for pos, task in enumerate(tasks)]
+-            results = await asyncio.gather(*task_coros, return_exceptions=True)
++            rule_tasks = [asyncio.create_task(run_task(pos, task)) for pos, task in enumerate(tasks)]
++            results = await asyncio.gather(*rule_tasks, return_exceptions=True)
+             reconciler_task.cancel()
+             try:
+                 await reconciler_task
+@@ -3924,7 +4647,7 @@
+             hard_errors = 0
+             hard_error_ids: set[str] = set()
+             for task, result in zip(tasks, results):
+-                if isinstance(result, Exception):
++                if isinstance(result, BaseException):
+                     hard_errors += 1
+                     tid = str(task.get("id", ""))
+                     hard_error_ids.add(tid)
+@@ -3957,6 +4680,14 @@
+                     ))
+             return hard_error_ids
+         finally:
++            children = list(rule_tasks)
++            if reconciler_task is not None:
++                children.append(reconciler_task)
++            for child in children:
++                if not child.done():
++                    child.cancel()
++            if children:
++                await asyncio.gather(*children, return_exceptions=True)
+             diagnostic_watch.cancel()
+             await asyncio.gather(diagnostic_watch, return_exceptions=True)
+             for diagnostic_key in list(getattr(self, '_diagnostic_keys', set())):
+@@ -4494,7 +5225,7 @@
+                 cached = self.app.group_state_cache.fresh_admin_sessions(target, self._cache_ttl_hours())
+             except Exception:
+                 cached = set()
+-            if session in cached or await self._is_admin_for_target(member_client, member_entity):
++            if session in cached or (not getattr(self.app, "__dict__", {}).get("_runtime_enabled", False) and await self._is_admin_for_target(member_client, member_entity)):
+                 return True
+ 
+             cached_controller = None
+@@ -4520,7 +5251,7 @@
+                 if controller_session in getattr(self.app, "_admin_safety_disabled_sessions", set()):
+                     continue
+                 try:
+-                    async with account_locks[controller_session]:
++                    async with account_locks[controller_session], self._file_client_lease(controller_session, clients, controller_client) as controller_client:
+                         controller_entity = await self.app._resolve_or_join_target(controller_client, target, False)
+                         try:
+                             controller_entity = await controller_client.get_entity(controller_entity)
+@@ -4609,14 +5340,18 @@
+         task["scan_bytes"] = total_bytes
+         task["scan_time"] = time.time()
+ 
+-        persisted = self.tasks()
+-        for i, x in enumerate(persisted):
+-            if str(x.get("id", "")) == tid:
+-                x.update({"scan_files": total_files, "scan_bytes": total_bytes, "scan_time": task["scan_time"]})
+-                persisted[i] = x
+-                break
+-        self.app.store.data["upload_tasks"] = persisted
+-        self.app.store.save()
++        scan_fields = {"scan_files": total_files, "scan_bytes": total_bytes, "scan_time": task["scan_time"]}
++        patch = getattr(self.app.store, "patch_upload_task", None)
++        if callable(patch):
++            patch(tid, scan_fields)
++        else:
++            persisted = self.tasks()
++            for x in persisted:
++                if str(x.get("id", "")) == tid:
++                    x.update(scan_fields)
++                    break
++            self.app.store.data["upload_tasks"] = persisted
++            self.app.store.save()
+         self._queue_task_row(tid, files=total_files, size=_fmt_bytes(total_bytes), status='Подключение…')
+         if not files and not bool(task.get("forum_topics_from_subfolders", False)):
+             self._queue_task_row(tid, status='Нет медиа', progress='100%')
+@@ -4645,21 +5380,22 @@
+                 self.app.log(f"{name}: {account.display} ⚠ пропуск — аккаунт помечен «Ограничен Telegram»; массовая отправка не выполняется")
+                 continue
+             try:
+-                should_join = bool(task.get("join_if_needed", False)) and not bool(task.get("auto_admin", True))
+-                entity = await self.app._resolve_or_join_target(client, str(task.get("target", "")), should_join)
+-                if bool(task.get("auto_admin", True)):
+-                    if session in cached_admins:
+-                        pass  # fresh local cache: avoid another permissions request every monitored cycle
+-                    elif not await self._is_admin_for_target(client, entity):
+-                        self.app.group_state_cache.invalidate_admin(task_target, session)
+-                        self.app.log(f"{name}: {account.display} не получил админку — исключаю из загрузки")
+-                        continue
+-                    else:
+-                        self.app.group_state_cache.mark_admins(task_target, {session}, title=str(getattr(entity, "title", "") or ""))
+-                key = self.app._target_key(entity)
+-                if target_key is None:
+-                    target_key = key
+-                resolved[session] = entity
++                async with self._borrow_client(session, client) as client:
++                    should_join = bool(task.get("join_if_needed", False)) and not bool(task.get("auto_admin", True))
++                    entity = await self.app._resolve_or_join_target(client, str(task.get("target", "")), should_join)
++                    if bool(task.get("auto_admin", True)):
++                        if session in cached_admins:
++                            pass  # fresh local cache: avoid another permissions request every monitored cycle
++                        elif not await self._is_admin_for_target(client, entity):
++                            self.app.group_state_cache.invalidate_admin(task_target, session)
++                            self.app.log(f"{name}: {account.display} не получил админку — исключаю из загрузки")
++                            continue
++                        else:
++                            self.app.group_state_cache.mark_admins(task_target, {session}, title=str(getattr(entity, "title", "") or ""))
++                    key = self.app._target_key(entity)
++                    if target_key is None:
++                        target_key = key
++                    resolved[session] = entity
+             except Exception as exc:
+                 self.app.log(f"{name}: {account.display} не открыл цель — {self.app._friendly_error(exc)}")
+         activation_failed = set(sessions) - set(resolved)
+@@ -4671,7 +5407,7 @@
+         topic_map: dict[str, int] = {}
+         if forum_mode:
+             self._queue_task_row(tid, status='Синхронизация тем…', speed='—', eta='—')
+-            topic_map = await self._prepare_forum_topics(task, clients, resolved)
++            topic_map = await self._prepare_live_forum_topics(task, clients, resolved)
+             self.app.log(
+                 f"{name}: режим тем включён — подпапка 1-го уровня = тема; найдено/создано тем {len(topic_map)}."
+             )
+@@ -4832,7 +5568,7 @@
+         parallel_auto = bool(task.get("parallel_auto", True))
+         task_parallel = 100 if parallel_auto else max(1, min(100, int(task.get("parallel", 2) or 2)))
+         effective_parallel = task_parallel if parallel_auto else min(task_parallel, len(sessions))
+-        task_sem = asyncio.Semaphore(effective_parallel)
++        task_sem = LiveSemaphore(lambda: self._task_parallel_limit(task))
+         policy = self.app.safety_policy()
+         self.app.log(
+             f"{name}: параллельность задания — {'Авто' if parallel_auto else task_parallel}; "
+@@ -4860,7 +5596,8 @@
+         if premium_priority is not None:
+             def premium_eligible(session: str) -> bool:
+                 gate = self.task_pause_events.get(tid)
+-                requested = bool(task.get("use_all_accounts", True)) or session in (task.get("account_sessions", []) or [])
++                latest = self._latest_task_settings(task)
++                requested = bool(latest and (latest.get("use_all_accounts", True) or session in (latest.get("account_sessions", []) or [])))
+                 restricted = getattr(self.app, "account_is_restricted", None)
+                 return (
+                     requested and session not in activation_failed
+@@ -4879,29 +5616,30 @@
+             account, client = pair
+             if not self._runtime_task_account_allowed(task, session):
+                 return False
+-            if not bool(task.get("use_all_accounts", True)) and session not in (task.get("account_sessions", []) or []):
++            latest = self._latest_task_settings(task)
++            if latest is None or (not latest.get("use_all_accounts", True) and session not in (latest.get("account_sessions", []) or [])):
+                 return False
+             restriction_check = getattr(self.app, "account_is_restricted", None)
+             if callable(restriction_check) and restriction_check(session):
+                 return False
+             try:
+-                auto_admin = bool(task.get("auto_admin", True))
+-                should_join = auto_admin or bool(task.get("join_if_needed", False))
+-                entity = await self.app._resolve_or_join_target(client, task_target, should_join)
++                auto_admin = bool(latest.get("auto_admin", True))
++                should_join = auto_admin or bool(latest.get("join_if_needed", False))
++                needs_promotion = False
++                async with self._borrow_client(session, client) as client:
++                    entity = await self.app._resolve_or_join_target(client, task_target, should_join)
++                    if auto_admin:
++                        hot_cached_admins = self.app.group_state_cache.fresh_admin_sessions(task_target, self._cache_ttl_hours())
++                        needs_promotion = session not in hot_cached_admins and not await self._is_admin_for_target(client, entity)
++                # Do not retain a member-session lease while acquiring another
++                # account's controller lease: queued exclusive auth must be able to drain.
++                if needs_promotion:
++                    promoted = await self._hot_promote_session_for_task(task, session, entity, clients, account_locks, hot_admin_locks)
++                    if not promoted:
++                        self.app.group_state_cache.invalidate_admin(task_target, session)
++                        return False
+                 if auto_admin:
+-                    hot_cached_admins = self.app.group_state_cache.fresh_admin_sessions(
+-                        task_target, self._cache_ttl_hours()
+-                    )
+-                    if session not in hot_cached_admins and not await self._is_admin_for_target(client, entity):
+-                        promoted = await self._hot_promote_session_for_task(
+-                            task, session, entity, clients, account_locks, hot_admin_locks
+-                        )
+-                        if not promoted:
+-                            self.app.group_state_cache.invalidate_admin(task_target, session)
+-                            return False
+-                    self.app.group_state_cache.mark_admins(
+-                        task_target, {session}, title=str(getattr(entity, "title", "") or "")
+-                    )
++                    self.app.group_state_cache.mark_admins(task_target, {session}, title=str(getattr(entity, "title", "") or ""))
+                 resolved[session] = entity
+                 self.app.log(f"{name}: hot-add {account.display} подключён к текущему заданию")
+                 return True
+@@ -4970,7 +5708,45 @@
+             if premium_by_session.get(session, False):
+                 account_name += " ⭐"
+ 
++            claim_taken = reservation_held = publication_started = unconfirmed_recorded = False
++            size = 0
++
++            def settle_interrupted_file(interrupted_item: tuple[int, Path]) -> None:
++                """Account for a file leaving through an exception: never lose or republish it."""
++                interrupted_path = interrupted_item[1]
++                file_key = f"{tid}:{interrupted_path}"
++                state["active"].pop(file_key, None)
++                if claim_taken and not reservation_held:
++                    return  # Its own path already completed, requeued or reported it.
++                if claim_taken and publication_started:
++                    # The send may have reached Telegram: keep the reservation for review.
++                    if not unconfirmed_recorded:
++                        state["blocked"] += 1
++                        try:
++                            self._remember_unconfirmed(task, interrupted_path, True)
++                            self.app.log(f"{name}: {interrupted_path.name}: отправка прервана после начала публикации; "
++                                         "резерв сохранён для проверки.")
++                            self._queue_activity_update(file_key, name, interrupted_path, account_name, size, 0.0, 0.0,
++                                                        "⚠ Требуется проверка результата отправки")
++                            self._emit_task_metrics(tid, force=True)
++                        except Exception:
++                            pass
++                    return
++                if claim_taken:
++                    try:
++                        release_reservation()
++                    except Exception as exc:
++                        self.app.log(f"{name}: {interrupted_path.name}: резерв не снят — {exc}")
++                queue_for_path(interrupted_path).put_nowait(interrupted_item)
++                self._queue_activity_update(file_key, name, interrupted_path, account_name, size, 0.0, 0.0, "Остановлено")
++
+             while not self.stop_event.is_set():
++                settings = self._latest_task_settings(task)
++                if settings is None:
++                    return
++                requested = settings.get("use_all_accounts", True) or session in (settings.get("account_sessions", []) or [])
++                if not requested:
++                    return
+                 if health(session).get("disabled"):
+                     return
+                 if not self._runtime_task_account_allowed(task, session):
+@@ -4982,88 +5758,96 @@
+                 if item is None:
+                     return
+                 original_index, path = item
+-                if not await self._wait_gate(tid):
+-                    queue_for_path(path).put_nowait(item)
+-                    return
++                claim_taken = reservation_held = publication_started = unconfirmed_recorded = False
++                size = 0
++                file_body = _FileBody(lambda interrupted=item: settle_interrupted_file(interrupted))
+                 try:
+-                    size = path.stat().st_size
+-                except OSError:
+-                    state["processed_files"] += 1
+-                    state["failed"] += 1
+-                    self._emit_task_metrics(tid, force=True)
+-                    continue
+-
+-                upload_lane = _telegram_upload_lane(size)
+-                if upload_lane == "too_large":
+-                    state["processed_bytes"] += size
+-                    state["processed_files"] += 1
+-                    state["skipped"] += 1
+-                    state["limit_skipped"] += 1
+-                    self._emit_task_metrics(tid, force=True)
+-                    continue
+-                if upload_lane == "premium" and not premium_by_session.get(session, False):
+-                    big_queue.put_nowait(item)
+-                    return
+-
+-                prepared = None
+-                if size <= 0 and preparation is None:
+-                    defer_empty_file(path, account_name, size)
+-                    continue
+-                if preparation is not None:
+-                    consumed.add(path)
+-                    fill_preparation()
+-                    key = f'{tid}:{path}'
+-                    self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Подготовка / ожидание записи')
++                    if not await self._wait_gate(tid):
++                        queue_for_path(path).put_nowait(item)
++                        return
+                     try:
+-                        prepared = await preparation.take(preparation_key(path), preparation_factory(path))
+-                    except EmptyFilePending:
++                        size = path.stat().st_size
++                    except OSError:
++                        state["processed_files"] += 1
++                        state["failed"] += 1
++                        self._emit_task_metrics(tid, force=True)
++                        continue
++
++                    upload_lane = _telegram_upload_lane(size)
++                    if upload_lane == "too_large":
++                        state["processed_bytes"] += size
++                        state["processed_files"] += 1
++                        state["skipped"] += 1
++                        state["limit_skipped"] += 1
++                        self._emit_task_metrics(tid, force=True)
++                        continue
++                    if upload_lane == "premium" and not premium_by_session.get(session, False):
++                        big_queue.put_nowait(item)
++                        return
++
++                    prepared = None
++                    if size <= 0 and preparation is None:
+                         defer_empty_file(path, account_name, size)
+                         continue
+-                    except PreparationStopped:
+-                        queue_for_path(path).put_nowait(item)
+-                        return
+-                    except Exception as exc:
+-                        state['processed_bytes'] += size
+-                        state['processed_files'] += 1
+-                        state['failed'] += 1
+-                        self.app.record_upload_error(task=name, target=task_target, path=str(path),
+-                            account=account.display, attempts=1, error=f'Ошибка подготовки: {exc}')
+-                        self.app.log(f'{name}: {path.name}: ошибка подготовки — {exc}')
+-                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Ошибка подготовки')
+-                        self._emit_task_metrics(tid, force=True)
+-                        continue
+-                    finally:
+-                        offered.pop(path, None)
++                    if preparation is not None:
++                        consumed.add(path)
+                         fill_preparation()
+-                    size = int(prepared.stamp[0])
+-                    upload_lane = _telegram_upload_lane(size)
+-                    if upload_lane == 'too_large':
+-                        state['processed_bytes'] += size
+-                        state['processed_files'] += 1
+-                        state['skipped'] += 1
+-                        state['limit_skipped'] += 1
+-                        continue
+-                    if upload_lane == 'premium' and not premium_by_session.get(session, False):
+-                        big_queue.put_nowait(item)
+-                        return
+-
+-                async with account_locks[session]:
+-                    if prepared is not None and await asyncio.to_thread(read_stamp, path) != prepared.stamp:
+-                        queue_for_path(path).put_nowait(item)
+-                        continue
+-                    if health(session).get("disabled"):
+-                        queue_for_path(path).put_nowait(item)
+-                        return
+-                    if not self._runtime_task_account_allowed(task, session):
+-                        queue_for_path(path).put_nowait(item)
+-                        continue
+-                    if (
+-                        premium_priority is not None and premium_by_session.get(session, False)
+-                        and upload_lane != "premium" and premium_priority.has_work(session)
+-                    ):
+-                        small_queue.put_nowait(item)
+-                        continue
+-                    async with task_sem:
++                        key = f'{tid}:{path}'
++                        self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Подготовка / ожидание записи')
++                        try:
++                            prepared = await preparation.take(preparation_key(path), preparation_factory(path))
++                        except EmptyFilePending:
++                            defer_empty_file(path, account_name, size)
++                            continue
++                        except PreparationStopped:
++                            queue_for_path(path).put_nowait(item)
++                            return
++                        except Exception as exc:
++                            state['processed_bytes'] += size
++                            state['processed_files'] += 1
++                            state['failed'] += 1
++                            self.app.record_upload_error(task=name, target=task_target, path=str(path),
++                                account=account.display, attempts=1, error=f'Ошибка подготовки: {exc}')
++                            self.app.log(f'{name}: {path.name}: ошибка подготовки — {exc}')
++                            self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Ошибка подготовки')
++                            self._emit_task_metrics(tid, force=True)
++                            continue
++                        finally:
++                            offered.pop(path, None)
++                            fill_preparation()
++                        size = int(prepared.stamp[0])
++                        upload_lane = _telegram_upload_lane(size)
++                        if upload_lane == 'too_large':
++                            state['processed_bytes'] += size
++                            state['processed_files'] += 1
++                            state['skipped'] += 1
++                            state['limit_skipped'] += 1
++                            continue
++                        if upload_lane == 'premium' and not premium_by_session.get(session, False):
++                            big_queue.put_nowait(item)
++                            return
++
++                    async with self._task_admission(task_sem, tid), account_locks[session], self._shared_transfer_slot(session), self._file_client_lease(session, clients, client) as client, file_body:
++                        if prepared is not None and await asyncio.to_thread(read_stamp, path) != prepared.stamp:
++                            queue_for_path(path).put_nowait(item)
++                            continue
++                        if health(session).get("disabled"):
++                            queue_for_path(path).put_nowait(item)
++                            return
++                        if not self._runtime_task_account_allowed(task, session):
++                            queue_for_path(path).put_nowait(item)
++                            continue
++                        if (
++                            premium_priority is not None and premium_by_session.get(session, False)
++                            and upload_lane != "premium" and premium_priority.has_work(session)
++                        ):
++                            small_queue.put_nowait(item)
++                            continue
++                        # Assignment boundary: queued/prepared files see the latest command.
++                        settings = self._latest_task_settings(task)
++                        if settings is None or (not settings.get("use_all_accounts", True) and session not in (settings.get("account_sessions", []) or [])):
++                            queue_for_path(path).put_nowait(item)
++                            return
+                         if not await self._wait_gate(tid):
+                             queue_for_path(path).put_nowait(item)
+                             return
+@@ -5091,13 +5875,18 @@
+ 
+                         history_key = history_key_for_path(path)
+                         dedup_fingerprint = _dedup_fingerprint_for_upload(task, path, fingerprint)
+-                        claim_status, reservation_claim_token = await asyncio.to_thread(
++                        (claim_status, reservation_claim_token), claim_cancelled = await _settled_thread_result(
+                             self._claim_upload_fingerprint,
+                             dedup_fingerprint,
+                             history_key,
+                             path,
+                         )
+                         claim_action = _dedup_claim_disposition(claim_status)
++                        if claim_cancelled is not None:
++                            if claim_action == "send":
++                                self.app.upload_history.release_fingerprint_reservation(
++                                    dedup_fingerprint, history_key, reservation_claim_token)
++                            raise claim_cancelled
+                         if claim_action != 'defer':
+                             self._remember_unconfirmed(task, path, claim_action == 'blocked')
+                         if claim_action == 'blocked':
+@@ -5120,7 +5909,7 @@
+                             self._emit_task_metrics(tid, force=True)
+                             continue
+ 
+-                        reservation_held = True
++                        claim_taken = reservation_held = True
+ 
+                         def release_reservation() -> None:
+                             nonlocal reservation_held
+@@ -5138,7 +5927,7 @@
+                         media_kind = _media_kind(path)
+                         thumb_path: Path | None = None
+                         if media_kind == "video":
+-                            preview_mode = str(task.get("video_preview_mode", "required"))
++                            preview_mode = str(settings.get("video_preview_mode", "required"))
+                             if preview_mode != "off":
+                                 self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Видео • превью')
+                                 try:
+@@ -5207,6 +5996,7 @@
+                             safe_parts_retry_used = False
+                             max_transient_retries = int(policy.get("upload_retries", 3) or 0)
+                             retry_base_delay = float(policy.get("retry_base_delay", 5) or 5)
++                            file_assigned = False
+                             while True:
+                                 publication_started = False
+                                 try:
+@@ -5233,40 +6023,50 @@
+                                             state["active"].pop(key, None)
+                                             self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '⏸ Аккаунт отключён')
+                                             break
+-                                        caption = self._render_live_caption(task, path, original_index, total_files, name)
++                                        caption = self._render_live_caption(dict(settings, _caption_frozen=True), path, original_index, total_files, str(settings.get("name", name)))
+                                         send_kwargs: dict[str, Any] = {
+                                             "caption": caption,
+                                             "progress_callback": progress_callback,
+-                                            "silent": bool(task.get("silent", False)),
++                                            "silent": bool(settings.get("silent", False)),
+                                         }
+                                         if media_kind == "video":
+                                             if thumb_path is not None:
+                                                 send_kwargs["thumb"] = str(thumb_path)
+-                                            send_kwargs["supports_streaming"] = bool(task.get("streaming", True)) and path.suffix.lower() in {".mp4", ".m4v"}
++                                            send_kwargs["supports_streaming"] = bool(settings.get("streaming", True)) and path.suffix.lower() in {".mp4", ".m4v"}
+                                         elif media_kind == "photo":
+-                                            send_kwargs["force_document"] = str(task.get("photo_mode", "photo")) == "file"
++                                            send_kwargs["force_document"] = str(settings.get("photo_mode", "photo")) == "file"
+                                         if forum_mode:
+                                             topic_id = topic_id_for_path(path)
+                                             if topic_id:
+                                                 send_kwargs["reply_to"] = int(topic_id)
+-                                    delay = max(0.0, float(task.get('delay', 0) or 0))
++                                    delay = max(0.0, float(settings.get('delay', 0) or 0))
+                                     if policy['enabled']:
+                                         delay = max(delay, float(policy['min_file_delay']))
++
++                                    def gate_closed() -> bool:
++                                        all_event = getattr(self, 'pause_all_event', None)
++                                        task_event = self.task_pause_events.get(tid)
++                                        return ((all_event is not None and not all_event.is_set())
++                                                or (task_event is not None and not task_event.is_set()))
+ 
+                                     async def bounded_action(action):
+                                         while await self._wait_gate(tid):
+                                             async with global_sem:
+                                                 if self.stop_event.is_set():
+                                                     raise BatchUploadStopped()
+-                                                all_event = getattr(self, 'pause_all_event', None)
+-                                                task_event = self.task_pause_events.get(tid)
+-                                                if ((all_event is not None and not all_event.is_set())
+-                                                        or (task_event is not None and not task_event.is_set())):
++                                                if gate_closed():
+                                                     continue  # Release the slot before awaiting resume.
+-                                                return await action()
++                                                async with self._network_slot():
++                                                    # Waiting for capacity can outlast a pause or Stop.
++                                                    if self.stop_event.is_set():
++                                                        raise BatchUploadStopped()
++                                                    if gate_closed():
++                                                        continue
++                                                    return await action()
+                                         raise BatchUploadStopped()
+ 
+                                     async def before_upload():
++                                        nonlocal settings, delay, file_assigned
+                                         if prepared is not None and (
+                                             await asyncio.to_thread(read_stamp, path) != prepared.stamp
+                                             or await asyncio.to_thread(has_active_writer, path)
+@@ -5275,7 +6075,23 @@
+                                         if (self.stop_event.is_set() or health(session).get('disabled')
+                                                 or not self._runtime_task_account_allowed(task, session)):
+                                             raise BatchUploadStopped()
+-                                        send_kwargs['caption'] = self._render_live_caption(task, path, original_index, total_files, name)
++                                        if not file_assigned:
++                                            latest = self._latest_task_settings(task)
++                                            if latest is None or (not latest.get("use_all_accounts", True) and session not in (latest.get("account_sessions", []) or [])):
++                                                raise BatchUploadStopped()
++                                            settings = latest
++                                            delay = max(0.0, float(settings.get("delay", 0) or 0))
++                                            if policy["enabled"]:
++                                                delay = max(delay, float(policy["min_file_delay"]))
++                                            send_kwargs.update(caption=self._render_live_caption(dict(settings, _caption_frozen=True), path, original_index, total_files, str(settings.get("name", name))), silent=bool(settings.get("silent", False)))
++                                            if media_kind == "video":
++                                                send_kwargs["supports_streaming"] = bool(settings.get("streaming", True)) and path.suffix.lower() in {".mp4", ".m4v"}
++                                            elif media_kind == "photo":
++                                                send_kwargs["force_document"] = str(settings.get("photo_mode", "photo")) == "file"
++                                            file_assigned = True
++                                            if task.get("monitor_folder"):
++                                                getattr(self, "monitor_runtime", {}).setdefault(tid, {})["settings_revision"] = settings.get("revision", 0)
++                                                self._ui_latest(('monitor',), self.refresh_monitor_tab)
+ 
+                                     async def publish(send):
+                                         if media_kind == 'video':
+@@ -5467,6 +6283,7 @@
+                                     rejected = (errors is not None and isinstance(exc, errors.RPCError)
+                                                 and int(getattr(exc, 'code', 500)) in {400, 401, 403, 404})
+                                     if publication_started and not rejected:
++                                        unconfirmed_recorded = True
+                                         state['blocked'] += 1
+                                         self._remember_unconfirmed(task, path, True)
+                                         self.app.log(f'{name}: {path.name}: результат публикации не подтверждён; '
+@@ -5557,6 +6374,13 @@
+ 
+                         finally:
+                             await self._finish_diagnostic(key, False)
++                except BaseException as exc:
++                    # Acquisition or preparation failed before the body could account for the file.
++                    if not file_body.finished:
++                        settle_interrupted_file(item)
++                    if isinstance(exc, BatchUploadStopped):
++                        return
++                    raise
+ 
+                 # The next byte upload can begin immediately. Publication of
+                 # its handle observes the shared per-account interval above.
+@@ -5567,6 +6391,29 @@
+         # Ordinary jobs still release the next rule in order. Premium jobs can
+         # bypass that gate only to take an eligible large file from this wave.
+         signal_drained_if_ready()
++
++        first_hard_failure: BaseException | None = None
++        worker_start_failed = False
++        # Rule-local: other rules still judge a shared account by their own attempts.
++        failed_worker_sessions: set[str] = set()
++
++        def note_worker_failure(session: str | None, exc: BaseException) -> None:
++            nonlocal first_hard_failure
++            if first_hard_failure is None:
++                first_hard_failure = exc
++            if session is not None:
++                failed_worker_sessions.add(session)
++                activation_failed.add(session)
++            try:
++                who = clients[session][0].display if session in clients else "запуск аккаунтов"
++                self.app.log(f"{name}: {who}: ❌ сбой вне отправки файла — {self.app._friendly_error(exc)}; "
++                             "аккаунт исключён из задания, остальные файлы продолжают выполняться.")
++                if session is not None and isinstance(exc, Exception):
++                    h = health(session)
++                    h["errors"] = int(h.get("errors", 0)) + 1
++                    self._record_connection_failure(session, exc)
++            except Exception:
++                pass
+ 
+         max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, 101 + FILE_PART_REQUEUE_LIMIT)
+         for _wave in range(max_waves):
+@@ -5578,9 +6425,11 @@
+ 
+             async def start_available_workers() -> None:
+                 account_map = {s: pair[0] for s, pair in clients.items()}
+-                requested = set(self._effective_task_sessions(task, account_map))
++                latest = self._latest_task_settings(task)
++                requested = set(self._effective_task_sessions(latest, account_map)) if latest else set()
+                 for session in list(clients):
+-                    if session in started_sessions or session not in requested or health(session).get("disabled"):
++                    if (session in started_sessions or session in failed_worker_sessions
++                            or session not in requested or health(session).get("disabled")):
+                         continue
+                     if session not in resolved:
+                         # A hot-added Premium must reserve its large-file priority
+@@ -5592,22 +6441,51 @@
+                     started_sessions.add(session)
+                     worker_tasks[session] = asyncio.create_task(worker(session))
+ 
+-            await start_available_workers()
+-            if not worker_tasks:
+-                break
+-            while worker_tasks and not self.stop_event.is_set():
+-                done, _pending_workers = await asyncio.wait(
+-                    list(worker_tasks.values()), timeout=0.25, return_when=asyncio.FIRST_COMPLETED
+-                )
+-                if done:
++            async def start_workers_isolated() -> None:
++                nonlocal worker_start_failed
++                if worker_start_failed:
++                    return
++                try:
++                    await start_available_workers()
++                except Exception as exc:
++                    worker_start_failed = True
++                    note_worker_failure(None, exc)
++
++            try:
++                await start_workers_isolated()
++                if not worker_tasks:
++                    break
++                while worker_tasks:
++                    done, _pending_workers = await asyncio.wait(
++                        list(worker_tasks.values()), timeout=0.25, return_when=asyncio.FIRST_COMPLETED
++                    )
+                     for finished in done:
++                        finished_session = None
+                         for session, task_obj in list(worker_tasks.items()):
+                             if task_obj is finished:
+                                 worker_tasks.pop(session, None)
++                                finished_session = session
+                                 break
+-                if live_pool_changed is not None and live_pool_changed.is_set():
+-                    live_pool_changed.clear()
+-                await start_available_workers()
++                        # Connection/permit failures outside the per-file send catch
++                        # must fail this rule without cancelling its healthy workers.
++                        failure = (asyncio.CancelledError("upload worker was cancelled")
++                                   if finished.cancelled() else finished.exception())
++                        if failure is not None:
++                            note_worker_failure(finished_session, failure)
++                    if not self.stop_event.is_set():
++                        if live_pool_changed is not None and live_pool_changed.is_set():
++                            live_pool_changed.clear()
++                        await start_workers_isolated()
++            finally:
++                # A persistent loop will not clean up children for us. On normal
++                # Stop the loop above drains current files; cancellation/errors
++                # settle every remaining worker before clients can be released.
++                remaining_workers = list(worker_tasks.values())
++                for pending in remaining_workers:
++                    if not pending.done():
++                        pending.cancel()
++                if remaining_workers:
++                    await asyncio.gather(*remaining_workers, return_exceptions=True)
+ 
+             if file_part_deferred and not self.stop_event.is_set():
+                 deferred_now = list(file_part_deferred)
+@@ -5661,6 +6539,10 @@
+             incomplete = state.get('blocked') or state.get('deferred')
+             progress = '—' if incomplete else '100%'
+             self._queue_task_row(tid, status=status, progress=progress, speed='—', eta='—' if incomplete else '0с')
++
++        # Every healthy worker has settled; now the rule must not read as a success.
++        if first_hard_failure is not None:
++            raise first_hard_failure
+ 
+     @staticmethod
+     def _render_caption(template: str, path: Path, index: int, total: int, task_name: str) -> str | None:
+@@ -5862,6 +6744,9 @@
+         self._refresh_live_sort()
+ 
+     def close(self) -> None:
++        self.queue_halt_requested = True
++        for run in list(getattr(self, "_active_runs", {}).values()):
++            run.cancel()
+         self.monitor_stop_event.set()
+         self.stop_event.set()
+         self.pause_all_event.set()

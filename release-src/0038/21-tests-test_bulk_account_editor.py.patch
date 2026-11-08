@@ -1,0 +1,51 @@
+--- /dev/null
++++ b/app/tests/test_bulk_account_editor.py
+@@ -0,0 +1,48 @@
++import tkinter as tk
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_ui.bulk_editor import BulkFieldEditor
++
++
++class BulkAccountEditorTests(unittest.TestCase):
++    def setUp(self):
++        try:
++            self.root = tk.Tk()
++        except tk.TclError as exc:
++            self.skipTest(str(exc))
++        self.root.withdraw()
++        self.addCleanup(self.root.destroy)
++
++    def test_accounts_use_labels_and_unchecked_fields_are_unchanged(self):
++        accounts = [SimpleNamespace(session='internal_a', display='Аккаунт А'),
++                    SimpleNamespace(session='internal_b', display='Аккаунт Б')]
++        dialog = BulkFieldEditor(self.root, [{'account_sessions': ['internal_a']}], accounts=accounts)
++        dialog.withdraw()
++        self.assertEqual(dialog.account_selector.get(0, 'end'), ('Аккаунт А', 'Аккаунт Б'))
++        self.assertEqual(dialog._collect_patch(), {})
++        dialog.account_selector.selection_clear(0, 'end')
++        dialog.account_selector.selection_set(1)
++        for key, enabled, variable, kind in dialog.choices:
++            if key == 'account_sessions':
++                enabled.set(True)
++        self.assertEqual(dialog._collect_patch(), {'account_sessions': ['internal_b'], 'use_all_accounts': False})
++
++    def test_small_screen_keeps_action_buttons_outside_scroll_area(self):
++        with patch.object(tk.Toplevel, 'winfo_screenwidth', return_value=640), \
++                patch.object(tk.Toplevel, 'winfo_screenheight', return_value=480):
++            dialog = BulkFieldEditor(self.root, [{'caption': 'test'}])
++            dialog.withdraw()
++            dialog.update_idletasks()
++            self.assertEqual(dialog.buttons.grid_info()['row'], 2)
++            self.assertIs(dialog.buttons.master, dialog)
++            self.assertIs(dialog.form_scroll.master, dialog)
++            size = dialog.geometry().split('+')[0]
++            width, height = map(int, size.split('x'))
++            self.assertLessEqual(width, 600)
++            self.assertLessEqual(height, 400)
++
++
++if __name__ == '__main__':
++    unittest.main()

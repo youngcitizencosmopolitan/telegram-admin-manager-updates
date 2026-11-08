@@ -1,0 +1,26 @@
+--- a/app/tam_ui/queue_view.py
++++ b/app/tam_ui/queue_view.py
+@@ -1,6 +1,8 @@
+ """A view of the controller's existing queue, never a queue owner."""
+ from tkinter import ttk
+ import tkinter as tk
++
++from tam_ui.table_clipboard import install_table_actions
+ 
+ 
+ class QueueView:
+@@ -21,12 +23,13 @@
+         ttk.Button(tools, text='Очистить ожидающие', command=commands['clear_pending_queue']).pack(side='left')
+         body = ttk.Frame(self.frame); body.grid(row=1, column=0, sticky='nsew')
+         body.columnconfigure(0, weight=1); body.rowconfigure(0, weight=1)
+-        self.tree = ttk.Treeview(body, columns=('source', 'tasks', 'status', 'created'), show='headings', selectmode='browse')
++        self.tree = ttk.Treeview(body, columns=('source', 'tasks', 'status', 'created'), show='headings', selectmode='extended')
+         for key, title, width in [('source','Источник',120), ('tasks','Правила / задания',360),
+                                   ('status','Состояние',240), ('created','Добавлено',100)]:
+             self.tree.heading(key, text=title)
+             self.tree.column(key, width=width, minwidth=80, stretch=key in ('tasks','status'))
+         self.tree.grid(row=0, column=0, sticky='nsew')
++        install_table_actions(self.tree, columns=('source', 'tasks', 'status', 'created'), id_of=str)
+         y = ttk.Scrollbar(body, orient='vertical', command=self.tree.yview); y.grid(row=0, column=1, sticky='ns')
+         x = ttk.Scrollbar(body, orient='horizontal', command=self.tree.xview); x.grid(row=1, column=0, sticky='ew')
+         self.tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)

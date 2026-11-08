@@ -1,0 +1,136 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -633,62 +633,95 @@
+         except Exception:
+             return {}
+ 
+-    def monitor_rule_put(self, payload: dict[str, Any], position: int | None = None) -> None:
+-        rule_id = str(payload.get("id", "")).strip()
+-        if not rule_id:
++    def monitor_rule_put(self, payload: dict[str, Any], position: int | None = None, *, restore: bool = False) -> None:
++        from tam_core.live_rules import revise
++        rid = str(payload.get("id", "")).strip()
++        if not rid:
+             raise ValueError("monitor rule requires id")
+-        now = time.time()
+-        with self.session() as conn:
++        with self.session() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            row = conn.execute("SELECT position,payload_json FROM monitor_rules WHERE id=?", (rid,)).fetchone()
++            old = json.loads(row["payload_json"]) if row else {}
++            tombstone = conn.execute("SELECT value_json FROM meta WHERE key=?", ("monitor_deleted:" + rid,)).fetchone()
++            restoring = bool(restore and not row and tombstone)
++            if (not row and not restoring and (payload.get("revision") or tombstone)) or (row and "revision" in payload and int(payload["revision"]) != int(old.get("revision", 0))):
++                raise ValueError("Правило изменено или удалено; обновите список и повторите изменение.")
++            generation = {}
++            if restoring:
++                value = json.loads(tombstone[0])
++                generation = value if isinstance(value, dict) else {"revision": 1, "route_revision": 1}
++                old = generation
++            updated, changed = revise(old, payload)
++            if restoring:
++                updated["route_revision"] = int(generation.get("route_revision", 1)) + 1
++                conn.execute("DELETE FROM meta WHERE key=?", ("monitor_deleted:" + rid,))
+             if position is None:
+-                row = conn.execute(
+-                    "SELECT position FROM monitor_rules WHERE id=?", (rule_id,)
+-                ).fetchone()
+-                if row is not None:
+-                    position = int(row[0])
+-                else:
+-                    row = conn.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM monitor_rules").fetchone()
+-                    position = int(row[0] if row else 0)
+-            conn.execute(
+-                """
+-                INSERT INTO monitor_rules(id, position, payload_json, updated_at)
+-                VALUES (?, ?, ?, ?)
+-                ON CONFLICT(id) DO UPDATE SET
+-                    position=excluded.position,
+-                    payload_json=excluded.payload_json,
+-                    updated_at=excluded.updated_at
+-                """,
+-                (rule_id, int(position), json.dumps(payload, ensure_ascii=False), now),
+-            )
++                position = row["position"] if row else conn.execute("SELECT COALESCE(MAX(position),-1)+1 FROM monitor_rules").fetchone()[0]
++            conn.execute("INSERT INTO monitor_rules(id,position,payload_json,updated_at) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET position=excluded.position,payload_json=excluded.payload_json,updated_at=excluded.updated_at",
++                         (rid, position, json.dumps(updated, ensure_ascii=False), time.time()))
++            if changed:
++                conn.execute("DELETE FROM monitor_seen_files WHERE rule_id=?", (rid,))
+ 
+     def monitor_rule_update_fields(self, rule_id: str, fields: dict[str, Any]) -> dict[str, Any]:
++        return self.monitor_rules_patch([rule_id], fields).get(str(rule_id), {})
++
++    def monitor_rules_patch(self, rule_ids, fields):
++        from tam_core.live_rules import revise, validate_patch
++        validate_patch(fields)
++        result = {}
+         with self.session() as conn:
+             conn.execute("BEGIN IMMEDIATE")
+-            row = conn.execute("SELECT payload_json FROM monitor_rules WHERE id=?", (str(rule_id),)).fetchone()
++            for rid in dict.fromkeys(map(str, rule_ids)):
++                row = conn.execute("SELECT payload_json FROM monitor_rules WHERE id=?", (rid,)).fetchone()
++                if row is None:
++                    continue
++                old = json.loads(row[0])
++                updated, changed = revise(old, dict(old, **fields))
++                conn.execute("UPDATE monitor_rules SET payload_json=?,updated_at=? WHERE id=?", (json.dumps(updated, ensure_ascii=False), time.time(), rid))
++                if changed:
++                    conn.execute("DELETE FROM monitor_seen_files WHERE rule_id=?", (rid,))
++                result[rid] = updated
++        return result
++
++    def monitor_rule_commit_scan(self, rule_id, route_revision, fields, paths=None, delta=None):
++        from tam_core.live_rules import DETECTION_FIELDS
++        if set(fields) - DETECTION_FIELDS:
++            raise ValueError("Scan may only update detection fields")
++        rid = str(rule_id)
++        with self.session() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            row = conn.execute("SELECT payload_json FROM monitor_rules WHERE id=?", (rid,)).fetchone()
+             if row is None:
+                 return {}
+             payload = json.loads(row[0])
++            if int(payload.get("route_revision", 1)) != int(route_revision) or not payload.get("monitor_folder", True):
++                return {}
+             payload.update(fields)
+-            conn.execute("UPDATE monitor_rules SET payload_json=?, updated_at=? WHERE id=?",
+-                         (json.dumps(payload, ensure_ascii=False), time.time(), str(rule_id)))
++            conn.execute("UPDATE monitor_rules SET payload_json=?,updated_at=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), time.time(), rid))
++            if paths is not None:
++                conn.execute("DELETE FROM monitor_seen_files WHERE rule_id=?", (rid,))
++                conn.executemany("INSERT OR IGNORE INTO monitor_seen_files(rule_id,path_key) VALUES(?,?)", ((rid, str(p).replace("\\", "/").casefold()) for p in paths if str(p)))
++            if delta is not None:
++                added, removed = delta
++                normalize = lambda items: ((rid, str(p).replace("\\", "/").casefold()) for p in items if str(p))
++                conn.executemany("DELETE FROM monitor_seen_files WHERE rule_id=? AND path_key=?", normalize(removed))
++                conn.executemany("INSERT OR IGNORE INTO monitor_seen_files(rule_id,path_key) VALUES(?,?)", normalize(added))
+             return payload
+ 
+     def monitor_rules_set_accounts(self, sessions: list[str]) -> list[str]:
+         selected = list(dict.fromkeys(str(s).strip() for s in sessions if str(s).strip()))
+         if not selected:
+             raise ValueError("Choose at least one account")
+-        changed: list[str] = []
++        return list(self.monitor_rules_patch([r["id"] for r in self.monitor_rules_all()], dict(account_sessions=selected, use_all_accounts=False, monitor_accounts_override=True)))
++
++    def monitor_rule_delete(self, rule_id: str) -> None:
+         with self.session() as conn:
+             conn.execute("BEGIN IMMEDIATE")
+-            for row in conn.execute("SELECT id, payload_json FROM monitor_rules ORDER BY position, id").fetchall():
+-                payload = json.loads(row["payload_json"])
+-                payload.update(account_sessions=selected, use_all_accounts=False, monitor_accounts_override=True)
+-                conn.execute("UPDATE monitor_rules SET payload_json=?, updated_at=? WHERE id=?",
+-                             (json.dumps(payload, ensure_ascii=False), time.time(), row["id"]))
+-                changed.append(str(row["id"]))
+-        return changed
+-
+-    def monitor_rule_delete(self, rule_id: str) -> None:
+-        with self.session() as conn:
++            row = conn.execute("SELECT payload_json FROM monitor_rules WHERE id=?", (str(rule_id),)).fetchone()
++            if row is not None:
++                old = json.loads(row[0])
++                generation = {"revision": int(old.get("revision", 0)), "route_revision": int(old.get("route_revision", 1))}
++                conn.execute("INSERT OR REPLACE INTO meta(key,value_json) VALUES(?,?)", ("monitor_deleted:" + str(rule_id), json.dumps(generation)))
+             conn.execute("DELETE FROM monitor_seen_files WHERE rule_id=?", (str(rule_id),))
+             conn.execute("DELETE FROM monitor_rules WHERE id=?", (str(rule_id),))
+ 

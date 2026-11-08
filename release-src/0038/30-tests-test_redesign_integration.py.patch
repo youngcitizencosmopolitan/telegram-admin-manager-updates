@@ -1,0 +1,23 @@
+--- a/app/tests/test_redesign_integration.py
++++ b/app/tests/test_redesign_integration.py
+@@ -93,10 +93,19 @@
+                    and w.cget('text') == 'Незавершённые отправки…']
+         self.assertEqual(len(buttons), 1)
+ 
+-    def test_busy_manual_group_name_refresh_still_defers(self):
++    def test_legacy_busy_manual_group_name_refresh_still_defers(self):
+         self.app._busy = True
++        self.app._runtime_enabled = False
+         with patch.object(main, 'TelegramClient', object()), patch.object(self.app, 'after') as after:
+             REAL_GROUP_NAME_REFRESH(self.app, force=True, automatic=False)
+             after.assert_called_once()
+             self.assertEqual(after.call_args.args[0], 4000)
+         self.assertIn('отложено', str(self.app.busy_label.cget('text')))
++
++    def test_managed_group_name_refresh_does_not_defer_for_upload(self):
++        self.app._busy = True
++        with patch.object(main, 'TelegramClient', object()), \
++                patch.object(self.app, '_collect_group_targets', return_value={}), \
++                patch.object(self.app, 'after') as after:
++            REAL_GROUP_NAME_REFRESH(self.app, force=True, automatic=False)
++            after.assert_not_called()

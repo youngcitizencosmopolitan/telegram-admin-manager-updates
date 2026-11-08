@@ -1,0 +1,459 @@
+--- /dev/null
++++ b/app/tests/test_batch_review_regressions.py
+@@ -0,0 +1,456 @@
++"""Regressions from the final batch review: findings 1, 3, 4 and 6."""
++import asyncio
++import threading
++import unittest
++from contextlib import asynccontextmanager
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import batch_uploader as bu
++import test_prefetch_upload_boundary as fixture
++from tam_core.models import Account
++
++
++class FakeSlots:
++    """Records the shared account and network capacity a run is holding."""
++
++    def __init__(self):
++        self.network_active = 0
++        self.network_entries = 0
++        self.held_accounts = set()
++        self.max_accounts = 0
++
++    @asynccontextmanager
++    async def network_slot(self, stop_event=None):
++        self.network_active += 1
++        self.network_entries += 1
++        try:
++            yield
++        finally:
++            self.network_active -= 1
++
++    @asynccontextmanager
++    async def transfer_slot(self, session, stop_event=None):
++        self.held_accounts.add(session)
++        self.max_accounts = max(self.max_accounts, len(self.held_accounts))
++        try:
++            yield
++        finally:
++            self.held_accounts.discard(session)
++
++
++class FakeFlood(Exception):
++    seconds = 1
++
++
++class FakeTelegram:
++    def __init__(self, owner, on_upload=None, on_send=None):
++        self.owner, self.on_upload, self.on_send = owner, on_upload, on_send
++
++    async def upload_file(self, path, **kwargs):
++        if self.on_upload:
++            await self.on_upload(Path(path))
++        return SimpleNamespace(path=path, name=Path(path).name)
++
++    async def send_file(self, entity, path, **kwargs):
++        path = getattr(path, 'path', path)
++        if self.on_send:
++            await self.on_send(Path(path))
++        self.owner.sent.append((path, kwargs))
++        return SimpleNamespace(id=len(self.owner.sent))
++
++
++class BatchReviewRegressionTests(unittest.IsolatedAsyncioTestCase):
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    read = fixture.PrefetchUploadTests.read
++    file = fixture.PrefetchUploadTests.file
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    async def asyncSetUp(self):
++        await fixture.PrefetchUploadTests.asyncSetUp(self)
++        self.locks = {'s1': self.account_lock, 's2': asyncio.Lock()}
++
++    def install_slots(self):
++        slots = FakeSlots()
++        self.pane.app.network_slot = slots.network_slot
++        self.pane.app.transfer_slot = slots.transfer_slot
++        return slots
++
++    async def run_rule(self, clients):
++        self.pane._effective_task_sessions = lambda *args: list(clients)
++        pool = {session: (Account(session=session, label=session, phone='', user_id=index), client)
++                for index, (session, client) in enumerate(clients.items(), start=1)}
++        await self.pane._run_one_task(dict(self.rule), pool, {session: False for session in clients}, self.locks,
++            asyncio.Semaphore(4), asyncio.Semaphore(2), asyncio.Semaphore(2), preparation=self.pool)
++
++    def reservation_rows(self):
++        with self.history.db.session() as conn:
++            return [tuple(row) for row in conn.execute('SELECT path, prepublication FROM upload_reservations')]
++
++    def record_waits(self, slots):
++        """Every pause or sleep is logged with the network capacity held across it."""
++        waits = []
++
++        async def gate(*args):
++            waits.append(slots.network_active)
++            return True
++
++        async def sleep(seconds):
++            waits.append(slots.network_active)
++            await asyncio.sleep(.01)
++            return True
++
++        self.pane._wait_gate, self.pane._sleep_stop = gate, sleep
++        return waits
++
++    # Finding 1: idle time must not occupy global capacity; Stop wakes waiters.
++    async def test_network_slot_covers_bytes_and_publication_but_not_publication_gap(self):
++        self.file('a.mp4', b'first')
++        self.file('b.mp4', b'second')
++        self.rule['delay'] = .05
++        slots = self.install_slots()
++        waits = self.record_waits(slots)
++        during = []
++
++        async def on_upload(path):
++            during.append(('upload', slots.network_active))
++
++        async def on_send(path):
++            during.append(('send', slots.network_active))
++
++        await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self, on_upload, on_send)}), 5)
++        self.assertEqual(len(self.sent), 2)
++        self.assertEqual(during, [('upload', 1), ('send', 1)] * 2)
++        self.assertGreater(len(waits), 2)
++        self.assertEqual(set(waits), {0}, 'network capacity was held across a pause or publication gap')
++        self.assertEqual(slots.network_active, 0)
++
++    async def test_network_slot_is_released_during_flood_wait(self):
++        self.file()
++        slots = self.install_slots()
++        waits = self.record_waits(slots)
++        attempts = []
++
++        async def on_upload(path):
++            attempts.append(path)
++            if len(attempts) == 1:
++                raise FakeFlood()
++
++        with (patch.object(bu, 'TELETHON_WAIT_ERRORS', (FakeFlood,)),
++              patch.object(bu, 'telegram_wait_seconds', lambda exc: 1),
++              patch.object(bu, 'is_premium_upload_wait', lambda exc: False)):
++            await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self, on_upload)}), 5)
++        self.assertEqual(len(attempts), 2)
++        self.assertEqual(len(self.sent), 1)
++        self.assertEqual(slots.network_entries, 3, 'failed upload, retried upload, publication')
++        self.assertEqual(set(waits), {0}, 'network capacity was held across FloodWait')
++
++    async def test_network_slot_is_released_during_retry_backoff(self):
++        self.file()
++        slots = self.install_slots()
++        waits = self.record_waits(slots)
++        attempts = []
++        self.pane.app._is_retryable_upload_error = lambda exc: True
++        self.pane.app._is_api_credential_error = lambda exc: False
++        self.pane.app._is_serious_account_error = lambda exc: False
++
++        async def on_upload(path):
++            attempts.append(path)
++            if len(attempts) == 1:
++                raise OSError('temporary')
++
++        await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self, on_upload)}), 5)
++        self.assertEqual(len(attempts), 2)
++        self.assertEqual(slots.network_entries, 3, 'failed upload, retried upload, publication')
++        self.assertEqual(set(waits), {0}, 'network capacity was held across retry backoff')
++
++    async def test_task_limit_wait_does_not_hold_another_account(self):
++        self.file('a.mp4', b'first')
++        self.file('b.mp4', b'second')
++        self.rule.update(parallel_auto=False, parallel=1)
++        slots = self.install_slots()
++        locked_during_upload = []
++
++        async def on_upload(path):
++            await asyncio.sleep(.1)
++            locked_during_upload.append(sum(lock.locked() for lock in self.locks.values()))
++
++        clients = {'s1': FakeTelegram(self, on_upload), 's2': FakeTelegram(self, on_upload)}
++        await asyncio.wait_for(self.run_rule(clients), 5)
++        self.assertEqual(len(self.sent), 2)
++        self.assertEqual(slots.max_accounts, 1, 'a worker held an account slot while waiting for its task permit')
++        self.assertEqual(set(locked_during_upload), {1})
++
++    async def test_stop_while_waiting_for_network_slot_requeues_safely(self):
++        self.file()
++        waiting = asyncio.Event()
++
++        @asynccontextmanager
++        async def network_slot(stop_event=None):
++            waiting.set()
++            while not stop_event.is_set():
++                await asyncio.sleep(.01)
++            raise asyncio.CancelledError()  # the runtime's stop signal
++            yield
++
++        self.pane.app.network_slot = network_slot
++        running = asyncio.create_task(self.run_rule({'s1': FakeTelegram(self)}))
++        await asyncio.wait_for(waiting.wait(), 2)
++        self.stop.set()
++        await asyncio.wait_for(running, 2)  # a bare CancelledError here would mean the rule died
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.errors, [])
++        self.assertEqual(self.reservation_rows(), [])
++        self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++        self.assertFalse(self.account_lock.locked())
++
++    async def test_stop_while_waiting_for_account_slot_ends_without_claim(self):
++        self.file()
++        waiting = asyncio.Event()
++
++        @asynccontextmanager
++        async def transfer_slot(session, stop_event=None):
++            waiting.set()
++            while not stop_event.is_set():
++                await asyncio.sleep(.01)
++            raise asyncio.CancelledError()
++            yield
++
++        self.pane.app.transfer_slot = transfer_slot
++        running = asyncio.create_task(self.run_rule({'s1': FakeTelegram(self)}))
++        await asyncio.wait_for(waiting.wait(), 2)
++        self.stop.set()
++        await asyncio.wait_for(running, 2)
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.reservation_rows(), [])
++        self.assertFalse(self.account_lock.locked())
++
++    # Finding 3: one account failing must not take other accounts' files with it.
++    async def test_connection_failure_settles_healthy_worker_then_raises(self):
++        self.file('a.mp4', b'first')
++        self.file('b.mp4', b'second')
++        healthy_uploading, connection_failed = asyncio.Event(), asyncio.Event()
++        finished = []
++
++        @asynccontextmanager
++        async def lease(session, clients, fallback):
++            if session == 's1':
++                await healthy_uploading.wait()
++                connection_failed.set()
++                raise OSError('proxy down')
++            yield fallback
++
++        async def on_upload(path):
++            first = not healthy_uploading.is_set()
++            healthy_uploading.set()
++            await connection_failed.wait()
++            if first:
++                await asyncio.sleep(.35)  # long enough for the wave loop to observe the failure
++            finished.append(path)
++
++        self.pane._file_client_lease = lease
++        with self.assertRaisesRegex(OSError, 'proxy down'):
++            await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self), 's2': FakeTelegram(self, on_upload)}), 5)
++        self.assertEqual(len(finished), 2, 'the healthy transfer was cancelled or the failed file was lost')
++        self.assertEqual(len(self.sent), 2)
++        self.assertEqual(self.reservation_rows(), [])
++        self.assertEqual(self.pane.account_health['s1']['state'], 'Недоступен')
++        self.assertIn('proxy down', self.pane.account_health['s1']['reason'])
++        self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++
++    async def test_failed_account_is_not_restarted_and_its_file_is_reported(self):
++        self.file()
++        attempts = []
++
++        @asynccontextmanager
++        async def lease(session, clients, fallback):
++            attempts.append(session)
++            raise OSError('proxy down')
++            yield
++
++        self.pane._file_client_lease = lease
++        with self.assertRaisesRegex(OSError, 'proxy down'):
++            await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self)}), 5)
++        self.assertEqual(attempts, ['s1'])
++        self.assertEqual(self.pane.task_states['r1']['failed'], 1)
++
++    async def test_failure_still_raises_when_stop_was_requested(self):
++        self.file()
++
++        @asynccontextmanager
++        async def lease(session, clients, fallback):
++            self.stop.set()
++            raise OSError('proxy down')
++            yield
++
++        self.pane._file_client_lease = lease
++        with self.assertRaisesRegex(OSError, 'proxy down'):
++            await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self)}), 5)
++
++    async def test_lease_connect_failure_disconnects_new_handle(self):
++        events = []
++
++        class Handle:
++            def __init__(self, name, fails=False):
++                self.name, self.fails = name, fails
++
++            async def connect(self):
++                if self.fails:
++                    raise OSError('proxy down')
++
++            async def disconnect(self):
++                events.append(self.name)
++
++        self.pane.app._runtime_enabled = True
++        self.pane.app._api_credentials = lambda: (1, 'hash')
++        self.pane.sessions_dir = self.root
++        self.pane._new_telegram_client = lambda *args, **kwargs: Handle('new', fails=True)
++        previous = Handle('previous')
++        clients = {'s1': (self.account, previous)}
++        with self.assertRaisesRegex(OSError, 'proxy down'):
++            async with self.pane._file_client_lease('s1', clients, previous):
++                self.fail('lease must not yield after a failed connect')
++        self.assertEqual(events, ['previous', 'new'])
++        self.assertIs(clients['s1'][1], previous)
++
++    async def test_cancel_before_publication_releases_claim_for_same_run_retry(self):
++        first = self.file()
++        uploading = asyncio.Event()
++
++        async def on_upload(path):
++            uploading.set()
++            await asyncio.Event().wait()
++
++        running = asyncio.create_task(self.run_rule({'s1': FakeTelegram(self, on_upload)}))
++        await asyncio.wait_for(uploading.wait(), 2)
++        self.assertEqual(len(self.reservation_rows()), 1)
++        running.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await running
++        self.assertEqual(self.reservation_rows(), [])
++        self.assertEqual(self.pane.task_states['r1']['blocked'], 0)
++        self.assertEqual(self.pane.task_states['r1']['active'], {})
++        await asyncio.wait_for(self.run_rule({'s1': FakeTelegram(self)}), 5)
++        self.assertEqual([Path(path) for path, _ in self.sent], [first])
++
++    async def test_cancel_after_mark_publishing_preserves_uncertainty(self):
++        path = self.file()
++        publishing = asyncio.Event()
++
++        async def on_send(sent_path):
++            publishing.set()
++            await asyncio.Event().wait()
++
++        running = asyncio.create_task(self.run_rule({'s1': FakeTelegram(self, on_send=on_send)}))
++        await asyncio.wait_for(publishing.wait(), 2)
++        running.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await running
++        self.assertEqual([row[1] for row in self.reservation_rows()], [0], 'publishing claim was released')
++        state = self.pane.task_states['r1']
++        self.assertEqual((state['blocked'], state['failed']), (1, 0))
++        self.assertIn(str(path), self.pane._unconfirmed_by_rule['r1'][1])
++        self.assertFalse(self.account_lock.locked())
++
++    async def test_cancel_during_claim_releases_the_claim_that_lands_later(self):
++        self.file()
++        entered, proceed, landed = threading.Event(), threading.Event(), threading.Event()
++        real_claim = self.pane._claim_upload_fingerprint
++
++        def claim(*args):
++            entered.set()
++            proceed.wait(5)
++            try:
++                return real_claim(*args)
++            finally:
++                landed.set()
++
++        self.pane._claim_upload_fingerprint = claim
++        running = asyncio.create_task(self.run_rule({'s1': FakeTelegram(self)}))
++        self.assertTrue(await asyncio.to_thread(entered.wait, 5))
++        running.cancel()
++        await asyncio.sleep(0)
++        proceed.set()
++        with self.assertRaises(asyncio.CancelledError):
++            await running
++        self.assertTrue(await asyncio.to_thread(landed.wait, 5))
++        self.assertEqual(self.reservation_rows(), [], 'a claim landed after cancellation and was never released')
++
++    # Finding 4: a connected but unregistered handle must not outlive cancellation.
++    async def test_hot_add_cancel_disconnects_unregistered_handle_even_when_recancelled(self):
++        entered, disconnecting, proceed = asyncio.Event(), asyncio.Event(), asyncio.Event()
++        disconnected = []
++
++        class Handle:
++            async def connect(self):
++                return None
++
++            async def is_user_authorized(self):
++                return True
++
++            async def get_me(self):
++                entered.set()
++                await asyncio.Event().wait()
++
++            async def disconnect(self):
++                disconnecting.set()
++                await proceed.wait()
++                disconnected.append(True)
++
++        self.pane.app.store.accounts = lambda: [Account(session='s9', label='hot', phone='', user_id=9)]
++        self.pane.sessions_dir = self.root
++        self.pane._new_telegram_client = lambda *args, **kwargs: Handle()
++        clients = {}
++        with patch.object(bu, '_hot_add_candidate_sessions', lambda *args: ['s9']):
++            running = asyncio.create_task(self.pane._connect_hot_batch_accounts_once([], clients, {}, {}, 1, 'hash'))
++            await asyncio.wait_for(entered.wait(), 2)
++            running.cancel()
++            await asyncio.wait_for(disconnecting.wait(), 2)
++            running.cancel()
++            await asyncio.sleep(0)
++            self.assertFalse(running.done(), 'cleanup was abandoned by the second cancellation')
++            proceed.set()
++            with self.assertRaises(asyncio.CancelledError):
++                await running
++        self.assertEqual(disconnected, [True])
++        self.assertEqual(clients, {})
++
++
++class SelectedDisabledTaskTests(unittest.TestCase):
++    def pane_with(self, tasks):
++        pane = bu.BatchUploaderPane.__new__(bu.BatchUploaderPane)
++        logged, queued, resumed = [], [], []
++        noop = lambda *args, **kwargs: None
++        pane.app = SimpleNamespace(save_api_settings=noop, _api_credentials=lambda: (1, 'hash'),
++                                   save_safety_settings=noop, log=logged.append)
++        pane.tasks = lambda: tasks
++        pane.save_tasks = pane.refresh_safety_badge = noop
++        pane._selected_task_ids = lambda: [str(task['id']) for task in tasks]
++        pane._enqueue_batch = lambda selected, **kwargs: queued.append([task['id'] for task in selected])
++        pane._ensure_queue_worker = lambda: resumed.append(True)
++        pane.queue_halt_requested = True
++        return pane, logged, queued, resumed
++
++    def test_all_disabled_selection_is_rejected_with_a_message(self):
++        pane, _, queued, resumed = self.pane_with([{'id': 'off', 'name': 'Отключённое', 'enabled': False}])
++        with patch.object(bu, 'TelegramClient', object), patch.object(bu, 'messagebox') as box:
++            pane.start(True)
++        self.assertEqual(queued, [])
++        self.assertEqual(resumed, [], 'a rejected start must not resume a halted dispatcher')
++        self.assertTrue(pane.queue_halt_requested)
++        message = box.showinfo.call_args.args[1]
++        self.assertIn('выключ', message.casefold())
++        self.assertIn('Отключённое', message)
++
++    def test_mixed_selection_queues_enabled_tasks_and_reports_skipped(self):
++        pane, logged, queued, _ = self.pane_with([{'id': 'off', 'name': 'Отключённое', 'enabled': False},
++                                                  {'id': 'on', 'name': 'Включённое'}])
++        with patch.object(bu, 'TelegramClient', object), patch.object(bu, 'messagebox'):
++            pane.start(True)
++        self.assertEqual(queued, [['on']])
++        self.assertTrue(any('Отключённое' in line and 'выключ' in line.casefold() for line in logged), logged)
++
++
++if __name__ == '__main__':
++    unittest.main()

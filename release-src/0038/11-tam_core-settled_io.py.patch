@@ -1,0 +1,27 @@
+--- /dev/null
++++ b/app/tam_core/settled_io.py
+@@ -0,0 +1,24 @@
++"""Do not release a session reservation while a local SQLite copy still runs."""
++import asyncio
++from concurrent.futures import ThreadPoolExecutor
++
++_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='tam-session-copy')
++
++
++async def settled_call(function, *args):
++    future = _pool.submit(function, *args)
++    cancelled = None
++    while not future.done():
++        try:
++            await asyncio.sleep(.02)
++        except asyncio.CancelledError as exc:
++            cancelled = exc
++    try:
++        result = future.result()
++    except Exception:
++        if cancelled is not None:
++            raise cancelled
++        raise
++    if cancelled is not None:
++        raise cancelled
++    return result

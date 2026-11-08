@@ -1,0 +1,60 @@
+--- /dev/null
++++ b/app/tests/test_runtime_batch_integration.py
+@@ -0,0 +1,57 @@
++import asyncio
++from contextlib import asynccontextmanager
++import threading
++import unittest
++
++import test_prefetch_upload_boundary as fixture
++from tam_core.runtime import AsyncRuntime
++
++
++class RuntimeBatchIntegrationTests(unittest.TestCase):
++    file = fixture.PrefetchUploadTests.file
++    read = fixture.PrefetchUploadTests.read
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    def setUp(self):
++        self.runtime = AsyncRuntime()
++        self.runtime.run(fixture.PrefetchUploadTests.asyncSetUp(self))
++        self.addCleanup(self.runtime.shutdown)
++        self.addCleanup(lambda: self.runtime.run(fixture.PrefetchUploadTests.asyncTearDown(self)))
++
++    def test_stop_releases_claim_while_other_operation_keeps_network_slot(self):
++        self.file()
++        occupied, waiting, release = threading.Event(), threading.Event(), threading.Event()
++        @asynccontextmanager
++        async def network_slot(stop_event=None):
++            waiting.set()
++            async with self.runtime.network_slot(lambda: 1, cancelled=stop_event.is_set):
++                yield
++        self.pane.app.network_slot = network_slot
++        async def other_operation():
++            async with self.runtime.network_slot(lambda: 1):
++                occupied.set()
++                while not release.is_set():
++                    await asyncio.sleep(.005)
++        holder = self.runtime.submit(other_operation())
++        running = None
++        try:
++            self.assertTrue(occupied.wait(1))
++            running = self.runtime.submit(self.run_task())
++            self.assertTrue(waiting.wait(2))
++            self.stop.set()
++            running.result(1)
++            self.assertFalse(holder.done(), 'Stop must not depend on the other line completing')
++            self.assertEqual(self.sent, [])
++            self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++            with self.history.db.session() as connection:
++                self.assertEqual(connection.execute('SELECT COUNT(*) FROM upload_reservations').fetchone()[0], 0)
++        finally:
++            self.stop.set()
++            release.set()
++            holder.result(1)
++            if running is not None:
++                running.result(1)
++
++
++if __name__ == '__main__':
++    unittest.main()

@@ -1,0 +1,66 @@
+--- /dev/null
++++ b/app/tests/test_factory_concurrency.py
+@@ -0,0 +1,63 @@
++import asyncio
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import telegram_admin_manager as main
++from tam_core.settled_io import settled_call
++
++
++class FactoryConcurrencyTests(unittest.TestCase):
++    def test_second_factory_start_does_not_clear_running_plan_stop(self):
++        app = main.TelegramAdminManager.__new__(main.TelegramAdminManager)
++        app._factory_operation_running = True
++        app._factory_stop_event = threading.Event()
++        app._factory_stop_event.set()
++        app.run_worker = Mock()
++        with patch.object(main.messagebox, 'showinfo') as info:
++            app._factory_start()
++        info.assert_called_once()
++        app.run_worker.assert_not_called()
++        self.assertTrue(app._factory_stop_event.is_set())
++
++    def test_factory_options_on_worker_use_saved_snapshot_without_tk(self):
++        get = Mock(side_effect=AssertionError('worker read Tk'))
++        app = SimpleNamespace(store=SimpleNamespace(snapshot=lambda: {
++            'group_factory_about': 'saved', 'group_factory_seed_caption': 'caption'}),
++            factory_about_var=SimpleNamespace(get=get))
++        result, errors = [], []
++        def read():
++            try:
++                result.append(main.TelegramAdminManager._factory_options(app))
++            except Exception as exc:
++                errors.append(exc)
++        worker = threading.Thread(target=read)
++        worker.start()
++        worker.join(1)
++        self.assertFalse(errors, str(errors))
++        self.assertEqual(result[0]['about'], 'saved')
++        self.assertEqual(result[0]['seed_caption'], 'caption')
++        get.assert_not_called()
++
++
++class SettledCopyTests(unittest.IsolatedAsyncioTestCase):
++    async def test_cancel_waits_for_actual_copy_completion(self):
++        started, release, finished = threading.Event(), threading.Event(), threading.Event()
++        def copy():
++            started.set()
++            release.wait(2)
++            finished.set()
++        task = asyncio.create_task(settled_call(copy))
++        try:
++            await asyncio.to_thread(started.wait, 1)
++            task.cancel()
++            await asyncio.sleep(.04)
++            self.assertFalse(task.done(), 'reservation can release while copy thread still runs')
++            release.set()
++            with self.assertRaises(asyncio.CancelledError):
++                await task
++            self.assertTrue(finished.is_set())
++        finally:
++            release.set()
++            await asyncio.gather(task, return_exceptions=True)

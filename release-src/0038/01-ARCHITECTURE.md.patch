@@ -1,0 +1,9 @@
+--- a/app/ARCHITECTURE.md
++++ b/app/ARCHITECTURE.md
+@@ -1,4 +1,6 @@
+ # Telegram Admin Manager 3.0 — architecture
++
++The concurrent-workflow changes are documented in [CONCURRENT_WORKFLOWS.md](CONCURRENT_WORKFLOWS.md) and the approved design at `../docs/superpowers/specs/2026-11-08-concurrent-app-design.md`. The sections below describe the historical persistence migration.
+ 
+ v3.0 keeps the v2.x UI/workflow but changes persistence and recovery underneath it.
+ 

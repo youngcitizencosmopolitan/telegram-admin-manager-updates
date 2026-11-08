@@ -1,0 +1,62 @@
+--- /dev/null
++++ b/app/tests/test_operations.py
+@@ -0,0 +1,59 @@
++import threading
++import unittest
++from tam_core.operations import OperationRegistry, SessionLeaseManager
++
++
++class OperationsTests(unittest.TestCase):
++    def test_cancel_only_targets_one_operation_and_finish_keeps_terminal_state(self):
++        registry = OperationRegistry()
++        first = registry.start('upload', resources=['session-a'])
++        other = registry.start('read')
++        first.update(status='waiting', progress=0.5, detail='session-a')
++        self.assertTrue(registry.cancel(first.id))
++        self.assertTrue(first.cancel_event.is_set())
++        self.assertFalse(other.cancel_event.is_set())
++        first.finish()
++        rows = {row['id']: row for row in registry.snapshot()}
++        self.assertEqual(rows[first.id]['status'], 'cancelled')
++        first.update(status='running')
++        self.assertEqual(first.snapshot()['status'], 'cancelled')
++        self.assertFalse(registry.cancel('missing'))
++
++    def test_terminal_retention_does_not_remove_running_operations(self):
++        registry = OperationRegistry(max_completed=2)
++        active = registry.start('active')
++        for n in range(5):
++            registry.start(str(n)).finish(result=n)
++        rows = registry.snapshot()
++        self.assertEqual(len(rows), 3)
++        self.assertEqual([row['label'] for row in rows], ['active', '3', '4'])
++        registry.finish(active.id, error='failed')
++        self.assertEqual(active.snapshot()['status'], 'failed')
++
++    def test_legacy_lease_wait_is_cancelable_and_ordered_resources_release(self):
++        manager = SessionLeaseManager()
++        cancel = threading.Event()
++        started = threading.Event()
++        result = []
++        def waiter():
++            started.set()
++            try:
++                with manager.lease(['b', 'a'], cancel_event=cancel):
++                    result.append('acquired')
++            except Exception as exc:
++                result.append(type(exc).__name__)
++        with manager.lease(['a', 'b']):
++            worker = threading.Thread(target=waiter)
++            worker.start()
++            self.assertTrue(started.wait(1))
++            cancel.set()
++            manager.wake_waiters()
++            worker.join(2)
++            self.assertFalse(worker.is_alive())
++        self.assertEqual(result, ['CancelledError'])
++        with manager.lease(['b', 'a']):
++            pass
++
++
++if __name__ == '__main__':
++    unittest.main()
