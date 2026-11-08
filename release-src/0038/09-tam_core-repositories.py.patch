@@ -1,0 +1,166 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import copy
+ import json
+ import threading
+ import time
+@@ -19,6 +20,7 @@
+     """Drop-in v2.x-compatible config facade backed by state.db."""
+ 
+     def __init__(self, legacy_path: Path):
++        self._lock = threading.RLock()
+         self.path = Path(legacy_path)
+         self.db = StateDatabase(self.path.parent / "state.db")
+         self.db.migrate_legacy_config(self.path, DEFAULT_CONFIG)
+@@ -26,18 +28,42 @@
+         self.data: dict[str, Any] = {}
+         self.load()
+ 
++    def snapshot(self) -> dict[str, Any]:
++        with self._lock:
++            return copy.deepcopy(self.data)
++
++    def update(self, fields: dict[str, Any], *, save: bool = True) -> dict[str, Any]:
++        """Publish related configuration values together, without shared aliases."""
++        with self._lock:
++            self.data.update(copy.deepcopy(fields))
++            if save:
++                self.save()
++            return copy.deepcopy(self.data)
++
++    def patch_upload_task(self, tid: str, fields: dict[str, Any]) -> bool:
++        with self._lock:
++            tasks = copy.deepcopy(self.data.get("upload_tasks", []))
++            for task in tasks:
++                if str(task.get("id", "")) == str(tid):
++                    task.update(copy.deepcopy(fields))
++                    self.data["upload_tasks"] = tasks
++                    self.save()
++                    return True
++            return False
++
+     def load(self) -> None:
+-        self.data = self.db.load_config(DEFAULT_CONFIG)
+-        if not isinstance(self.data.get("accounts"), list):
+-            self.data["accounts"] = []
+-        if not isinstance(self.data.get("upload_tasks"), list):
+-            self.data["upload_tasks"] = []
+-        # Keep a human-readable compatibility snapshot for rollback/support.
+-        self._write_snapshot()
++        with self._lock:
++            self.data = self.db.load_config(DEFAULT_CONFIG)
++            if not isinstance(self.data.get("accounts"), list):
++                self.data["accounts"] = []
++            if not isinstance(self.data.get("upload_tasks"), list):
++                self.data["upload_tasks"] = []
++            self._write_snapshot()
+ 
+     def save(self) -> None:
+-        self.db.save_config(self.data)
+-        self._write_snapshot()
++        with self._lock:
++            self.db.save_config(copy.deepcopy(self.data))
++            self._write_snapshot()
+ 
+     def _write_snapshot(self) -> None:
+         try:
+@@ -50,7 +76,7 @@
+ 
+     def accounts(self) -> list[Account]:
+         result: list[Account] = []
+-        for item in self.data.get("accounts", []):
++        for item in self.snapshot().get("accounts", []):
+             try:
+                 if isinstance(item, dict):
+                     result.append(Account.from_dict(item))
+@@ -59,8 +85,20 @@
+         return result
+ 
+     def set_accounts(self, accounts: list[Account]) -> None:
+-        self.data["accounts"] = [a.to_dict() for a in accounts]
+-        self.save()
++        self.update({"accounts": [a.to_dict() for a in accounts]})
++
++    def refresh_accounts(self, updated: list[Account]) -> None:
++        """Merge server observations into still-existing accounts only."""
++        observed = {a.session: a.to_dict() for a in updated}
++        server_fields = {"user_id", "username", "first_name", "last_name", "premium", "phone"}
++        with self._lock:
++            current = copy.deepcopy(self.data.get("accounts", []))
++            for account in current:
++                update = observed.get(str(account.get("session", "")))
++                if update is not None:
++                    account.update({key: update[key] for key in server_fields if key in update})
++            self.data["accounts"] = current
++            self.save()
+ 
+ 
+ class UploadHistory:
+@@ -566,6 +604,12 @@
+     def update_fields(self, rule_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+         return self.db.monitor_rule_update_fields(rule_id, fields)
+ 
++    def patch_many(self, rule_ids, fields):
++        return self.db.monitor_rules_patch(rule_ids, fields)
++
++    def commit_scan(self, rule_id, route_revision, fields, paths=None):
++        return self.db.monitor_rule_commit_scan(rule_id, route_revision, fields, paths)
++
+     def seen_files(self, rule_id: str) -> set[str]:
+         return self.db.monitor_seen_files(rule_id)
+ 
+@@ -581,7 +625,7 @@
+     def delete(self, rule_id: str) -> None:
+         self.db.monitor_rule_delete(rule_id)
+ 
+-    def sync_from_task(self, task: dict[str, Any]) -> None:
++    def sync_from_task(self, task: dict[str, Any], previous: dict[str, Any] | None = None) -> None:
+         """Mirror monitor settings from a package task without coupling deletion.
+ 
+         Existing signatures survive ordinary task edits when the monitored route
+@@ -593,10 +637,18 @@
+         if not tid:
+             return
+         existing = self.get(tid)
++        deleted = not existing and bool(self.db.get_meta("monitor_deleted:" + tid, False))
++        explicit_restore = bool(deleted and previous is not None and not previous.get("monitor_folder", False) and task.get("monitor_folder", False))
++        if deleted and not explicit_restore:
++            return
+         wants_monitor = bool(task.get("monitor_folder", False))
+         if not wants_monitor and not existing:
+             return
+         updated = dict(task)
++        if existing and previous is not None:
++            updated = dict(existing)
++            updated.update({key: value for key, value in task.items() if previous.get(key) != value})
++            wants_monitor = bool(updated.get("monitor_folder", False))
+         updated["id"] = tid
+         updated["monitor_folder"] = wants_monitor
+         if existing.get("monitor_accounts_override"):
+@@ -614,14 +666,21 @@
+                     updated[key] = existing.get(key)
+         elif existing:
+             # A different folder/media selection is a new monitoring baseline.
+-            self.reset_seen_files(tid)
++            # Route metadata and membership are cleared atomically by monitor_rule_put.
+             for key in (
+                 "monitor_signature", "monitor_last_success",
+                 "monitor_seen_initialized",
+                 "monitor_last_new_count", "monitor_last_detection",
+             ):
+                 updated.pop(key, None)
+-        self.put(updated)
++        if existing:
++            updated["revision"] = existing.get("revision", 0)
++        if explicit_restore:
++            updated.pop("revision", None)
++            updated.pop("route_revision", None)
++            self.db.monitor_rule_put(updated, restore=True)
++        else:
++            self.put(updated)
+ 
+     def migrate_from_tasks(self, tasks: list[dict[str, Any]]) -> int:
+         if self.db.get_meta("monitor_rules_migrated_v1", False):

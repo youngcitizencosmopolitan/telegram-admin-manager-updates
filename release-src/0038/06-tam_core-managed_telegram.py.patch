@@ -1,0 +1,30 @@
+--- /dev/null
++++ b/app/tam_core/managed_telegram.py
+@@ -0,0 +1,27 @@
++"""Context-local request policy for a client shared on one asyncio loop."""
++from weakref import WeakKeyDictionary
++
++from .runtime import CLIENT_FLOOD_POLICY
++
++_types = WeakKeyDictionary()
++
++
++def managed_client_type(base):
++    """Preserve Telethon's threshold without mutating another consumer's policy."""
++    if not isinstance(base, type):
++        return base
++    descriptor = getattr(base, 'flood_sleep_threshold', None)
++    if not isinstance(descriptor, property):
++        return base
++    if base not in _types:
++        class ManagedTelegramClient(base):
++            @property
++            def flood_sleep_threshold(self):
++                policy = CLIENT_FLOOD_POLICY.get()
++                return descriptor.fget(self) if policy is None else policy
++
++            @flood_sleep_threshold.setter
++            def flood_sleep_threshold(self, value):
++                descriptor.fset(self, value)
++        _types[base] = ManagedTelegramClient
++    return _types[base]

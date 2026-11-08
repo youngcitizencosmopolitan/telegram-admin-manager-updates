@@ -1,0 +1,73 @@
+--- /dev/null
++++ b/app/tests/test_concurrent_ui_bridge.py
+@@ -0,0 +1,70 @@
++import asyncio
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import telegram_admin_manager as main
++
++
++class UiBridgeTests(unittest.TestCase):
++    def test_channel_right_click_preserves_existing_multi_selection(self):
++        tree = SimpleNamespace(identify_row=lambda y: '2', selection=lambda: ('1', '2'), selection_set=Mock())
++        app = SimpleNamespace(channels_tree=tree, channels_context=Mock())
++        main.TelegramAdminManager._channels_popup(app, SimpleNamespace(y=5, x_root=0, y_root=0))
++        tree.selection_set.assert_not_called()
++
++    def test_channel_copy_field_includes_all_selected_rows(self):
++        app = SimpleNamespace(_channels_selected_peer_ids=lambda: [2, 1],
++            _channels_selected_peer_id=lambda: 2,
++            state_db=SimpleNamespace(channel_get=lambda ident: {'title': str(ident)}),
++            clipboard_clear=Mock(), clipboard_append=Mock(), update_idletasks=Mock(), log=Mock())
++        main.TelegramAdminManager._channels_copy(app, 'title')
++        app.clipboard_append.assert_called_once_with('2\n1')
++
++    def test_shutdown_wakes_pending_ui_question(self):
++        callbacks, errors = [], []
++        app = SimpleNamespace(_closed=False, ui_call=callbacks.append)
++        def work():
++            try:
++                main.TelegramAdminManager.ui_ask(app, lambda: 'answer')
++            except RuntimeError as exc:
++                errors.append(str(exc))
++        thread = threading.Thread(target=work, daemon=True)
++        thread.start()
++        try:
++            for _ in range(100):
++                if callbacks:
++                    break
++                threading.Event().wait(.005)
++            app._closed = True
++            thread.join(.5)
++            self.assertFalse(thread.is_alive(), 'closed UI left a worker waiting forever')
++            self.assertEqual(len(errors), 1)
++        finally:
++            for callback in callbacks:
++                callback()
++            thread.join(1)
++
++    def test_ui_question_propagates_exception_to_caller(self):
++        def fail():
++            raise ValueError('invalid selection')
++        app = SimpleNamespace(_closed=False, ui_call=lambda f: f())
++        with self.assertRaisesRegex(ValueError, 'invalid selection'):
++            main.TelegramAdminManager.ui_ask(app, fail)
++
++    def test_runtime_bridge_delegates_without_creating_another_loop(self):
++        runtime = SimpleNamespace(run=Mock(return_value=42))
++        app = SimpleNamespace(_async_runtime=runtime)
++        async def work():
++            return 42
++        coroutine = work()
++        try:
++            self.assertEqual(main.TelegramAdminManager.run_async(app, coroutine), 42)
++            runtime.run.assert_called_once_with(coroutine)
++        finally:
++            coroutine.close()
++
++
++if __name__ == '__main__':
++    unittest.main()

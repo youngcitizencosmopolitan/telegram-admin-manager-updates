@@ -1,0 +1,239 @@
+--- /dev/null
++++ b/app/tests/test_managed_application_runtime.py
+@@ -0,0 +1,236 @@
++import asyncio
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import telegram_admin_manager as main
++from tam_core.operations import OperationRegistry
++
++
++class ManagedApplicationTests(unittest.TestCase):
++    def app(self):
++        app = main.TelegramAdminManager.__new__(main.TelegramAdminManager)
++        app._runtime_enabled = True
++        app._runtime_lock = threading.Lock()
++        app._async_runtime = None
++        app._closed = False
++        app.store = SimpleNamespace(data={})
++        app._operations = OperationRegistry()
++        app._worker_pool = None
++        app._admin_auto_pending = {}
++        app._refresh_operations_status = Mock()
++        app.ui_call = lambda f: f()
++        app.log = Mock()
++        app._write_log = Mock()
++        def cleanup():
++            app._closed = True
++            app._operations.cancel_all()
++            runtime = app.__dict__.get('_async_runtime')
++            if runtime is not None:
++                runtime.shutdown()
++            if app._worker_pool is not None:
++                app._worker_pool.shutdown(wait=True, cancel_futures=True)
++        self.addCleanup(cleanup)
++        return app
++
++    def test_read_during_upload_shares_connection_despite_different_flood_options(self):
++        app = self.app()
++        made, closed = [], []
++        class Client:
++            def __init__(self, *args, **kwargs):
++                made.append(kwargs)
++            async def connect(self):
++                pass
++            async def disconnect(self):
++                closed.append(True)
++            async def get_me(self):
++                return 'account'
++            async def upload_file(self, started, finish):
++                started.set()
++                await finish.wait()
++                return 'uploaded'
++        async def scenario():
++            upload = app._new_telegram_client('sessions/a', 1, 'test', flood_sleep_threshold=60)
++            await upload.connect()
++            started, finish = asyncio.Event(), asyncio.Event()
++            sending = asyncio.create_task(upload.upload_file(started, finish))
++            await started.wait()
++            read = app._new_telegram_client('sessions/a', 1, 'test', flood_sleep_threshold=0)
++            await asyncio.wait_for(read.connect(), .5)
++            self.assertEqual(await read.get_me(), 'account')
++            self.assertFalse(sending.done())
++            await read.disconnect()
++            finish.set()
++            self.assertEqual(await sending, 'uploaded')
++            await upload.disconnect()
++        with patch.object(main, 'TelegramClient', Client):
++            app.run_async(scenario())
++        self.assertEqual(len(made), 1)
++        self.assertEqual(made[0]['flood_sleep_threshold'], 60)
++
++    def test_cancel_one_managed_operation_keeps_another_running(self):
++        app = self.app()
++        first_started, second_started = threading.Event(), threading.Event()
++        first_finished, second_finished = threading.Event(), threading.Event()
++        finish_second = threading.Event()
++        async def first():
++            first_started.set()
++            try:
++                await asyncio.Event().wait()
++            finally:
++                first_finished.set()
++        async def second():
++            second_started.set()
++            try:
++                while not finish_second.is_set():
++                    await asyncio.sleep(.01)
++            finally:
++                second_finished.set()
++        app.run_worker(lambda: app.run_async(first()), 'first')
++        app.run_worker(lambda: app.run_async(second()), 'second')
++        self.assertTrue(first_started.wait(1))
++        self.assertTrue(second_started.wait(1))
++        one = next(row for row in app._operations.snapshot() if row['label'] == 'first')
++        app._operations.cancel(one['id'])
++        self.assertTrue(first_finished.wait(1))
++        self.assertFalse(second_finished.is_set())
++        finish_second.set()
++        self.assertTrue(second_finished.wait(1))
++
++    def test_auth_staging_client_physically_closes_before_file_swap(self):
++        app = self.app()
++        closed = []
++        class Client:
++            def __init__(self, path, *args, **kwargs):
++                self.path = path
++            async def connect(self):
++                pass
++            async def disconnect(self):
++                closed.append(self.path)
++        async def authenticate():
++            client = app._new_telegram_client('sessions/auth-staging', 1, 'test')
++            await client.connect()
++            await client.disconnect()
++            self.assertEqual(closed, ['sessions/auth-staging'])
++        with patch.object(main, 'TelegramClient', Client):
++            app.run_async(authenticate(), exclusive_session='sessions/original')
++
++    def test_new_auth_client_physically_closes_before_failed_session_delete(self):
++        app = self.app()
++        closed = []
++        class Client:
++            def __init__(self, *args, **kwargs):
++                pass
++            async def connect(self):
++                pass
++            async def disconnect(self):
++                closed.append(True)
++        async def authenticate():
++            client = app._new_telegram_client('sessions/new-auth', 1, 'test')
++            await client.connect()
++            await client.disconnect()
++            self.assertEqual(closed, [True])
++        with patch.object(main, 'TelegramClient', Client):
++            app.run_async(authenticate(), auth_workflow=True)
++
++    def test_cancelled_queued_worker_runs_completion_cleanup(self):
++        app = self.app()
++        release = threading.Event()
++        started = [threading.Event() for _ in range(8)]
++        cleaned = threading.Event()
++        def occupied(event):
++            event.set()
++            release.wait(2)
++        try:
++            for index, event in enumerate(started):
++                app.run_worker(lambda event=event: occupied(event), str(index))
++            for event in started:
++                self.assertTrue(event.wait(1))
++            app.run_worker(lambda: None, 'queued', on_finished=cleaned.set)
++            row = next(row for row in app._operations.snapshot() if row['label'] == 'queued')
++            app._operations.cancel(row['id'])
++            release.set()
++            self.assertTrue(cleaned.wait(1))
++        finally:
++            release.set()
++
++    def test_ui_cancel_of_queued_worker_cleans_up_before_pool_is_free(self):
++        app = self.app()
++        release, cleaned = threading.Event(), threading.Event()
++        started = [threading.Event() for _ in range(8)]
++        app.busy_label = Mock()
++        app._busy = False
++        app.after = Mock(return_value='scheduled')
++        def occupied(event):
++            event.set()
++            release.wait(2)
++        try:
++            for index, event in enumerate(started):
++                app.run_worker(lambda event=event: occupied(event), str(index))
++            for event in started:
++                self.assertTrue(event.wait(1))
++            app.run_worker(lambda: None, 'queued-ui', on_finished=cleaned.set)
++            row = next(row for row in app._operations.snapshot() if row['label'] == 'queued-ui')
++            app._operations.cancel(row['id'])
++            main.TelegramAdminManager._refresh_operations_status(app)
++            self.assertTrue(cleaned.is_set(), 'queued cancellation waited for an occupied worker')
++            self.assertEqual(next(row for row in app._operations.snapshot() if row['label'] == 'queued-ui')['status'], 'cancelled')
++        finally:
++            release.set()
++
++    def test_new_phone_sessions_are_unique_even_with_the_same_clock_second(self):
++        paths = []
++        class Client:
++            async def connect(self):
++                raise RuntimeError('test cancellation')
++            async def disconnect(self):
++                pass
++        app = SimpleNamespace(_api_credentials=lambda: (1, 'test'),
++            _new_telegram_client=lambda path, *args: paths.append(path) or Client(),
++            _delete_session_files=Mock())
++        async def scenario():
++            for _ in range(2):
++                with self.assertRaisesRegex(RuntimeError, 'test cancellation'):
++                    await main.TelegramAdminManager._add_account_async(app, '+1234567890', 'test')
++        with patch.object(main.time, 'time', return_value=1234):
++            asyncio.run(scenario())
++        self.assertEqual(len(set(paths)), 2)
++
++    def test_admin_safety_marks_are_isolated_between_operations(self):
++        app = self.app()
++        marked, cleared = threading.Event(), threading.Event()
++        results, errors = {}, []
++        async def first():
++            app._admin_safety_disabled_sessions.add('blocked-in-first')
++            marked.set()
++            while not cleared.is_set():
++                await asyncio.sleep(.005)
++            return set(app._admin_safety_disabled_sessions)
++        async def second():
++            app._admin_safety_disabled_sessions.clear()
++            app._admin_safety_disabled_sessions.add('blocked-in-second')
++            cleared.set()
++            return set(app._admin_safety_disabled_sessions)
++        def run(name, coroutine):
++            try:
++                results[name] = app.run_async(coroutine, operation=app._operations.start(name))
++            except BaseException as exc:
++                errors.append(exc)
++        one = threading.Thread(target=run, args=('first', first()))
++        one.start()
++        try:
++            self.assertTrue(marked.wait(1))
++            two = threading.Thread(target=run, args=('second', second()))
++            two.start()
++            two.join(1)
++            one.join(1)
++            self.assertFalse(errors)
++            self.assertEqual(results, {'first': {'blocked-in-first'}, 'second': {'blocked-in-second'}})
++        finally:
++            cleared.set()
++            one.join(1)
++
++
++if __name__ == '__main__':
++    unittest.main()

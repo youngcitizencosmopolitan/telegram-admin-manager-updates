@@ -1,0 +1,12 @@
+--- a/app/tam_ui/proxy_manager.py
++++ b/app/tam_ui/proxy_manager.py
+@@ -68,7 +68,8 @@
+         try:
+             proxies = self.manager.list_proxies()
+             accounts = self.app.store.accounts()
+-            rows = [(account.session, account.display, self.manager.route_label(account.session)) for account in accounts]
++            route_label = getattr(self.app, 'proxy_route_status', self.manager.route_label)
++            rows = [(account.session, account.display, route_label(account.session)) for account in accounts]
+         except Exception as error:
+             self._error(error)
+             return

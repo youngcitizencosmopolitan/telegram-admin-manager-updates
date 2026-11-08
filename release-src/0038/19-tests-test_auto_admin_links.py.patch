@@ -1,0 +1,55 @@
+--- a/app/tests/test_auto_admin_links.py
++++ b/app/tests/test_auto_admin_links.py
+@@ -28,7 +28,7 @@
+         async def promote(**kw):
+             self.plans.append(kw)
+         app._promote_many_async = promote
+-        def worker(fn, text):
++        def worker(fn, text, **kwargs):
+             self.workers.append(fn)
+             app.set_busy(True, text)
+         app.run_worker = worker
+@@ -138,6 +138,7 @@
+ 
+     def test_background_upload_yields_before_automatic_promotions(self):
+         app = self.configure()
++        app._runtime_enabled = False  # Legacy fallback still serializes session owners.
+         yields, resumes = [], []
+         app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
+             request_background_yield=lambda: yields.append(True) or True,
+@@ -154,6 +155,19 @@
+         app._foreground_takeover_pending = False
+         self.flush()
+         self.assertEqual(len(self.workers), 1)
++        self.finish()
++
++    def test_managed_promotions_do_not_interrupt_background_upload(self):
++        app = self.configure()
++        yields = []
++        app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
++            request_background_yield=lambda: yields.append(True) or True)
++        app._busy = True
++        self.add('@group_one\n')
++        self.flush()
++        self.assertEqual(yields, [])
++        self.assertEqual(len(self.workers), 1)
++        self.assertFalse(app._foreground_takeover_pending)
+         self.finish()
+ 
+     def test_manual_processing_consumes_pending_links_without_a_second_batch(self):
+@@ -197,6 +211,7 @@
+ 
+     def test_cancelled_handoff_resumes_background_queue_without_admin_worker(self):
+         app = self.configure()
++        app._runtime_enabled = False  # Legacy fallback still serializes session owners.
+         callbacks, resumes = [], []
+         app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
+             request_background_yield=lambda: True, resume_queue=lambda: resumes.append(True))
+@@ -245,6 +260,7 @@
+ 
+     def test_manual_handoff_cancelled_by_empty_list_also_resumes_uploads(self):
+         app = self.configure()
++        app._runtime_enabled = False  # Legacy fallback still serializes session owners.
+         callbacks, resumes = [], []
+         app.batch_uploader = SimpleNamespace(background_upload_active=lambda: True,
+             request_background_yield=lambda: True, resume_queue=lambda: resumes.append(True))

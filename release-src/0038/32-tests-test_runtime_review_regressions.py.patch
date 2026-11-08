@@ -1,0 +1,104 @@
+--- /dev/null
++++ b/app/tests/test_runtime_review_regressions.py
+@@ -0,0 +1,101 @@
++import asyncio
++import threading
++import unittest
++
++from tam_core.runtime import AsyncRuntime
++
++
++class RuntimeReviewTests(unittest.TestCase):
++    def setUp(self):
++        self.runtime = AsyncRuntime()
++        self.addCleanup(self.runtime.shutdown)
++
++    def test_idle_disconnected_client_reconnects_before_reuse(self):
++        class Client:
++            def __init__(self):
++                self.connected = False
++                self.connections = 0
++            def is_connected(self):
++                return self.connected
++            async def connect(self):
++                self.connected = True
++                self.connections += 1
++            async def disconnect(self):
++                self.connected = False
++        client = Client()
++        async def scenario():
++            first = self.runtime.broker.handle('demo', lambda: client, keepalive=True)
++            await first.connect()
++            await first.disconnect()
++            client.connected = False
++            second = self.runtime.broker.handle('demo', lambda: client, keepalive=True)
++            await second.connect()
++            self.assertTrue(client.is_connected())
++            self.assertEqual(client.connections, 2)
++            await second.disconnect()
++        self.runtime.run(scenario())
++
++    def test_cancelling_idle_eviction_waits_cleanup_without_poisoning_session(self):
++        async def scenario():
++            started, finish = asyncio.Event(), asyncio.Event()
++            class Client:
++                async def connect(self):
++                    pass
++                async def disconnect(self):
++                    started.set()
++                    await finish.wait()
++            client = Client()
++            first = self.runtime.broker.handle('demo', lambda: client, options_key='old', keepalive=True)
++            await first.connect()
++            await first.disconnect()
++            next_handle = self.runtime.broker.handle('demo', Client, options_key='new', keepalive=True)
++            pending = asyncio.create_task(next_handle.connect())
++            await started.wait()
++            pending.cancel()
++            finish.set()
++            with self.assertRaises(asyncio.CancelledError):
++                await pending
++            await next_handle.connect()
++            await next_handle.disconnect()
++        self.runtime.run(scenario())
++
++    def test_cooperative_stop_wakes_transfer_waiter(self):
++        async def scenario():
++            stop = threading.Event()
++            async with self.runtime.transfer_slot('a', lambda: 1):
++                async def wait():
++                    async with self.runtime.transfer_slot('b', lambda: 1, cancelled=stop.is_set):
++                        self.fail('stopped waiter acquired a slot')
++                pending = asyncio.create_task(wait())
++                await asyncio.sleep(0)
++                stop.set()
++                with self.assertRaises(asyncio.CancelledError):
++                    await asyncio.wait_for(pending, .5)
++        self.runtime.run(scenario())
++
++    def test_account_lease_does_not_hold_global_network_capacity(self):
++        async def scenario():
++            async with self.runtime.transfer_slot('paused-account', lambda: 100000):
++                async with self.runtime.network_slot(lambda: 1):
++                    pass
++        self.runtime.run(scenario())
++
++    def test_global_network_capacity_and_cooperative_stop(self):
++        async def scenario():
++            stop = threading.Event()
++            async with self.runtime.network_slot(lambda: 1):
++                async def wait():
++                    async with self.runtime.network_slot(lambda: 1, cancelled=stop.is_set):
++                        self.fail('stopped request consumed network capacity')
++                pending = asyncio.create_task(wait())
++                await asyncio.sleep(0)
++                stop.set()
++                with self.assertRaises(asyncio.CancelledError):
++                    await asyncio.wait_for(pending, .5)
++            async with self.runtime.network_slot(lambda: 1):
++                pass
++        self.runtime.run(scenario())
++
++
++if __name__ == '__main__':
++    unittest.main()

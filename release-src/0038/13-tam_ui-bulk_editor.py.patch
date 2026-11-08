@@ -1,0 +1,120 @@
+--- /dev/null
++++ b/app/tam_ui/bulk_editor.py
+@@ -0,0 +1,117 @@
++"""Explicit selected-field edits; unchecked fields are never part of a command."""
++import tkinter as tk
++from types import SimpleNamespace
++from tkinter import messagebox, ttk
++from tam_ui.scrollable import ScrollableFrame
++
++FIELDS = (
++    ("caption", "Подпись", str, ""),
++    ("silent", "Тихая отправка", bool, False),
++    ("streaming", "Streaming MP4", bool, True),
++    ("delay", "Задержка публикаций, сек.", float, 0),
++    ("parallel_auto", "Параллельность автоматически", bool, True),
++    ("parallel", "Лимит одновременных файлов", int, 2),
++    ("use_all_accounts", "Все аккаунты автоматически", bool, True),
++    ("account_sessions", "Выбранные аккаунты", list, []),
++    ("recursive", "Подпапки", bool, True),
++    ("send_videos", "Отправлять видео", bool, True),
++    ("send_photos", "Отправлять фото", bool, False),
++    ("monitor_interval", "Интервал мониторинга, сек.", int, 60),
++)
++
++def selected_patch(choices):
++    result = {}
++    for key, enabled, text, kind in choices:
++        if not enabled:
++            continue
++        if kind is bool:
++            if text not in ("Да", "Нет"):
++                raise ValueError("Для отмеченного логического поля выберите Да или Нет.")
++            value = text == "Да"
++        elif kind is list:
++            value = list(dict.fromkeys(s.strip() for s in text.split(",") if s.strip()))
++        else:
++            value = kind(text)
++        result[key] = value
++    return result
++
++class BulkFieldEditor(tk.Toplevel):
++    def __init__(self, parent, records, *, monitor=False, validate=None, accounts=()):
++        super().__init__(parent)
++        self.result = None
++        self.title(f"Общие параметры — выбрано: {len(records)}")
++        self.transient(parent)
++        self.resizable(True, True)
++        self.columnconfigure(0, weight=1)
++        self.rowconfigure(1, weight=1)
++        ttk.Label(self, text="Отметьте только изменяемые поля. Разные значения обозначены явно.\nИзменения применятся к следующим файлам; текущая передача завершится со своим снимком.", wraplength=min(700, self.winfo_screenwidth()-64)).grid(row=0,column=0,sticky="w",padx=12,pady=12)
++        self.form_scroll = ScrollableFrame(self)
++        self.form_scroll.grid(row=1, column=0, sticky="nsew")
++        host = self.form_scroll.content
++        host.columnconfigure(2, weight=1)
++        self.choices = []
++        fields = list(FIELDS) + [("monitor_folder" if monitor else "enabled", "Мониторинг включён" if monitor else "Задание включено", bool, True)]
++        for row, (key, label, kind, default) in enumerate(fields):
++            values = [r.get(key, default) for r in records]
++            mixed = any(v != values[0] for v in values[1:])
++            value = values[0]
++            text = "— разные значения —" if mixed else ("Да" if value else "Нет") if kind is bool else ", ".join(value) if kind is list else str(value)
++            enabled, variable = tk.BooleanVar(self, value=False), tk.StringVar(self, value=text)
++            ttk.Checkbutton(host, variable=enabled).grid(row=row,column=0,padx=(12,2))
++            ttk.Label(host, text=label + (' (разные значения)' if mixed else '')).grid(row=row,column=1,sticky="w",padx=6,pady=3)
++            if kind is list:
++                entry = self.account_selector = tk.Listbox(host, selectmode=tk.EXTENDED,
++                    exportselection=False, height=3, width=42)
++                common = set(values[0])
++                for existing in values[1:]:
++                    common.intersection_update(existing)
++                for index, account in enumerate(accounts):
++                    entry.insert('end', account.display)
++                    if account.session in common:
++                        entry.selection_set(index)
++                identities = tuple(account.session for account in accounts)
++                variable = SimpleNamespace(get=lambda entry=entry, ids=identities:
++                    ','.join(ids[index] for index in entry.curselection()))
++                def select_all(_event, entry=entry):
++                    entry.selection_set(0, 'end')
++                    return 'break'
++                entry.bind('<Control-a>', select_all)
++            else:
++                entry = ttk.Combobox(host,textvariable=variable,values=("Да","Нет"),state="readonly") if kind is bool else ttk.Entry(host,textvariable=variable,width=42)
++            entry.grid(row=row,column=2,sticky="ew",padx=(6,12),pady=3)
++            self.choices.append((key,enabled,variable,kind))
++        buttons = self.buttons = ttk.Frame(self)
++        buttons.grid(row=2,column=0,sticky="e",padx=12,pady=12)
++        def apply():
++            try:
++                patch = self._collect_patch()
++                if validate:
++                    validate(patch)
++                self.result = patch
++            except (ValueError, TypeError) as exc:
++                messagebox.showerror("Параметры не сохранены", str(exc), parent=self)
++                return
++            self.destroy()
++        ttk.Button(buttons,text="Отмена",command=self.destroy).pack(side="left",padx=6)
++        ttk.Button(buttons,text="Применить отмеченные поля",command=apply).pack(side="left")
++        self.bind('<Escape>', lambda _event: self.destroy())
++        self.update_idletasks()
++        available_width = max(240, self.winfo_screenwidth()-40)
++        available_height = max(240, self.winfo_screenheight()-80)
++        width = min(available_width, max(self.winfo_reqwidth(), host.winfo_reqwidth()+30))
++        height = min(available_height, self.winfo_reqheight()+host.winfo_reqheight())
++        x = max(10, min(parent.winfo_rootx()+(parent.winfo_width()-width)//2, self.winfo_screenwidth()-width-10))
++        y = max(10, min(parent.winfo_rooty()+(parent.winfo_height()-height)//2, self.winfo_screenheight()-height-40))
++        self.geometry(f'{width}x{height}+{x}+{y}')
++        self.minsize(min(width, 440), min(height, 280))
++        self.grab_set()
++
++    def _collect_patch(self):
++        patch = selected_patch([(key,enabled.get(),var.get(),kind) for key,enabled,var,kind in self.choices])
++        if 'account_sessions' in patch:
++            if not patch['account_sessions']:
++                raise ValueError('Выберите хотя бы один аккаунт.')
++            if patch.get('use_all_accounts') is True:
++                raise ValueError('Выберите автоматический режим или конкретный список аккаунтов.')
++            patch['use_all_accounts'] = False
++        return patch

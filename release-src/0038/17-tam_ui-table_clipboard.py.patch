@@ -1,0 +1,378 @@
+--- /dev/null
++++ b/app/tam_ui/table_clipboard.py
+@@ -0,0 +1,375 @@
++"""Shared multi-selection and clipboard behaviour for Treeview and Listbox tables.
++
++Only presentation lives here: reading rows, copying them, and keeping the view
++stable while a parent rebuilds it. Bulk operations belong to the parent.
++"""
++from __future__ import annotations
++
++import csv
++import io
++import re
++import sys
++import tkinter as tk
++from contextlib import contextmanager
++from dataclasses import dataclass
++from tkinter import ttk
++from typing import Callable, Iterable, Iterator, Sequence
++
++Provider = Callable[[str], object]
++
++_SHIFT_MASK = 0x1
++_ALT_MASK = 0x20000 if sys.platform == 'win32' else 0x8
++# Windows virtual keycodes follow the physical key whatever the active layout is.
++# Elsewhere keycodes are hardware-specific, so only keysyms can be trusted.
++_WINDOWS_KEYCODES = {65: 'a', 67: 'c'}
++_KEYSYM_LETTERS = {'a': 'a', 'cyrillic_ef': 'a', 'c': 'c', 'cyrillic_es': 'c'}
++
++# A second gate behind the explicit allowlist: a credential column stays out of
++# the clipboard even if somebody configures it by mistake.
++_SECRET_COLUMN = re.compile(
++    r'pass(word|wd|phrase)?\b|passw|secret|token|api[\s_-]*(hash|id|key)|session|phone|2fa|'
++    r'auth(?!or)|cookie|credential|парол|токен|секрет|сесси|телефон',
++    re.IGNORECASE,
++)
++_SORT_MARKER = re.compile(r'\s*[▲▼↑↓]\s*$')
++_PROVIDER_ERRORS = (KeyError, IndexError, ValueError, TypeError, AttributeError, tk.TclError)
++_SELECTABLE_MODES = {'extended', 'multiple'}
++
++_KIND_LABELS = {
++    'rows': ('Копировать строку', 'Копировать строки ({n})'),
++    'paths': ('Копировать путь', 'Копировать пути ({n})'),
++    'links': ('Копировать ссылку', 'Копировать ссылки ({n})'),
++    'ids': ('Копировать ID', 'Копировать ID ({n})'),
++}
++
++
++def to_tsv(rows: Iterable[Sequence[object]]) -> str:
++    """Format rows as spreadsheet-ready TSV.
++
++    LF is used on purpose: Tk expands every LF to CRLF for the Windows clipboard,
++    so CRLF here would become CR CR LF. Bare CRs are normalised because not every
++    supported ``csv`` version quotes them when the line terminator is LF.
++    """
++    buffer = io.StringIO()
++    writer = csv.writer(buffer, dialect='excel-tab', lineterminator='\n')
++    for row in rows:
++        writer.writerow([str(cell).replace('\r\n', '\n').replace('\r', '\n') for cell in row])
++    return buffer.getvalue().removesuffix('\n')
++
++
++def physical_ctrl_letter(event) -> str | None:
++    """Return 'a' or 'c' when the event is plain Ctrl+<that physical key>."""
++    state = int(getattr(event, 'state', 0) or 0)
++    if state & (_SHIFT_MASK | _ALT_MASK):  # Windows reports AltGr as Ctrl+Alt.
++        return None
++    keysym = str(getattr(event, 'keysym', '') or '').casefold()
++    if keysym in _KEYSYM_LETTERS:
++        return _KEYSYM_LETTERS[keysym]
++    if sys.platform == 'win32':
++        return _WINDOWS_KEYCODES.get(int(getattr(event, 'keycode', -1) or -1))
++    return None
++
++
++def telegram_link(target: object) -> str:
++    """Return a shareable link for a chat target, or '' for ids and plain names."""
++    text = str(target or '').strip()
++    lowered = text.casefold()
++    if lowered.startswith(('http://', 'https://')):
++        return text
++    if lowered.startswith(('t.me/', 'telegram.me/')):
++        return 'https://' + text
++    if text.startswith('@') and len(text) > 1:
++        return 'https://t.me/' + text[1:]
++    return ''
++
++
++def _is_listbox(widget) -> bool:
++    return isinstance(widget, tk.Listbox)
++
++
++def _displayed_rows(tree: ttk.Treeview, parent: str = '') -> list[str]:
++    rows: list[str] = []
++    for iid in tree.get_children(parent):
++        rows.append(str(iid))
++        if tree.get_children(iid) and tree.tk.getboolean(tree.item(iid, 'open')):
++            rows.extend(_displayed_rows(tree, iid))
++    return rows
++
++
++def _selected_with_hidden_rows_last(tree: ttk.Treeview) -> list[str]:
++    selected = {str(iid) for iid in tree.selection()}
++    ordered = [iid for iid in _displayed_rows(tree) if iid in selected]
++    seen = set(ordered)
++    return ordered + [str(iid) for iid in tree.selection() if str(iid) not in seen]
++
++
++def selected_items(widget) -> list[str]:
++    """Selected row identifiers in on-screen order; Listbox rows are str indices."""
++    if _is_listbox(widget):
++        return [str(index) for index in widget.curselection()]
++    return _selected_with_hidden_rows_last(widget)
++
++
++def single_selection(widget) -> str | None:
++    """The selected row when exactly one is selected, otherwise None."""
++    items = widget.curselection() if _is_listbox(widget) else widget.selection()
++    return str(items[0]) if len(items) == 1 else None
++
++
++@dataclass(frozen=True)
++class ViewState:
++    selection: tuple[str, ...]
++    focus: str
++    yview: float
++    xview: float
++
++    def remap(self, mapper: Callable[[str], str]) -> 'ViewState':
++        """Translate row ids for tables whose ids change on every rebuild."""
++        return ViewState(tuple(filter(None, map(mapper, self.selection))),
++                         mapper(self.focus) if self.focus else '', self.yview, self.xview)
++
++
++def _listbox_texts(box: tk.Listbox) -> list[str]:
++    return [str(text) for text in box.get(0, 'end')]
++
++
++def capture_view(widget) -> ViewState:
++    """Remember selection, keyboard row and scroll position.
++
++    Listbox rows have no identity, so they are remembered by their text.
++    """
++    if _is_listbox(widget):
++        texts = _listbox_texts(widget)
++        active = widget.index('active')
++        selection = tuple(texts[i] for i in widget.curselection())
++        focus = texts[active] if 0 <= active < len(texts) else ''
++    else:
++        selection = tuple(str(iid) for iid in widget.selection())
++        focus = str(widget.focus())
++    return ViewState(selection, focus, widget.yview()[0], widget.xview()[0])
++
++
++def restore_view(widget, state: ViewState) -> None:
++    """Reapply a captured view; rows that no longer exist are simply dropped."""
++    if _is_listbox(widget):
++        texts = _listbox_texts(widget)
++        wanted = {i for i, text in enumerate(texts) if text in set(state.selection)}
++        if wanted != set(widget.curselection()):
++            widget.selection_clear(0, 'end')
++            for index in sorted(wanted):
++                widget.selection_set(index)
++        if state.focus in texts:
++            widget.activate(texts.index(state.focus))
++    else:
++        keep = [iid for iid in state.selection if widget.exists(iid)]
++        # selection_set always queues <<TreeviewSelect>>, so only call it on a real change.
++        if set(keep) != {str(iid) for iid in widget.selection()}:
++            widget.selection_set(keep)
++        if state.focus and widget.exists(state.focus):
++            widget.focus(state.focus)
++    widget.yview_moveto(state.yview)
++    widget.xview_moveto(state.xview)
++
++
++@contextmanager
++def preserve_view(widget) -> Iterator[None]:
++    state = capture_view(widget)
++    try:
++        yield
++    finally:
++        restore_view(widget, state)
++
++
++class TableActions:
++    def __init__(self, widget, *, columns: Sequence[str] | None, header: str | None,
++                 path_of: Provider | None, link_of: Provider | None, id_of: Provider | None,
++                 labels: dict[str, tuple[str, str]] | None):
++        self.widget = widget
++        self.columns = tuple(columns or ())
++        self.header = header
++        self.providers = {'paths': path_of, 'links': link_of, 'ids': id_of}
++        self.labels = {**_KIND_LABELS, **(labels or {})}
++
++    # ---------- reading rows ----------
++    def _shows(self, part: str) -> bool:
++        # Tk hands 'show' back as index objects, which never compare equal to str.
++        return part in {str(item) for item in self.widget.tk.splitlist(self.widget.cget('show'))}
++
++    def _visible_columns(self) -> list[str]:
++        tree = self.widget
++        split = tree.tk.splitlist
++        columns = [str(c) for c in split(tree.cget('columns'))]
++        display = [str(c) for c in split(tree.cget('displaycolumns'))]
++        if display == ['#all']:
++            shown = columns
++        else:
++            shown = [columns[int(c)] if c.isdigit() else c for c in display]
++        if self._shows('tree'):
++            shown = ['#0', *shown]
++        return shown
++
++    def _heading(self, column: str) -> str:
++        return _SORT_MARKER.sub('', str(self.widget.heading(column, 'text') or ''))
++
++    def _copyable_columns(self) -> list[str]:
++        return [c for c in self._visible_columns() if c in self.columns
++                and not _SECRET_COLUMN.search(c) and not _SECRET_COLUMN.search(self._heading(c))]
++
++    def _table_rows(self, items: Sequence[str]) -> list[list[str]]:
++        widget = self.widget
++        if _is_listbox(widget):
++            rows = [[str(widget.get(int(i)))] for i in items]
++            return ([[self.header]] + rows) if self.header else rows
++        columns = self._copyable_columns()
++        rows = [[self._cell(iid, column) for column in columns] for iid in items]
++        if self._shows('headings'):
++            rows.insert(0, [self._heading(column) for column in columns])
++        return rows
++
++    def _cell(self, iid: str, column: str) -> str:
++        tree = self.widget
++        return str(tree.item(iid, 'text') if column == '#0' else tree.set(iid, column))
++
++    def _provided(self, kind: str, items: Sequence[str]) -> list[str]:
++        provider = self.providers.get(kind)
++        if provider is None:
++            return []
++        values = []
++        for iid in items:
++            try:
++                value = provider(iid)
++            except _PROVIDER_ERRORS:
++                continue
++            if value not in (None, ''):
++                values.append(str(value))
++        return values
++
++    # ---------- commands ----------
++    def _put_on_clipboard(self, text: str) -> bool:
++        try:
++            self.widget.clipboard_clear()
++            self.widget.clipboard_append(text)
++        except tk.TclError:  # Another program may be holding the Windows clipboard.
++            return False
++        return True
++
++    def copy_rows(self) -> bool:
++        items = selected_items(self.widget)
++        return bool(items) and self._put_on_clipboard(to_tsv(self._table_rows(items)))
++
++    def _copy_lines(self, kind: str) -> bool:
++        values = self._provided(kind, selected_items(self.widget))
++        return bool(values) and self._put_on_clipboard('\n'.join(values))
++
++    def copy_paths(self) -> bool:
++        return self._copy_lines('paths')
++
++    def copy_links(self) -> bool:
++        return self._copy_lines('links')
++
++    def copy_ids(self) -> bool:
++        return self._copy_lines('ids')
++
++    def select_all(self) -> None:
++        widget = self.widget
++        if str(widget.cget('selectmode')) not in _SELECTABLE_MODES:
++            return
++        if _is_listbox(widget):
++            widget.selection_set(0, 'end')
++        else:
++            widget.selection_set(_displayed_rows(widget))
++
++    def on_key(self, event) -> str | None:
++        letter = physical_ctrl_letter(event)
++        if letter is None:
++            return None
++        if letter == 'a':
++            self.select_all()
++        else:
++            self.copy_rows()
++        # Always consumed: the global text handler would otherwise copy whatever
++        # happens to own the PRIMARY selection in place of table rows.
++        return 'break'
++
++    # ---------- context menu ----------
++    def _row_at(self, event) -> str:
++        widget = self.widget
++        if not _is_listbox(widget):
++            return str(widget.identify_row(event.y))
++        if widget.size() == 0:
++            return ''
++        index = widget.nearest(event.y)
++        box = widget.bbox(index)  # nearest() answers even below the last row.
++        return str(index) if box and box[1] <= event.y <= box[1] + box[3] else ''
++
++    def prepare_context(self, event) -> list[str]:
++        """Apply right-click selection rules and return the rows a menu acts on."""
++        widget = self.widget
++        row = self._row_at(event)
++        if not row:
++            return []
++        widget.focus_set()
++        if row not in selected_items(widget):
++            if _is_listbox(widget):
++                widget.selection_clear(0, 'end')
++                widget.selection_set(int(row))
++                widget.activate(int(row))
++            else:
++                widget.selection_set(row)
++                widget.focus(row)
++        return selected_items(widget)
++
++    def _label(self, kind: str, count: int) -> str:
++        one, many = self.labels[kind]
++        return one if count == 1 else many.format(n=count)
++
++    def add_copy_items(self, menu: tk.Menu) -> None:
++        items = selected_items(self.widget)
++        if not items:
++            return
++        menu.add_command(label=self._label('rows', len(items)), command=self.copy_rows)
++        commands = (('paths', self.copy_paths), ('links', self.copy_links), ('ids', self.copy_ids))
++        for kind, command in commands:
++            count = len(self._provided(kind, items))
++            if count:
++                menu.add_command(label=self._label(kind, count), command=command)
++
++    def show_copy_menu(self, event) -> None:
++        menu = tk.Menu(self.widget, tearoff=False)
++        self.add_copy_items(menu)
++        if menu.index('end') is None:
++            return
++        try:
++            menu.tk_popup(event.x_root, event.y_root)
++        finally:
++            menu.grab_release()
++
++    def on_right_click(self, event) -> None:
++        if self.prepare_context(event):
++            self.show_copy_menu(event)
++
++
++def install_table_actions(widget, *, columns: Sequence[str] | None = None, header: str | None = None,
++                          path_of: Provider | None = None, link_of: Provider | None = None,
++                          id_of: Provider | None = None, labels: dict[str, tuple[str, str]] | None = None,
++                          install_menu: bool = True) -> TableActions:
++    """Attach Ctrl+A/Ctrl+C and copy commands to one table.
++
++    ``columns`` is the allowlist for Treeviews: a column is copied only when it is
++    both listed here and currently visible. There is deliberately no default.
++    Bind directly on the widget so the handlers run before the global ``bind_all``
++    text shortcuts. Pass ``install_menu=False`` if the owner has its own menu.
++    """
++    if columns is None and not _is_listbox(widget):
++        raise ValueError('A Treeview needs an explicit allowlist of copyable columns')
++    actions = TableActions(widget, columns=columns, header=header, path_of=path_of,
++                           link_of=link_of, id_of=id_of, labels=labels)
++    widget.bind('<Control-KeyPress>', actions.on_key)
++    if install_menu:
++        widget.bind('<Button-3>', actions.on_right_click)
++    widget._table_actions = actions
++    return actions
++
++
++def actions_for(widget) -> TableActions | None:
++    return getattr(widget, '_table_actions', None)

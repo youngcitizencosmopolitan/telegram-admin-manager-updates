@@ -1,0 +1,1369 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -1,6 +1,9 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextvars
++import concurrent.futures
++from contextlib import asynccontextmanager
+ import base64
+ import hashlib
+ import inspect
+@@ -41,6 +44,7 @@
+     wait_seconds as telegram_wait_seconds,
+ )
+ from tam_ui.qr_dialog import QRLoginDialog
++from tam_ui.table_clipboard import actions_for, capture_view, install_table_actions, preserve_view, restore_view
+ from tam_x.launcher import build_x_planner_command
+ 
+ try:
+@@ -71,7 +75,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0037"
++APP_VERSION = "0038"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -313,7 +317,167 @@
+     pass
+ 
+ 
++_current_operation = contextvars.ContextVar('tam_operation', default=None)
++_exclusive_workflow = contextvars.ContextVar('tam_exclusive_workflow', default=False)
++_admin_safety_state = contextvars.ContextVar('tam_admin_safety_state', default=None)
++
++
+ class TelegramAdminManager(tk.Tk):
++    @property
++    def _admin_safety_disabled_sessions(self):
++        state = _admin_safety_state.get()
++        return state if state is not None else self.__dict__.setdefault('_legacy_admin_safety_state', set())
++
++    @_admin_safety_disabled_sessions.setter
++    def _admin_safety_disabled_sessions(self, value):
++        self.__dict__['_legacy_admin_safety_state'] = value
++
++    def _concurrent_enabled(self):
++        return self.__dict__.get('_runtime_enabled', False)
++
++    def _config_snapshot(self):
++        snapshot = getattr(self.store, 'snapshot', None)
++        return snapshot() if callable(snapshot) else dict(self.store.data)
++
++    def _update_config(self, fields):
++        update = getattr(self.store, 'update', None)
++        if callable(update):
++            update(fields)
++        else:
++            self.store.data.update(fields)
++            self.store.save()
++
++    def _transfer_limit(self):
++        data = TelegramAdminManager._config_snapshot(self)
++        limit = 100 if data.get('batch_global_parallel_auto', True) else max(1, min(100, int(data.get('batch_global_parallel', 4))))
++        if data.get('safety_mode', True):
++            limit = min(limit, max(1, int(data.get('safety_max_active_accounts', 4))))
++        return limit
++
++    def _route_stamp(self, session):
++        data = TelegramAdminManager._config_snapshot(self)
++        ident = data.get('account_proxies', {}).get(session)
++        return repr((ident, data.get('socks5_proxies', {}).get(ident)))
++
++    def proxy_route_status(self, session):
++        label = self.proxy_manager.route_label(session)
++        lock = self.__dict__.setdefault('_transfer_state_lock', threading.RLock())
++        with lock:
++            active = self.__dict__.get('_active_transfer_routes', {}).get(session)
++        if active is not None and active != self._route_stamp(session):
++            return label + ' — после текущего файла'
++        return label
++
++    @asynccontextmanager
++    async def transfer_slot(self, session, stop_event=None):
++        if not self.__dict__.get('_runtime_enabled', False):
++            yield
++            return
++        runtime = self._get_runtime()
++        # Account ownership spans the file. Shared network capacity is acquired
++        # separately around actual requests, so pauses/backoffs do not occupy it.
++        async with runtime.transfer_slot(str(SESSIONS_DIR / session), lambda: 100000,
++                cancelled=stop_event.is_set if stop_event is not None else None):
++            lock = self.__dict__.setdefault('_transfer_state_lock', threading.RLock())
++            with lock:
++                self.__dict__.setdefault('_active_transfer_routes', {})[session] = self._route_stamp(session)
++            try:
++                yield
++            finally:
++                with lock:
++                    self.__dict__.get('_active_transfer_routes', {}).pop(session, None)
++                pane = self.__dict__.get('proxy_pane')
++                if pane is not None:
++                    self.ui_latest(('proxy-routes',), pane.refresh)
++
++    @asynccontextmanager
++    async def network_slot(self, stop_event=None):
++        if not self.__dict__.get('_runtime_enabled', False):
++            yield
++            return
++        async with self._get_runtime().network_slot(self._transfer_limit,
++                cancelled=stop_event.is_set if stop_event is not None else None):
++            yield
++
++    @asynccontextmanager
++    async def _quick_file_client(self, account, fallback):
++        if not self.__dict__.get('_runtime_enabled', False):
++            yield fallback
++            return
++        await fallback.disconnect()
++        client = self._new_telegram_client(str(SESSIONS_DIR / account.session),
++            *self._api_credentials(), flood_sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD)
++        try:
++            await client.connect()
++            if not await client.is_user_authorized():
++                raise RuntimeError('Сессия больше не авторизована.')
++            yield client
++        finally:
++            await client.disconnect()
++
++    @asynccontextmanager
++    async def _account_mutation(self, session):
++        if not self.__dict__.get('_runtime_enabled', False):
++            yield
++            return
++        async with self._get_runtime().broker.exclusive(str(SESSIONS_DIR / session)):
++            yield
++
++    def _get_runtime(self):
++        runtime = self.__dict__.get('_async_runtime')
++        if runtime is None:
++            from tam_core.runtime import AsyncRuntime
++            with self._runtime_lock:
++                runtime = self.__dict__.get('_async_runtime')
++                if runtime is None:
++                    if self._closed:
++                        raise RuntimeError('Приложение закрыто.')
++                    runtime = self._async_runtime = AsyncRuntime()
++        return runtime
++
++    def run_async(self, coroutine, *, exclusive_session=None, auth_workflow=False, operation=None):
++        runtime = self.__dict__.get('_async_runtime')
++        if runtime is None and self.__dict__.get('_runtime_enabled', False):
++            runtime = self._get_runtime()
++        if runtime is None:
++            return asyncio.run(coroutine)
++        operation = operation or _current_operation.get()
++        if operation is None and exclusive_session is None and not auth_workflow:
++            return runtime.run(coroutine)
++
++        async def invoke():
++            token = _exclusive_workflow.set(auth_workflow or exclusive_session is not None)
++            safety_token = _admin_safety_state.set(set())
++            try:
++                if exclusive_session is None:
++                    return await coroutine
++                if operation is not None:
++                    operation.update(status='waiting', detail='Ожидает завершения передачи аккаунта')
++                async with runtime.broker.exclusive(exclusive_session):
++                    if operation is not None:
++                        operation.update(status='running', detail='')
++                    return await coroutine
++            finally:
++                _admin_safety_state.reset(safety_token)
++                _exclusive_workflow.reset(token)
++                coroutine.close()
++
++        async def watched():
++            task = asyncio.create_task(invoke())
++            try:
++                while not task.done():
++                    if operation is not None and operation.cancel_event.is_set() and not getattr(operation, 'cooperative_cancel', False):
++                        task.cancel()
++                        break
++                    await asyncio.wait({task}, timeout=.1)
++                return await task
++            finally:
++                if not task.done():
++                    task.cancel()
++                    await asyncio.gather(task, return_exceptions=True)
++        with runtime.broker.operation(operation):
++            return runtime.run(watched())
++
+     def _new_telegram_client(self, session_path, api_id, api_hash, *, proxy_session=None, _connection_options=None, **kwargs):
+         manager = self.__dict__.get('proxy_manager')
+         session = proxy_session or Path(session_path).name.removesuffix('.session')
+@@ -321,13 +485,30 @@
+             kwargs.update(_connection_options)
+         elif manager is not None:
+             kwargs.update(manager.options(session))
+-        client = TelegramClient(session_path, api_id, api_hash, **kwargs)
+         route_id = self.__dict__.get('store')
+         route_id = route_id.data.get('account_proxies', {}).get(session) if route_id is not None else None
+-        client._tam_route = f'proxy:{route_id}' if route_id else 'direct'
++        route = f'proxy:{route_id}' if route_id else 'direct'
++        if self.__dict__.get('_runtime_enabled', False):
++            runtime = self._get_runtime()
++            operation = _current_operation.get()
++            requested_flood = kwargs.get('flood_sleep_threshold', 60)
++            kwargs['flood_sleep_threshold'] = 60
++            from tam_core.managed_telegram import managed_client_type
++            client_type = managed_client_type(TelegramClient)
++            factory = lambda: client_type(session_path, api_id, api_hash, **kwargs)
++            key = (api_id, api_hash, repr(sorted(kwargs.items(), key=lambda item: item[0])))
++            handle = runtime.broker.handle(session_path, factory, options_key=key,
++                keepalive=not _exclusive_workflow.get())
++            handle._tam_route = route
++            handle._tam_flood_sleep_threshold = requested_flood
++            return handle
++        client = TelegramClient(session_path, api_id, api_hash, **kwargs)
++        client._tam_route = route
+         return client
+ 
+     def _proxy_changes_allowed(self):
++        if self._concurrent_enabled():
++            return True
+         uploader = self.__dict__.get('batch_uploader')
+         if (self.__dict__.get('_busy', False) or self.__dict__.get('_uploader_running', False)
+                 or (uploader is not None and (uploader.monitor_active or uploader.running))):
+@@ -379,7 +560,7 @@
+             return self._new_telegram_client(str(SESSIONS_DIR / session), api_id, api_hash,
+                 _connection_options=connection_options, flood_sleep_threshold=0)
+         def run():
+-            asyncio.run(compare_routes(make_client, self.upload_diagnostics, session, path, options,
++            self.run_async(compare_routes(make_client, self.upload_diagnostics, session, path, options,
+                 f'proxy:{proxy_id}', lambda: self._closed or self._proxy_benchmark_stop.is_set()))
+         self.run_worker(run, 'Сравнение: один файл, прямое подключение / назначенный прокси…')
+ 
+@@ -409,6 +590,13 @@
+         self._resume_background_queue_after_busy = False
+         self._foreground_takeover_pending = False
+         self._closed = False
++        self._runtime_enabled = True
++        self._async_runtime = None
++        self._runtime_lock = threading.Lock()
++        from tam_core.operations import OperationRegistry
++        self._operations = OperationRegistry()
++        self._worker_pool = None
++        self.bind('<Destroy>', self._runtime_destroyed, add='+')
+         self._uploader_running = False
+         self._admin_stop_event = threading.Event()
+         self._admin_auto_pending: dict[str, None] = {}
+@@ -441,6 +629,8 @@
+         from tam_core.journal_policy import JournalPolicy
+         self._journal_policy = JournalPolicy()
+         self._build_ui()
++        self._install_shared_table_actions()
++        self.busy_label.bind('<Double-Button-1>', lambda _event: self.show_operations(), add='+')
+         self._install_keyboard_shortcuts()
+         self._load_config_into_ui()
+         self.refresh_account_list()
+@@ -466,6 +656,18 @@
+                 threading.Thread(target=update_app_shortcuts, args=(icon, BASE_DIR), daemon=True).start()
+         except (OSError, ValueError, tk.TclError):
+             pass  # Cosmetic asset failures must not prevent startup.
++
++    def _install_shared_table_actions(self):
++        def visit(parent):
++            for widget in parent.winfo_children():
++                if isinstance(widget, ttk.Treeview) and actions_for(widget) is None:
++                    install_table_actions(widget, columns=('#0', *widget['columns']),
++                        install_menu=not bool(widget.bind('<Button-3>')))
++                elif isinstance(widget, tk.Listbox) and actions_for(widget) is None:
++                    install_table_actions(widget, header='Аккаунт',
++                        install_menu=not bool(widget.bind('<Button-3>')))
++                visit(widget)
++        visit(self)
+ 
+     # ---------- table sorting ----------
+     def _load_table_sort_state(self, table_id: str) -> dict[str, Any] | None:
+@@ -941,6 +1143,7 @@
+         qsb = ttk.Scrollbar(queue_card, orient="vertical", command=self.dashboard_queue_tree.yview)
+         qsb.grid(row=1, column=1, sticky="ns")
+         self.dashboard_queue_tree.configure(yscrollcommand=qsb.set)
++        install_table_actions(self.dashboard_queue_tree, columns=qcols, id_of=lambda iid: iid.removeprefix("d:"))
+         self._register_sortable_tree(self.dashboard_queue_tree, "dashboard.queue")
+ 
+         # Groups / channels catalog -----------------------------------------
+@@ -988,6 +1191,8 @@
+             self.dashboard_activity_tree.heading(col, text=title)
+             self.dashboard_activity_tree.column(col, width=width, minwidth=55, anchor="w")
+         self.dashboard_activity_tree.grid(row=1, column=0, sticky="nsew")
++        install_table_actions(self.dashboard_activity_tree, columns=("#0", *acols),
++                              path_of=lambda iid: self.batch_uploader.activity_paths.get(iid.removeprefix("d:"), ""))
+         asb = ttk.Scrollbar(activity_card, orient="vertical", command=self.dashboard_activity_tree.yview)
+         asb.grid(row=1, column=1, sticky="ns")
+         self.dashboard_activity_tree.configure(yscrollcommand=asb.set)
+@@ -1143,12 +1348,13 @@
+             if getattr(self, cache_name, None) == snapshot:
+                 return
+             setattr(self, cache_name, snapshot)
+-            target.delete(*target.get_children(""))
+-            for iid, text, values, tags in snapshot:
+-                try:
+-                    target.insert("", "end", iid=f"d:{iid}", text=text, values=values, tags=tags)
+-                except Exception:
+-                    target.insert("", "end", text=text, values=values, tags=tags)
++            with preserve_view(target):
++                target.delete(*target.get_children(""))
++                for iid, text, values, tags in snapshot:
++                    try:
++                        target.insert("", "end", iid=f"d:{iid}", text=text, values=values, tags=tags)
++                    except Exception:
++                        target.insert("", "end", text=text, values=values, tags=tags)
+         except Exception:
+             pass
+ 
+@@ -1353,7 +1559,7 @@
+             return
+         if self._group_catalog_refreshing:
+             return
+-        if self._busy:
++        if self._busy and not self._concurrent_enabled():
+             if automatic:
+                 self.after(5000, lambda: self.refresh_group_names(force=False, automatic=True))
+             else:
+@@ -1375,7 +1581,7 @@
+ 
+         def runner() -> None:
+             try:
+-                asyncio.run(self._refresh_group_names_async(targets, force=force))
++                self.run_async(self._refresh_group_names_async(targets, force=force))
+             except Exception as exc:
+                 self._write_log(f"Group metadata refresh failed: {type(exc).__name__}: {exc}\n")
+             finally:
+@@ -1428,7 +1634,7 @@
+                     continue
+                 next_remaining: list[str] = []
+                 for target in remaining:
+-                    if self._closed or self._group_catalog_abort or self._busy:
++                    if self._closed or self._group_catalog_abort or (self._busy and not self._concurrent_enabled()):
+                         return
+                     try:
+                         info = await self._resolve_target_metadata(client, target)
+@@ -1630,6 +1836,8 @@
+         ttk.Button(tools, text="Очистить", command=self._clear_visible_log).grid(row=0, column=3)
+         ttk.Checkbutton(tools, text='Подробный журнал', variable=self.verbose_journal_var,
+             command=self._save_log_verbosity).grid(row=1, column=0, columnspan=4, sticky='w', pady=(4, 0))
++        ttk.Button(tools, text='Операции…', command=self.show_operations).grid(
++            row=2, column=0, columnspan=4, sticky='w', pady=(4, 0))
+         text = tk.Text(parent, wrap="word", state="disabled", font=("Consolas", 9), padx=7, pady=7)
+         text.grid(row=1, column=0, sticky="nsew")
+         sb = ttk.Scrollbar(parent, orient="vertical", command=text.yview)
+@@ -1873,8 +2081,13 @@
+     def _channels_popup(self, event: Any) -> None:
+         try:
+             iid = self.channels_tree.identify_row(event.y)
+-            if iid:
++            if iid and iid not in self.channels_tree.selection():
+                 self.channels_tree.selection_set(iid)
++            actions = actions_for(self.channels_tree)
++            if actions is not None and not getattr(self.channels_context, '_copy_rows_installed', False):
++                self.channels_context.add_separator()
++                self.channels_context.add_command(label='Копировать выбранные строки', command=actions.copy_rows)
++                self.channels_context._copy_rows_installed = True
+             self.channels_context.tk_popup(event.x_root, event.y_root)
+         finally:
+             try:
+@@ -1903,18 +2116,19 @@
+         return [str(x) for x in self.channel_accounts_tree.selection() if str(x)]
+ 
+     def _channels_copy(self, field: str) -> None:
+-        peer_id = self._channels_selected_peer_id()
+-        if peer_id is None:
+-            return
+-        row = self.state_db.channel_get(peer_id)
+-        value = row.get(field, "")
+-        if value in (None, ""):
+-            self.log(f"Каналы: поле «{CHANNEL_COLUMN_LABELS.get(field, field)}» пустое — копировать нечего.")
+-            return
+-        if field == "link" and not str(value).startswith(("https://", "http://", "tg://")):
+-            self.log("Каналы: действующая ссылка для выбранного канала пока не сохранена.")
+-            return
+-        self.clipboard_clear(); self.clipboard_append(str(value)); self.update_idletasks()
++        values = []
++        for peer_id in self._channels_selected_peer_ids():
++            value = self.state_db.channel_get(peer_id).get(field, '')
++            if value in (None, ''):
++                continue
++            if field == 'link' and not str(value).startswith(('https://', 'http://', 'tg://')):
++                continue
++            values.append(str(value))
++        if not values:
++            return
++        self.clipboard_clear()
++        self.clipboard_append('\n'.join(values))
++        self.update_idletasks()
+ 
+     def _channels_open_selected(self) -> None:
+         peer_id = self._channels_selected_peer_id()
+@@ -2117,7 +2331,7 @@
+         peer_ids, accounts = self._channel_management_selection()
+         if not peer_ids or not accounts:
+             return
+-        self.run_worker(lambda: asyncio.run(self._channel_manage_join_async(peer_ids, accounts)), "Управление каналами: вступление…")
++        self.run_worker(lambda: self.run_async(self._channel_manage_join_async(peer_ids, accounts)), "Управление каналами: вступление…")
+ 
+     async def _channel_manage_join_async(self, peer_ids: list[int], accounts: list[Account]) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -2152,7 +2366,7 @@
+         peer_ids, accounts = self._channel_management_selection()
+         if not peer_ids or not accounts:
+             return
+-        self.run_worker(lambda: asyncio.run(self._channel_manage_promote_async(peer_ids, accounts)), "Управление каналами: права…")
++        self.run_worker(lambda: self.run_async(self._channel_manage_promote_async(peer_ids, accounts)), "Управление каналами: права…")
+ 
+     async def _channel_manage_promote_async(self, peer_ids: list[int], accounts: list[Account]) -> None:
+         all_accounts = {a.session: a for a in self.store.accounts()}
+@@ -2273,7 +2487,7 @@
+             rank = rank_var.get().strip()
+             dialog.destroy()
+             self.run_worker(
+-                lambda: asyncio.run(self._channel_manage_set_rights_async(peer_ids, accounts, requested, rank)),
++                lambda: self.run_async(self._channel_manage_set_rights_async(peer_ids, accounts, requested, rank)),
+                 "Управление каналами: изменяю права…",
+             )
+ 
+@@ -2369,7 +2583,7 @@
+             return
+         if not messagebox.askyesno(APP_NAME, f"Снять права администратора у выбранных аккаунтов в {len(peer_ids)} каналах/группах?"):
+             return
+-        self.run_worker(lambda: asyncio.run(self._channel_manage_demote_async(peer_ids, accounts)), "Управление каналами: снимаю права…")
++        self.run_worker(lambda: self.run_async(self._channel_manage_demote_async(peer_ids, accounts)), "Управление каналами: снимаю права…")
+ 
+     async def _channel_manage_demote_async(self, peer_ids: list[int], accounts: list[Account]) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -2412,7 +2626,7 @@
+             return
+         if not messagebox.askyesno(APP_NAME, f"Выбранные аккаунты выйдут из {len(peer_ids)} каналов/групп. Продолжить?"):
+             return
+-        self.run_worker(lambda: asyncio.run(self._channel_manage_leave_async(peer_ids, accounts)), "Управление каналами: выход…")
++        self.run_worker(lambda: self.run_async(self._channel_manage_leave_async(peer_ids, accounts)), "Управление каналами: выход…")
+ 
+     async def _channel_manage_leave_async(self, peer_ids: list[int], accounts: list[Account]) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -2422,19 +2636,20 @@
+                 if self.account_is_restricted(account.session) or admin_flood_remaining(self.state_db, account.session) > 0:
+                     self.log(f"Каналы: {account.display} → {target_ref}: пропуск по состоянию Telegram")
+                     continue
+-                client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
+-                try:
+-                    await client.connect()
+-                    entity = await self._resolve_or_join_target(client, target_ref, should_join=False)
+-                    await client.delete_dialog(entity)
+-                    self.log(f"Каналы: {account.display} → {target_ref}: вышел")
+-                except Exception as exc:
+-                    if errors is not None and isinstance(exc, getattr(errors, "FloodWaitError", ())):
+-                        remember_admin_flood_wait(self.state_db, account.session, max(1, int(getattr(exc, "seconds", 1))))
+-                    self.remember_account_restriction(account, exc, "channel_leave")
+-                    self.log(f"Каналы: {account.display} → {target_ref}: ❌ {self._friendly_error(exc)}")
+-                finally:
+-                    await client.disconnect()
++                async with TelegramAdminManager._account_mutation(self, account.session):
++                    client = self._new_telegram_client(str(SESSIONS_DIR / account.session), api_id, api_hash, flood_sleep_threshold=0)
++                    try:
++                        await client.connect()
++                        entity = await self._resolve_or_join_target(client, target_ref, should_join=False)
++                        await client.delete_dialog(entity)
++                        self.log(f"Каналы: {account.display} → {target_ref}: вышел")
++                    except Exception as exc:
++                        if errors is not None and isinstance(exc, getattr(errors, "FloodWaitError", ())):
++                            remember_admin_flood_wait(self.state_db, account.session, max(1, int(getattr(exc, "seconds", 1))))
++                        self.remember_account_restriction(account, exc, "channel_leave")
++                        self.log(f"Каналы: {account.display} → {target_ref}: ❌ {self._friendly_error(exc)}")
++                    finally:
++                        await client.disconnect()
+             await self._refresh_channel_async(peer_id)
+ 
+     def refresh_channel_links_from_telegram(self) -> None:
+@@ -2447,7 +2662,7 @@
+             messagebox.showinfo(APP_NAME, "В кэше пока нет каналов/групп.")
+             return
+         self.run_worker(
+-            lambda: asyncio.run(self._refresh_channel_links_async(peer_ids, create_missing=True, show_message=True)),
++            lambda: self.run_async(self._refresh_channel_links_async(peer_ids, create_missing=True, show_message=True)),
+             "Обновляю ссылки каналов…",
+         )
+ 
+@@ -2582,7 +2797,7 @@
+     def refresh_channels_from_telegram(self) -> None:
+         if TelegramClient is None:
+             self._show_missing_dependency(); return
+-        self.run_worker(lambda: asyncio.run(self._refresh_channels_inventory_async()), "Обновляю каналы…")
++        self.run_worker(lambda: self.run_async(self._refresh_channels_inventory_async()), "Обновляю каналы…")
+ 
+     async def _refresh_channels_inventory_async(self) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -2656,7 +2871,7 @@
+         peer_id = self._channels_selected_peer_id()
+         if peer_id is None:
+             return
+-        self.run_worker(lambda: asyncio.run(self._refresh_channel_async(peer_id)), "Обновляю канал…")
++        self.run_worker(lambda: self.run_async(self._refresh_channel_async(peer_id)), "Обновляю канал…")
+ 
+     async def _refresh_channel_async(self, peer_id: int) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -3055,9 +3270,10 @@
+         return [a for a in self._factory_selected_from_list(self.factory_admins_list) if self.account_usage_allows(a.session, "admins")]
+ 
+     def _save_group_factory_settings(self) -> None:
++        fields = {}
+         if not hasattr(self, "factory_title_var"):
+             return
+-        d = self.store.data
++        d = {}
+         d["group_factory_title_template"] = self.factory_title_var.get()
+         # 4.3.1 normal factory flow intentionally creates groups only and does not
+         # publish seed media. Keep compatibility fields deterministic for the engine.
+@@ -3091,7 +3307,7 @@
+                 d["group_factory_admin_sessions"] = [a.session for a in self._factory_selected_admins()]
+         except Exception:
+             pass
+-        self.store.save()
++        self._update_config(d)
+ 
+     def _factory_plan(self):
+         creators = self._factory_selected_creators()
+@@ -3134,12 +3350,15 @@
+         )
+ 
+     def _factory_start(self) -> None:
+-        if self._busy:
++        if self.__dict__.get('_factory_operation_running', False):
++            messagebox.showinfo(APP_NAME, 'Создание групп уже выполняется.', parent=self)
++            return
++        if self._busy and not self._concurrent_enabled():
+             if self._defer_if_background_monitor(self._factory_start, "создание групп / каналов"):
+                 return
+             messagebox.showwarning(APP_NAME, "Сейчас уже выполняется другая операция.")
+             return
+-        if hasattr(self, "batch_uploader") and self.batch_uploader.running:
++        if hasattr(self, "batch_uploader") and self.batch_uploader.running and not self._concurrent_enabled():
+             messagebox.showwarning(
+                 APP_NAME,
+                 "Сначала дождись окончания текущей загрузки/поставь её на паузу. "
+@@ -3185,10 +3404,35 @@
+         self.factory_progress.configure(maximum=max(1, len(plan)), value=0)
+         self.factory_progress_var.set(f"0 / {len(plan)}")
+         self.factory_stop_button.configure(state="normal")
+-        self.run_worker(
+-            lambda: asyncio.run(self._factory_create_async(plan, admins, delay)),
+-            busy_text="Создание групп / каналов…",
+-        )
++        options = self._factory_options()
++        self._factory_operation_running = True
++        def create():
++            try:
++                return self.run_async(self._factory_create_async(plan, admins, delay, options=options))
++            finally:
++                self._factory_operation_running = False
++        self.run_worker(create, busy_text='Создание групп / каналов…',
++            on_finished=lambda: setattr(self, '_factory_operation_running', False))
++
++    def _factory_options(self):
++        data = TelegramAdminManager._config_snapshot(self)
++        specs = {
++            'about': ('factory_about_var', 'group_factory_about', ''),
++            'empty': ('factory_empty_var', 'group_factory_empty', False),
++            'forum': ('factory_forum_var', 'group_factory_forum', False),
++            'seed_enabled': ('factory_seed_enabled_var', 'group_factory_seed_enabled', False),
++            'seed_path': ('factory_seed_path_var', 'group_factory_seed_path', ''),
++            'seed_as_file': ('factory_seed_as_file_var', 'group_factory_seed_as_file', False),
++            'seed_caption': ('factory_seed_caption_var', 'group_factory_seed_caption', ''),
++        }
++        in_ui = threading.get_ident() == self.__dict__.get('_tk_thread_id', threading.main_thread().ident)
++        result = {}
++        for key, (name, saved, default) in specs.items():
++            variable = self.__dict__.get(name) if in_ui else None
++            result[key] = variable.get() if variable is not None else data.get(saved, default)
++        variable = self.__dict__.get('factory_entity_type_var') if in_ui else None
++        result['entity_type'] = ('channel' if variable.get() == 'Канал' else 'group') if variable is not None else data.get('group_factory_entity_type', 'group')
++        return result
+ 
+     def _factory_stop(self) -> None:
+         self._factory_stop_event.set()
+@@ -3319,21 +3563,22 @@
+             self.remember_account_restriction(account, exc, "factory_join_admin")
+             raise
+ 
+-    async def _factory_create_async(self, plan: list[Any], admins: list[Account], delay: float) -> None:
++    async def _factory_create_async(self, plan: list[Any], admins: list[Account], delay: float, *, options=None) -> None:
+         api_id, api_hash = self._api_credentials()
+         account_by_session = {a.session: a for a in self.store.accounts()}
+         clients: dict[str, Any] = {}
+         policy = self.safety_policy()
+         admin_delay = policy["admin_delay"] if policy["enabled"] else 0.0
+         preset = "full_add_admins"
+-        about = self.factory_about_var.get().strip()
+-        empty = bool(getattr(self, "factory_empty_var", tk.BooleanVar(value=False)).get())
+-        entity_type = "channel" if getattr(self, "factory_entity_type_var", tk.StringVar(value="Группа")).get() == "Канал" else "group"
+-        forum = bool(self.factory_forum_var.get()) and entity_type == "group" and not empty
+-        seed_enabled = bool(getattr(self, "factory_seed_enabled_var", tk.BooleanVar(value=False)).get())
+-        seed_path = Path(getattr(self, "factory_seed_path_var", tk.StringVar()).get().strip()) if seed_enabled else None
+-        seed_as_file = bool(getattr(self, "factory_seed_as_file_var", tk.BooleanVar(value=False)).get())
+-        seed_caption = str(getattr(self, "factory_seed_caption_var", tk.StringVar()).get())
++        options = options if options is not None else TelegramAdminManager._factory_options(self)
++        about = str(options['about']).strip()
++        empty = bool(options['empty'])
++        entity_type = options['entity_type']
++        forum = bool(options['forum']) and entity_type == 'group' and not empty
++        seed_enabled = bool(options['seed_enabled'])
++        seed_path = Path(options['seed_path']) if seed_enabled else None
++        seed_as_file = bool(options['seed_as_file'])
++        seed_caption = str(options['seed_caption'])
+         blocked_creators: set[str] = set()
+         completed = 0
+         created_ok = 0
+@@ -3809,7 +4054,7 @@
+         except (ValueError, TypeError) as exc:
+             self.admin_stats_var.set(str(exc))
+             return
+-        if self._busy or self._foreground_takeover_pending:
++        if (self._busy or self._foreground_takeover_pending) and not self._concurrent_enabled():
+             if (not self._foreground_takeover_pending
+                     and self._defer_if_background_monitor(
+                         lambda: self._continue_admin_handoff(self._flush_admin_auto_queue), "новые группы для админов")):
+@@ -3930,7 +4175,7 @@
+         tree_frame.grid(row=10, column=0, columnspan=2, sticky="nsew")
+         tree_frame.columnconfigure(0, weight=1)
+         tree_frame.rowconfigure(0, weight=1)
+-        self.upload_tree = ttk.Treeview(tree_frame, columns=("status", "account", "size", "progress"), show="tree headings", selectmode="browse")
++        self.upload_tree = ttk.Treeview(tree_frame, columns=("status", "account", "size", "progress"), show="tree headings", selectmode="extended")
+         self.upload_tree.heading("#0", text="Файл")
+         self.upload_tree.heading("status", text="Статус")
+         self.upload_tree.heading("account", text="Аккаунт")
+@@ -3946,6 +4191,8 @@
+         upload_tree_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.upload_tree.yview)
+         upload_tree_sb.grid(row=0, column=1, sticky="ns")
+         self.upload_tree.configure(yscrollcommand=upload_tree_sb.set)
++        install_table_actions(self.upload_tree, columns=("#0", "status", "account", "size", "progress"),
++                              path_of=self._upload_path_for_row)
+     def _build_safety_tab(self) -> None:
+         from tam_ui.scrollable import ScrollableFrame
+         host = self.tab_safety
+@@ -4124,6 +4371,7 @@
+                     pass
+ 
+     def save_safety_settings(self, quiet: bool = False) -> bool:
++        fields = {}
+         try:
+             max_accounts = max(1, min(50, int(self.safety_max_accounts_var.get())))
+             min_delay = max(0.0, float(self.safety_min_delay_var.get().replace(",", ".")))
+@@ -4149,7 +4397,7 @@
+             "upload_retry_base_delay_seconds": retry_base_delay,
+             "safety_stop_account_on_serious_error": bool(self.safety_stop_serious_var.get()),
+         })
+-        self.store.save()
++        self._update_config(fields)
+         try:
+             if hasattr(self, "batch_uploader"):
+                 self.batch_uploader.refresh_safety_badge()
+@@ -4160,7 +4408,7 @@
+         return True
+ 
+     def safety_policy(self) -> dict[str, Any]:
+-        d = self.store.data
++        d = TelegramAdminManager._config_snapshot(self)
+         return {
+             "enabled": bool(d.get("safety_mode", True)),
+             "max_active_accounts": max(1, int(d.get("safety_max_active_accounts", 4) or 4)),
+@@ -4453,59 +4701,60 @@
+             if not quiet:
+                 messagebox.showerror(APP_NAME, "API ID должен состоять из цифр.")
+             return False
+-        self.store.data["api_id"] = api_id
+-        self.store.data["api_hash"] = api_hash
+-        self.store.save()
++        self._update_config({'api_id': api_id, 'api_hash': api_hash})
+         if not quiet:
+             messagebox.showinfo(APP_NAME, "Настройки сохранены.")
+         return True
+ 
+     def _save_group_settings(self) -> None:
+-        self.store.data["join_before_promote"] = bool(self.join_var.get())
+-        self.store.data["admin_preset"] = "full_add_admins"
+-        self.store.data["admin_title"] = self.title_var.get().strip()
+-        self.store.data["admin_anonymous"] = bool(self.admin_anonymous_var.get())
++        fields = {}
++        fields["join_before_promote"] = bool(self.join_var.get())
++        fields["admin_preset"] = "full_add_admins"
++        fields["admin_title"] = self.title_var.get().strip()
++        fields["admin_anonymous"] = bool(self.admin_anonymous_var.get())
+         if hasattr(self, "admin_targets_text"):
+-            self.store.data["admin_targets"] = self.admin_targets_text.get("1.0", "end").strip()
++            fields["admin_targets"] = self.admin_targets_text.get("1.0", "end").strip()
+         if hasattr(self, "admin_accounts_list"):
+-            self.store.data["admin_selected_sessions"] = [a.session for a in self._selected_admin_accounts()]
+-        self.store.data["auto_controller"] = self.controller_var.get() == AUTO_CONTROLLER_LABEL
++            fields["admin_selected_sessions"] = [a.session for a in self._selected_admin_accounts()]
++        fields["auto_controller"] = self.controller_var.get() == AUTO_CONTROLLER_LABEL
+         controller = self._controller_session_from_display(self.controller_var.get())
+         if controller:
+-            self.store.data["controller_session"] = controller
+-        try:
+-            self.store.data["delay_seconds"] = max(0.0, float(self.delay_var.get().replace(",", ".")))
++            fields["controller_session"] = controller
++        try:
++            fields["delay_seconds"] = max(0.0, float(self.delay_var.get().replace(",", ".")))
+         except ValueError:
+             pass
+-        self.store.save()
++        self._update_config(fields)
+ 
+     def _save_upload_settings(self) -> None:
+-        self.store.data["upload_folder"] = self.upload_folder_var.get().strip()
+-        self.store.data["upload_target"] = self.upload_target_var.get().strip()
+-        self.store.data["upload_join_if_needed"] = bool(self.upload_join_var.get())
+-        self.store.data["upload_recursive"] = bool(self.upload_recursive_var.get())
+-        self.store.data["upload_caption"] = self.upload_caption_var.get()
+-        self.store.data["upload_send_videos"] = bool(self.upload_send_videos_var.get())
+-        self.store.data["upload_send_photos"] = bool(self.upload_send_photos_var.get())
+-        self.store.data["upload_video_preview_mode"] = next((k for k, v in VIDEO_PREVIEW_LABELS.items() if v == self.upload_video_preview_var.get()), "required")
+-        self.store.data["upload_streaming"] = bool(self.upload_streaming_var.get())
+-        self.store.data["upload_photo_mode"] = next((k for k, v in PHOTO_MODE_LABELS.items() if v == self.upload_photo_mode_var.get()), "photo")
+-        try:
+-            self.store.data["upload_parallel"] = max(1, min(10, int(self.upload_parallel_var.get())))
++        fields = {}
++        fields["upload_folder"] = self.upload_folder_var.get().strip()
++        fields["upload_target"] = self.upload_target_var.get().strip()
++        fields["upload_join_if_needed"] = bool(self.upload_join_var.get())
++        fields["upload_recursive"] = bool(self.upload_recursive_var.get())
++        fields["upload_caption"] = self.upload_caption_var.get()
++        fields["upload_send_videos"] = bool(self.upload_send_videos_var.get())
++        fields["upload_send_photos"] = bool(self.upload_send_photos_var.get())
++        fields["upload_video_preview_mode"] = next((k for k, v in VIDEO_PREVIEW_LABELS.items() if v == self.upload_video_preview_var.get()), "required")
++        fields["upload_streaming"] = bool(self.upload_streaming_var.get())
++        fields["upload_photo_mode"] = next((k for k, v in PHOTO_MODE_LABELS.items() if v == self.upload_photo_mode_var.get()), "photo")
++        try:
++            fields["upload_parallel"] = max(1, min(10, int(self.upload_parallel_var.get())))
+         except ValueError:
+             pass
+         try:
+-            self.store.data["upload_delay_seconds"] = max(0.0, float(self.upload_delay_var.get().replace(",", ".")))
++            fields["upload_delay_seconds"] = max(0.0, float(self.upload_delay_var.get().replace(",", ".")))
+         except ValueError:
+             pass
+         selected = self.selected_upload_accounts()
+-        self.store.data["upload_selected_sessions"] = [a.session for a in selected]
+-        self.store.save()
++        fields["upload_selected_sessions"] = [a.session for a in selected]
++        self._update_config(fields)
+ 
+     def _api_credentials(self) -> tuple[int, str]:
+         # Read only persisted values here so this method is safe from worker threads.
+-        api_id_raw = str(self.store.data.get("api_id", "")).strip()
+-        api_hash = str(self.store.data.get("api_hash", "")).strip()
++        data = TelegramAdminManager._config_snapshot(self)
++        api_id_raw = str(data.get("api_id", "")).strip()
++        api_hash = str(data.get("api_hash", "")).strip()
+         if not api_id_raw or not api_hash:
+             raise ValueError("Сначала укажи API ID и API Hash во вкладке «Настройки API».")
+         try:
+@@ -4628,7 +4877,7 @@
+         return immediately. Manual/non-monitor work is never preempted here.
+         """
+         bu = getattr(self, "batch_uploader", None)
+-        if not self._busy or bu is None or not getattr(bu, "background_upload_active", lambda: False)():
++        if self._concurrent_enabled() or not self._busy or bu is None or not getattr(bu, "background_upload_active", lambda: False)():
+             return False
+         if not bu.request_background_yield():
+             return False
+@@ -4639,7 +4888,7 @@
+         def wait_then() -> None:
+             if self._closed:
+                 return
+-            if self._busy:
++            if self._busy and not self._concurrent_enabled():
+                 self.after(300, wait_then)
+                 return
+             self._foreground_takeover_pending = False
+@@ -4649,13 +4898,13 @@
+         return True
+ 
+     def set_busy(self, busy: bool, text: str = "") -> None:
+-        if busy and self._group_catalog_refreshing:
++        if busy and self._group_catalog_refreshing and not self._concurrent_enabled():
+             # Metadata loading is low-priority and immediately yields to real work.
+             self._group_catalog_abort = True
+         self._busy = busy
+-        self.run_button.configure(state="disabled" if busy else "normal")
++        self.run_button.configure(state="disabled" if busy and not self._concurrent_enabled() else "normal")
+         if hasattr(self, "upload_start_button"):
+-            self.upload_start_button.configure(state="disabled" if busy else "normal")
++            self.upload_start_button.configure(state="disabled" if (busy and not self._concurrent_enabled()) or self._uploader_running else "normal")
+         self.busy_label.configure(text=text or ("Работаю…" if busy else "Готово"))
+         if not busy and self._admin_auto_pending and not self._foreground_takeover_pending:
+             self._schedule_admin_auto_queue(0)
+@@ -4668,8 +4917,57 @@
+             self._resume_background_queue_after_busy = False
+             self.after(250, self.batch_uploader.resume_queue)
+ 
+-    def run_worker(self, fn: Callable[[], Any], busy_text: str = "Работаю…") -> None:
+-        if self._busy:
++    def run_worker(self, fn: Callable[[], Any], busy_text: str = "Работаю…", *, on_finished=None) -> None:
++        if self._concurrent_enabled():
++            if self._closed:
++                return
++            active = [row for row in self._operations.snapshot() if row['finished_at'] is None]
++            if len(active) >= 64:
++                if on_finished is not None:
++                    on_finished()
++                messagebox.showinfo(APP_NAME, 'Очередь операций заполнена. Дождитесь завершения части задач.', parent=self)
++                return
++            operation = self._operations.start(busy_text)
++            if self._worker_pool is None:
++                self._worker_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix='tam-work')
++            self._refresh_operations_status()
++            def managed_runner():
++                token = _current_operation.set(operation)
++                try:
++                    if operation.cancel_event.is_set():
++                        operation.finish()
++                        return
++                    operation.update(status='running')
++                    result = fn()
++                    operation.finish(result=result)
++                except (asyncio.CancelledError, concurrent.futures.CancelledError):
++                    operation.cancel_event.set()
++                    operation.finish()
++                except Exception as exc:
++                    operation.finish(error=str(exc))
++                    self.log(f'ОШИБКА: {type(exc).__name__}: {exc}')
++                    self._write_log(traceback.format_exc())
++                    self.ui_call(lambda error=str(exc): messagebox.showerror(APP_NAME, error, parent=self))
++                finally:
++                    _current_operation.reset(token)
++                    if on_finished is not None:
++                        self.ui_call(on_finished)
++                    self.ui_call(self._refresh_operations_status)
++                    if self._admin_auto_pending and not self.__dict__.get('_admin_operation_running', False):
++                        self.ui_call(lambda: self._schedule_admin_auto_queue(0))
++            future = self._worker_pool.submit(managed_runner)
++            cancellations = self.__dict__.setdefault('_operation_cancellations', {})
++            cancellations[operation.id] = future.cancel
++            def settled(completed):
++                cancellations.pop(operation.id, None)
++                if completed.cancelled():
++                    operation.finish()
++                    if on_finished is not None:
++                        self.ui_call(on_finished)
++                    self.ui_call(self._refresh_operations_status)
++            future.add_done_callback(settled)
++            return
++        if self._busy and not self._concurrent_enabled():
+             bu = getattr(self, "batch_uploader", None)
+             if bu is not None and getattr(bu, "background_upload_active", lambda: False)():
+                 if bu.request_background_yield():
+@@ -4680,11 +4978,11 @@
+                     def wait_and_start() -> None:
+                         if self._closed:
+                             return
+-                        if self._busy:
++                        if self._busy and not self._concurrent_enabled():
+                             self.after(300, wait_and_start)
+                             return
+                         self._foreground_takeover_pending = False
+-                        self.run_worker(fn, busy_text)
++                        self.run_worker(fn, busy_text, on_finished=on_finished)
+ 
+                     self.after(300, wait_and_start)
+                     return
+@@ -4700,9 +4998,99 @@
+                 self._write_log(traceback.format_exc())
+                 self.ui_call(lambda: messagebox.showerror(APP_NAME, str(exc)))
+             finally:
++                if on_finished is not None:
++                    self.ui_call(on_finished)
+                 self.ui_call(lambda: self.set_busy(False))
+ 
+         threading.Thread(target=runner, daemon=True).start()
++
++    def begin_operation(self, label, kind='background', cancel=None):
++        operation = self._operations.start(label, kind=kind)
++        operation.cooperative_cancel = cancel is not None
++        if cancel is not None:
++            self.__dict__.setdefault('_operation_cancellations', {})[operation.id] = cancel
++        self._refresh_operations_status()
++        return operation
++
++    def end_operation(self, operation, error=None):
++        if operation is not None:
++            operation.finish(error=error)
++            self.__dict__.get('_operation_cancellations', {}).pop(operation.id, None)
++        self._refresh_operations_status()
++
++    def _refresh_operations_status(self):
++        if self._closed:
++            return
++        rows = self._operations.snapshot()
++        callbacks = self.__dict__.get('_operation_cancellations', {})
++        for row in rows:
++            if row['status'] == 'cancelling':
++                callback = callbacks.pop(row['id'], None)
++                if callback is not None:
++                    callback()
++        active = [row for row in rows if row['status'] not in ('completed', 'failed', 'cancelled')]
++        if active:
++            self.busy_label.configure(text=f"Операций: {len(active)} · " + ' · '.join(row['label'] for row in active[:3]))
++        elif not self._busy:
++            self.busy_label.configure(text='Готово')
++        dialog = self.__dict__.get('_operations_dialog')
++        if dialog is not None and dialog.winfo_exists():
++            tree = dialog.operation_tree
++            selection = tree.selection()
++            existing = set(tree.get_children(''))
++            labels = {'pending': 'В очереди', 'running': 'Выполняется', 'waiting': 'Ожидает ресурс', 'cancelling': 'Отмена…',
++                      'completed': 'Завершено', 'failed': 'Ошибка', 'cancelled': 'Отменено'}
++            for row in rows:
++                progress = row.get('progress')
++                progress = f'{progress:.1f}%' if isinstance(progress, (int, float)) else '—'
++                values = (row['label'], labels.get(row['status'], row['status']), progress, row.get('detail', ''))
++                if tree.exists(row['id']):
++                    tree.item(row['id'], values=values)
++                else:
++                    tree.insert('', 'end', iid=row['id'], values=values)
++                existing.discard(row['id'])
++            for iid in existing:
++                tree.delete(iid)
++            tree.selection_set([iid for iid in selection if tree.exists(iid)])
++        if active and not self.__dict__.get('_operations_after'):
++            def refresh():
++                self._operations_after = None
++                self._refresh_operations_status()
++            self._operations_after = self.after(500, refresh)
++
++    def show_operations(self):
++        dialog = self.__dict__.get('_operations_dialog')
++        if dialog is not None and dialog.winfo_exists():
++            dialog.lift()
++            return
++        dialog = self._operations_dialog = tk.Toplevel(self)
++        dialog.title('Фоновые операции')
++        dialog.geometry('760x320')
++        tree = dialog.operation_tree = ttk.Treeview(dialog, columns=('label', 'status', 'progress', 'detail'),
++            show='headings', selectmode='extended')
++        for key, title in (('label', 'Операция'), ('status', 'Состояние'), ('progress', 'Прогресс'), ('detail', 'Подробности')):
++            tree.heading(key, text=title)
++            tree.column(key, width=75 if key == 'progress' else 200 if key != 'status' else 130)
++        tree.pack(fill='both', expand=True, padx=10, pady=10)
++        def cancel():
++            for iid in tree.selection():
++                self._operations.cancel(iid)
++            self._refresh_operations_status()
++        ttk.Button(dialog, text='Отменить выбранные', command=cancel).pack(anchor='w', padx=10, pady=(0, 10))
++        self._refresh_operations_status()
++
++    def _runtime_destroyed(self, event):
++        if event.widget is not self:
++            return
++        self._closed = True
++        for row in self._operations.snapshot():
++            self._operations.cancel(row['id'])
++        runtime = self.__dict__.get('_async_runtime')
++        if runtime is not None:
++            runtime.shutdown(timeout=5)
++        pool = self.__dict__.get('_worker_pool')
++        if pool is not None:
++            pool.shutdown(wait=False, cancel_futures=True)
+ 
+     def ui_call(self, func: Callable[[], Any]) -> None:
+         if self._closed:
+@@ -4751,7 +5139,9 @@
+                 event.set()
+ 
+         self.ui_call(callback)
+-        event.wait()
++        while not event.wait(.1):
++            if self._closed:
++                raise RuntimeError('Приложение закрыто; запрос отменён.')
+         return box["value"]
+ 
+     async def ui_ask_async(self, func: Callable[[], Any]) -> Any:
+@@ -5078,7 +5468,7 @@
+         account = self._selected_account_for_status()
+         if account is None:
+             return
+-        self.run_worker(lambda: asyncio.run(self._recheck_account_restriction_async(account)), "Проверяю аккаунт…")
++        self.run_worker(lambda: self.run_async(self._recheck_account_restriction_async(account)), "Проверяю аккаунт…")
+ 
+     async def _recheck_account_restriction_async(self, account: Account) -> None:
+         api_id, api_hash = self._api_credentials()
+@@ -5091,7 +5481,7 @@
+             if not me:
+                 raise RuntimeError("Telegram не вернул данные аккаунта.")
+             self.log(f"Проверка {account.display}: read-only проверка успешна. Она не доказывает, что антиспам-ограничение Telegram снято.")
+-            clear = self.ui_ask(lambda: messagebox.askyesno(APP_NAME, "Read-only проверка успешна. Снять локальную отметку и снова разрешить risky write-действия?"))
++            clear = await self.ui_ask_async(lambda: messagebox.askyesno(APP_NAME, "Read-only проверка успешна. Снять локальную отметку и снова разрешить risky write-действия?"))
+             if clear:
+                 self.state_db.account_restriction_clear(account.session)
+                 self.log(f"{account.display}: локальная отметка ограничения снята пользователем.")
+@@ -5134,12 +5524,13 @@
+             simpledialog.askstring(APP_NAME, "Название аккаунта в приложении (необязательно):", parent=self) or '')
+ 
+         def work() -> None:
+-            asyncio.run(self._add_account_qr_async(label.strip(), existing_account=existing_account))
++            self.run_async(self._add_account_qr_async(label.strip(), existing_account=existing_account), exclusive_session=str(SESSIONS_DIR / existing_account.session) if existing_account else None, auth_workflow=True)
+ 
+         self.run_worker(work, "QR-авторизация…")
+ 
+     async def _add_account_qr_async(self, label: str, existing_account: Account | None = None) -> None:
+         from tam_core.session_recovery import copy_session_database
++        from tam_core.settled_io import settled_call
+         api_id, api_hash = self._api_credentials()
+         if existing_account and not any(a.session == existing_account.session and a.user_id == existing_account.user_id
+                                         for a in self.store.accounts()):
+@@ -5153,7 +5544,7 @@
+         backup = None
+         if existing_account and session_file.exists():
+             backup = DATA_DIR / 'backups' / 'reauth' / f'{session_name}-{time.time_ns()}.session'
+-            await asyncio.to_thread(copy_session_database, session_file, backup)
++            await settled_call(copy_session_database, session_file, backup)
+         client = None
+         dialog: QRLoginDialog | None = None
+         wait_task = None
+@@ -5254,7 +5645,7 @@
+             account = self._account_from_me(me, session_name, label=existing_account.label if existing_account else label)
+             if existing_account:
+                 await client.disconnect()
+-                await asyncio.to_thread(copy_session_database,
++                await settled_call(copy_session_database,
+                     SESSIONS_DIR / f'{working_session_name}.session', session_file)
+             if dialog.cancelled.is_set() or getattr(self, '_closed', False):
+                 raise RuntimeError('QR-авторизация отменена.')
+@@ -5282,7 +5673,7 @@
+                 try:
+                     if not saved:
+                         if backup is not None:
+-                            await asyncio.to_thread(copy_session_database, backup, session_file)
++                            await settled_call(copy_session_database, backup, session_file)
+                         else:
+                             self._delete_session_files(session_name)
+                 finally:
+@@ -5387,14 +5778,15 @@
+ 
+         def work() -> None:
+             if existing_account:
+-                asyncio.run(self._reauthorize_account_phone_async(existing_account, phone.strip()))
++                self.run_async(self._reauthorize_account_phone_async(existing_account, phone.strip()), exclusive_session=str(SESSIONS_DIR / existing_account.session))
+             else:
+-                asyncio.run(self._add_account_async(phone.strip(), label.strip()))
++                self.run_async(self._add_account_async(phone.strip(), label.strip()), auth_workflow=True)
+ 
+         self.run_worker(work, "Авторизация аккаунта…")
+ 
+     async def _reauthorize_account_phone_async(self, existing_account: Account, phone: str) -> None:
+         from tam_core.session_recovery import copy_session_database
++        from tam_core.settled_io import settled_call
+         phone = re.sub(r'[\s()\-]', '', phone.strip())
+         if phone.startswith('00'):
+             phone = '+' + phone[2:]
+@@ -5417,7 +5809,7 @@
+         backup = None
+         if session_file.exists():
+             backup = DATA_DIR / 'backups' / 'reauth' / f'{session_name}-{time.time_ns()}.session'
+-            await asyncio.to_thread(copy_session_database, session_file, backup)
++            await settled_call(copy_session_database, session_file, backup)
+         client, working_session_name, saved = None, None, False
+         try:
+             client = self._new_telegram_client(str(SESSIONS_DIR / session_name), api_id, api_hash)
+@@ -5480,7 +5872,7 @@
+             account = self._account_from_me(me, session_name, label=existing_account.label, fallback_phone=phone)
+             await client.disconnect()
+             check_current()
+-            await asyncio.to_thread(copy_session_database,
++            await settled_call(copy_session_database,
+                 SESSIONS_DIR / f'{working_session_name}.session', session_file)
+             def commit():
+                 nonlocal saved
+@@ -5501,7 +5893,7 @@
+                 try:
+                     if not saved:
+                         if backup is not None:
+-                            await asyncio.to_thread(copy_session_database, backup, session_file)
++                            await settled_call(copy_session_database, backup, session_file)
+                         else:
+                             self._delete_session_files(session_name)
+                 finally:
+@@ -5511,11 +5903,11 @@
+     async def _add_account_async(self, phone: str, label: str) -> None:
+         api_id, api_hash = self._api_credentials()
+         safe = re.sub(r"[^0-9A-Za-z_-]+", "_", phone).strip("_") or str(int(time.time()))
+-        session_name = f"acc_{safe}_{int(time.time())}"
++        session_name = f"acc_{safe}_{uuid.uuid4().hex}"
+         session_path = str(SESSIONS_DIR / session_name)
+ 
+         client = self._new_telegram_client(session_path, api_id, api_hash)
+-        failed = False
++        failed = True
+         try:
+             await client.connect()
+             if not await client.is_user_authorized():
+@@ -5523,7 +5915,7 @@
+                 sent = await client.send_code_request(phone)
+                 delivery = self._sent_code_description(sent)
+                 self.log(f"Telegram ответил: код отправлен {delivery}.")
+-                code = self.ui_ask(
++                code = await self.ui_ask_async(
+                     lambda: simpledialog.askstring(
+                         APP_NAME,
+                         f"Telegram сообщает, что код отправлен {delivery}.\n\nВведи код для {phone}:",
+@@ -5535,7 +5927,7 @@
+                 try:
+                     await client.sign_in(phone=phone, code=code.strip(), phone_code_hash=sent.phone_code_hash)
+                 except errors.SessionPasswordNeededError:
+-                    password = self.ui_ask(
++                    password = await self.ui_ask_async(
+                         lambda: simpledialog.askstring(
+                             APP_NAME,
+                             f"Включена двухэтапная проверка для {phone}. Введи пароль:",
+@@ -5553,6 +5945,7 @@
+ 
+             account = self._account_from_me(me, session_name, label=label, fallback_phone=phone)
+             self._save_account(account)
++            failed = False
+             self.log(f"Добавлен аккаунт: {account.display} (ID {account.user_id})")
+             self.ui_call(lambda: self.refresh_account_list())
+         except Exception:
+@@ -5575,7 +5968,7 @@
+             return
+ 
+         def work() -> None:
+-            asyncio.run(self._refresh_accounts_async())
++            self.run_async(self._refresh_accounts_async())
+ 
+         self.run_worker(work, "Проверяю аккаунты…")
+ 
+@@ -5605,7 +5998,11 @@
+                 updated.append(account)
+             finally:
+                 await client.disconnect()
+-        self.store.set_accounts(updated)
++        refresh = getattr(self.store, 'refresh_accounts', None)
++        if callable(refresh):
++            refresh(updated)
++        else:
++            self.store.set_accounts(updated)
+         self.ui_call(lambda: self.refresh_account_list())
+ 
+     def remove_selected_accounts(self) -> None:
+@@ -5650,13 +6047,16 @@
+ 
+     # ---------- group / promotion ----------
+     def start_promote(self, force_recheck: bool = False, *, targets_override=None, automatic: bool = False) -> None:
+-        if self._busy:
++        if self._busy and not self._concurrent_enabled():
+             if automatic:
+                 self._schedule_admin_auto_queue(500)
+             elif not self._defer_if_background_monitor(
+                     lambda: self._continue_admin_handoff(
+                         lambda: self.start_promote(force_recheck, targets_override=targets_override)), "назначение админов"):
+                 messagebox.showwarning(APP_NAME, "Сейчас уже выполняется другая операция.")
++            return
++        if self.__dict__.get("_admin_operation_running", False):
++            self._schedule_admin_auto_queue(500)
+             return
+         targets = self._admin_targets() if targets_override is None else list(targets_override)
+         def report_error(text):
+@@ -5739,24 +6139,29 @@
+         self.admin_progress.configure(value=0, maximum=max(1, len(work_plan)))
+         self.admin_stop_button.configure(state="normal")
+ 
++        self._admin_operation_running = True
+         def work() -> None:
+-            asyncio.run(
+-                self._promote_many_async(
+-                    work_plan=work_plan,
+-                    controller=controller,
+-                    delay=delay,
+-                    preset=preset,
+-                    title=title,
+-                    join_before=join_before,
+-                    policy_key=policy_key,
+-                    total_requested_groups=len(targets),
+-                    cached_groups=cached_groups,
+-                    force_recheck=force_recheck,
+-                    notify=not automatic,
++            try:
++                self.run_async(
++                    self._promote_many_async(
++                        work_plan=work_plan,
++                        controller=controller,
++                        delay=delay,
++                        preset=preset,
++                        title=title,
++                        join_before=join_before,
++                        policy_key=policy_key,
++                        total_requested_groups=len(targets),
++                        cached_groups=cached_groups,
++                        force_recheck=force_recheck,
++                        notify=not automatic,
++                    )
+                 )
+-            )
+-
+-        self.run_worker(work, f"Обрабатываю изменения: 0/{len(work_plan)} групп…")
++            finally:
++                self._admin_operation_running = False
++
++        self.run_worker(work, f"Обрабатываю изменения: 0/{len(work_plan)} групп…",
++            on_finished=lambda: setattr(self, '_admin_operation_running', False))
+ 
+     async def _promote_many_async(
+         self,
+@@ -6652,6 +7057,8 @@
+             messagebox.showerror(APP_NAME, f"Не удалось прочитать папку:\n{exc}")
+             return
+ 
++        previous_files = self._upload_files
++        view_state = capture_view(self.upload_tree)
+         self._upload_files = files
+         self._upload_rows.clear()
+         for iid in self.upload_tree.get_children():
+@@ -6678,12 +7085,22 @@
+                 values=("Готов", "—", self._format_bytes(size), "0%"),
+             )
+ 
++        def row_after_rescan(iid: str) -> str:
++            try:  # Rows are numbered per scan, so each is followed by its file path.
++                return self._upload_rows.get(str(previous_files[int(iid.removeprefix("media_"))]), "")
++            except (ValueError, IndexError):
++                return ""
++
++        restore_view(self.upload_tree, view_state.remap(row_after_rescan))
+         self.upload_progress["value"] = 0
+         if files:
+             self.upload_stats_var.set(f"{len(files)} файлов • {self._format_bytes(total_size)}")
+         else:
+             self.upload_stats_var.set("Подходящие медиафайлы в выбранной папке не найдены")
+         self._save_upload_settings()
++
++    def _upload_path_for_row(self, iid: str) -> str:
++        return str(self._upload_files[int(iid.removeprefix("media_"))])
+ 
+     def _upload_tree_update(
+         self,
+@@ -6717,10 +7134,13 @@
+         if TelegramClient is None:
+             self._show_missing_dependency()
+             return
+-        if self._busy:
++        if self._busy and not self._concurrent_enabled():
+             if self._defer_if_background_monitor(self.start_uploads, "быстрая загрузка"):
+                 return
+             messagebox.showwarning(APP_NAME, "Сейчас уже выполняется другая операция.")
++            return
++        if self._uploader_running:
++            messagebox.showinfo(APP_NAME, "Быстрая загрузка уже выполняется.", parent=self)
+             return
+         self.save_api_settings(quiet=True)
+         try:
+@@ -6778,9 +7198,25 @@
+         streaming = bool(self.upload_streaming_var.get())
+         photo_mode = next((k for k, v in PHOTO_MODE_LABELS.items() if v == self.upload_photo_mode_var.get()), "photo")
+ 
++        if self._concurrent_enabled():
++            settings = dict(name='Быстрая загрузка', folder=self.upload_folder_var.get().strip(),
++                target=target, recursive=bool(self.upload_recursive_var.get()),
++                send_videos=bool(self.upload_send_videos_var.get()), send_photos=bool(self.upload_send_photos_var.get()),
++                caption=caption_template, streaming=streaming, delay=delay,
++                use_all_accounts=False, account_sessions=[account.session for account in accounts],
++                parallel_auto=False, parallel=parallel, auto_admin=False, join_if_needed=join_if_needed,
++                video_preview_mode=video_preview_mode, photo_mode=photo_mode, files=[str(path) for path in files])
++            try:
++                self._quick_task_id = self.batch_uploader.enqueue_quick_upload(settings, on_finished=self._uploader_finished)
++            except Exception:
++                self._uploader_finished()
++                raise
++            self._sync_quick_progress()
++            return
++
+         def work() -> None:
+             try:
+-                asyncio.run(
++                self.run_async(
+                     self._upload_files_async(
+                         files=files,
+                         accounts=accounts,
+@@ -6810,21 +7246,49 @@
+             self._upload_pause_event.set()
+             self.upload_pause_button.configure(text="Пауза после текущих")
+             self.busy_label.configure(text="Загрузка медиа…")
++        task_id = self.__dict__.get('_quick_task_id')
++        if task_id:
++            self.batch_uploader.set_task_paused(task_id, not self._upload_pause_event.is_set())
+ 
+     def stop_uploads(self) -> None:
+         if not self._uploader_running:
+             return
+         self._upload_stop_event.set()
+         self._upload_pause_event.set()
++        task_id = self.__dict__.get('_quick_task_id')
++        if task_id:
++            self.batch_uploader.cancel_task(task_id)
+         self.upload_stop_button.configure(state="disabled")
+         self.busy_label.configure(text="Останавливаю загрузку…")
+ 
+     def _uploader_finished(self) -> None:
++        self._sync_quick_progress(schedule=False)
+         self._uploader_running = False
+-        self._admin_stop_event = threading.Event()
++        self._quick_task_id = None
+         self._upload_pause_event.set()
+         self.upload_pause_button.configure(state="disabled", text="Пауза после текущих")
+         self.upload_stop_button.configure(state="disabled")
++
++    def _sync_quick_progress(self, schedule=True):
++        if self._closed:
++            return
++        tid = self.__dict__.get('_quick_task_id')
++        if not tid:
++            return
++        pane = self.batch_uploader
++        state = dict(pane.task_states.get(tid, {}))
++        total = int(state.get('total_files', 0) or 0)
++        done = int(state.get('processed_files', 0) or 0)
++        percent = 100 * done / total if total else 0
++        self._set_upload_overall(percent, f'Обработано {done}/{total}' if total else 'В очереди загрузок')
++        for iid, path in list(pane.activity_paths.items()):
++            if str(path) not in self._upload_rows or not pane.activity.exists(iid):
++                continue
++            values = pane.activity.item(iid, 'values')
++            if len(values) >= 6 and values[0] == 'Быстрая загрузка':
++                self._upload_tree_update(Path(path), status=values[5], account=values[1], progress=values[3])
++        if schedule and self._uploader_running:
++            self.after(500, self._sync_quick_progress)
+ 
+     async def _wait_upload_gate(self) -> bool:
+         while not self._upload_pause_event.is_set():
+@@ -6867,6 +7331,8 @@
+         streaming: bool,
+         photo_mode: str,
+     ) -> None:
++        if self.__dict__.get('_runtime_enabled', False):
++            raise RuntimeError('Управляемая загрузка должна использовать общую очередь публикаций.')
+         api_id, api_hash = self._api_credentials()
+         clients: list[tuple[Account, Any, Any, bool]] = []
+         from tam_core.upload_observer import observe_upload_loop
+@@ -6997,6 +7463,10 @@
+                     small_pos += 1
+                 assignments[chosen].append(item)
+ 
++            if self.__dict__.get("_runtime_enabled", False):
++                for _account, initial_client, _entity, _premium in clients:
++                    await initial_client.disconnect()
++
+             semaphore = asyncio.Semaphore(min(parallel, len(clients)))
+ 
+             async def worker(account: Account, client: Any, entity: Any, is_premium: bool, jobs: list[tuple[int, Path]]) -> None:
+@@ -7010,7 +7480,8 @@
+                         update_overall()
+                         continue
+ 
+-                    async with semaphore:
++                    async with semaphore, TelegramAdminManager.transfer_slot(self, account.session), \
++                            TelegramAdminManager._quick_file_client(self, account, client) as client:
+                         if not await self._wait_upload_gate():
+                             return
+ 

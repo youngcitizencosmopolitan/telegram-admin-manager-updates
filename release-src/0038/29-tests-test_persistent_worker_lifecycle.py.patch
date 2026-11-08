@@ -1,0 +1,123 @@
+--- /dev/null
++++ b/app/tests/test_persistent_worker_lifecycle.py
+@@ -0,0 +1,120 @@
++import asyncio
++from contextlib import asynccontextmanager
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++import test_prefetch_upload_boundary as prefetch_fixture
++
++
++class PersistentWorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = prefetch_fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = prefetch_fixture.PrefetchUploadTests.asyncTearDown
++    file = prefetch_fixture.PrefetchUploadTests.file
++    read = prefetch_fixture.PrefetchUploadTests.read
++    run_task = prefetch_fixture.PrefetchUploadTests.run_task
++
++    async def test_stop_keeps_run_alive_until_active_worker_releases_account(self):
++        self.file()
++        started, finish, exited = asyncio.Event(), asyncio.Event(), asyncio.Event()
++        async def send(path):
++            started.set()
++            try:
++                await finish.wait()
++            finally:
++                exited.set()
++        running = asyncio.create_task(self.run_task(send))
++        try:
++            await asyncio.wait_for(started.wait(), 2)
++            self.stop.set()
++            await asyncio.sleep(.35)
++            self.assertFalse(running.done(), 'run completed while its transfer still owned the account')
++            finish.set()
++            await asyncio.wait_for(running, 2)
++            self.assertTrue(exited.is_set())
++            self.assertFalse(self.account_lock.locked())
++        finally:
++            finish.set()
++            await asyncio.gather(running, return_exceptions=True)
++
++    async def test_connection_failure_propagates_instead_of_successful_completion(self):
++        self.file()
++        @asynccontextmanager
++        async def broken_connection(*args):
++            raise OSError('reconnect failed')
++            yield
++        self.pane._file_client_lease = broken_connection
++        with self.assertRaisesRegex(OSError, 'reconnect failed'):
++            await self.run_task()
++        self.assertEqual(self.sent, [])
++
++    async def test_parent_cancel_settles_worker_before_return(self):
++        self.file()
++        started, exited = asyncio.Event(), asyncio.Event()
++        async def send(path):
++            started.set()
++            try:
++                await asyncio.Event().wait()
++            finally:
++                exited.set()
++        running = asyncio.create_task(self.run_task(send))
++        await asyncio.wait_for(started.wait(), 2)
++        running.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await running
++        self.assertTrue(exited.is_set())
++        self.assertFalse(self.account_lock.locked())
++
++    async def test_cancel_during_borrowed_client_connect_closes_unregistered_handle(self):
++        started, closed = asyncio.Event(), asyncio.Event()
++        class Client:
++            async def connect(self):
++                started.set()
++                await asyncio.Event().wait()
++            async def disconnect(self):
++                closed.set()
++        self.pane.app._runtime_enabled = True
++        self.pane.app._api_credentials = lambda: (1, 'test')
++        self.pane.sessions_dir = Path('synthetic')
++        self.pane._new_telegram_client = lambda *a, **kw: Client()
++        async def borrow():
++            async with self.pane._borrow_client('s1', None):
++                pass
++        running = asyncio.create_task(borrow())
++        await started.wait()
++        running.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await running
++        self.assertTrue(closed.is_set())
++
++    async def test_cancel_during_initial_account_auth_check_closes_handle(self):
++        started, closed = asyncio.Event(), asyncio.Event()
++        class Client:
++            async def connect(self):
++                pass
++            async def is_user_authorized(self):
++                started.set()
++                await asyncio.Event().wait()
++            async def disconnect(self):
++                closed.set()
++        pane = self.pane
++        pane.app.store.accounts = lambda: [self.account]
++        pane.app._api_credentials = lambda: (1, 'test')
++        pane.app.refresh_safety_health_table = lambda: None
++        pane.sessions_dir = Path('synthetic')
++        pane.session_connection_ready = lambda session: True
++        pane._new_telegram_client = lambda *args, **kwargs: Client()
++        pane._ui_latest = lambda *args: None
++        async def prepare(*args):
++            pass
++        pane._prepare_task_admins = prepare
++        running = asyncio.create_task(pane._run_batch([self.rule], 1, notify=False))
++        await asyncio.wait_for(started.wait(), 1)
++        running.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await running
++        self.assertTrue(closed.is_set())
++
++
++if __name__ == '__main__':
++    unittest.main()

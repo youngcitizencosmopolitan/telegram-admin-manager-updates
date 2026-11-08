@@ -1,0 +1,11 @@
+--- a/app/tam_core/proxies.py
++++ b/app/tam_core/proxies.py
+@@ -69,7 +69,7 @@
+         self.store = store
+         self._protector = protector if protector is not None else DPAPIProtector()
+         self._proxy_factory = proxy_factory
+-        self._lock = threading.RLock()
++        self._lock = getattr(store, '_lock', None) or threading.RLock()
+ 
+     @staticmethod
+     def _endpoint(host, port):

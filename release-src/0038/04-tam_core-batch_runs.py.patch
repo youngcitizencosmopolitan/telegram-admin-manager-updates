@@ -1,0 +1,35 @@
+--- /dev/null
++++ b/app/tam_core/batch_runs.py
+@@ -0,0 +1,32 @@
++"""Per-run state and lane identities for the upload coordinator."""
++from dataclasses import dataclass, field
++import threading
++import uuid
++
++@dataclass
++class BatchRun:
++    lane: str
++    items: list
++    controller: object
++    id: str = field(default_factory=lambda: uuid.uuid4().hex)
++    operation: object = None
++    thread: object = None
++    error: object = None
++
++    @property
++    def task_ids(self):
++        return {str(tid) for item in self.items for tid in item.get("task_ids", [])}
++
++    @property
++    def queue_ids(self):
++        return {str(item.get("id", "")) for item in self.items}
++
++    def cancel(self):
++        event = getattr(self.operation, "cancel_event", None)
++        if event is not None:
++            event.set()
++        self.controller.queue_halt_requested = True
++        self.controller.stop_event.set()
++        self.controller.pause_all_event.set()
++        for event in list(self.controller.task_pause_events.values()):
++            event.set()

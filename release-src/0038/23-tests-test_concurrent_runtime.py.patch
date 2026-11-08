@@ -1,0 +1,673 @@
+--- /dev/null
++++ b/app/tests/test_concurrent_runtime.py
+@@ -0,0 +1,670 @@
++import asyncio
++import concurrent.futures
++import threading
++import unittest
++
++from tam_core.runtime import AsyncRuntime
++
++
++class Client:
++    def __init__(self, events, name='client', fail=False):
++        self.events, self.name, self.fail = events, name, fail
++        self.loop = asyncio.get_running_loop()
++
++    async def connect(self):
++        self.events.append(('connect', self.name))
++        if self.fail:
++            raise ValueError('connect failed')
++
++    def disconnect(self):
++        async def close():
++            self.events.append(('disconnect', self.name))
++        return close()
++
++    async def __call__(self, value):
++        assert asyncio.get_running_loop() is self.loop
++        return value
++
++    async def read(self):
++        return self.name
++
++
++class RuntimeTests(unittest.TestCase):
++    def setUp(self):
++        self.runtime = AsyncRuntime()
++        self.addCleanup(self.runtime.close)
++
++    def test_submissions_share_loop_and_cancel_independently(self):
++        started = threading.Event()
++        async def pending():
++            started.set()
++            await asyncio.Event().wait()
++        first = self.runtime.submit(pending())
++        self.assertTrue(started.wait(2))
++        async def identity():
++            return asyncio.get_running_loop()
++        self.assertIs(self.runtime.run(identity()), self.runtime.loop)
++        first.cancel()
++        self.assertIs(self.runtime.run(identity()), self.runtime.loop)
++
++    def test_blocking_run_on_owner_loop_is_rejected(self):
++        async def nested():
++            with self.assertRaises(RuntimeError):
++                self.runtime.run(asyncio.sleep(0))
++        self.runtime.run(nested())
++
++    def test_shared_session_has_one_connection_and_last_release_closes(self):
++        events = []
++        async def work():
++            first = self.runtime.broker.handle('sessions/../example.session', lambda: Client(events))
++            second = self.runtime.broker.handle('example.session', lambda: Client(events))
++            await asyncio.gather(first.connect(), second.connect())
++            self.assertEqual(await second('ok'), 'ok')
++            await first.disconnect()
++            self.assertEqual(await second.read(), 'client')
++            self.assertEqual(events, [('connect', 'client')])
++            await second.disconnect()
++            await second.disconnect()
++        self.runtime.run(work())
++        self.assertEqual(events, [('connect', 'client'), ('disconnect', 'client')])
++
++    def test_options_change_and_exclusive_queue_without_barging(self):
++        events = []
++        async def work():
++            broker = self.runtime.broker
++            old = broker.handle('example', lambda: Client(events, 'old'), options_key=1)
++            new = broker.handle('example', lambda: Client(events, 'new'), options_key=2, exclusive=True)
++            reader = broker.handle('example', lambda: Client(events, 'reader'), options_key=2)
++            await old.connect()
++            change = asyncio.create_task(new.connect())
++            await asyncio.sleep(0)
++            read = asyncio.create_task(reader.connect())
++            await asyncio.sleep(0)
++            self.assertFalse(change.done())
++            self.assertFalse(read.done())
++            await old.disconnect()
++            await change
++            self.assertFalse(read.done())
++            await new.disconnect()
++            await read
++            await reader.disconnect()
++        self.runtime.run(work(), timeout=3)
++        self.assertEqual(events, [('connect', 'old'), ('disconnect', 'old'), ('connect', 'new'), ('disconnect', 'new'), ('connect', 'reader'), ('disconnect', 'reader')])
++
++    def test_cancelled_wait_and_failed_connect_release_resources(self):
++        events = []
++        async def work():
++            broker = self.runtime.broker
++            async with broker.handle('example', lambda: Client(events)):
++                waiting = broker.handle('example', lambda: Client(events), exclusive=True)
++                task = asyncio.create_task(waiting.connect())
++                await asyncio.sleep(0)
++                task.cancel()
++                with self.assertRaises(asyncio.CancelledError):
++                    await task
++            bad = broker.handle('example', lambda: Client(events, 'bad', fail=True))
++            with self.assertRaises(ValueError):
++                await bad.connect()
++            async with broker.handle('example', lambda: Client(events, 'good')) as good:
++                self.assertEqual(await good.read(), 'good')
++        self.runtime.run(work(), timeout=3)
++        self.assertIn(('disconnect', 'bad'), events)
++
++    def test_wrong_loop_access_fails_and_shutdown_wakes_waiters(self):
++        events = []
++        handle = self.runtime.broker.handle('example', lambda: Client(events))
++        self.runtime.run(handle.connect())
++        async def wrong():
++            with self.assertRaises(RuntimeError):
++                await handle.read()
++        asyncio.run(wrong())
++        waiting = self.runtime.broker.handle('example', lambda: Client(events), exclusive=True)
++        pending = self.runtime.submit(waiting.connect())
++        self.runtime.close(timeout=2)
++        self.assertTrue(pending.done())
++        self.assertIn(('disconnect', 'client'), events)
++        rejected = asyncio.sleep(0)
++        with self.assertRaises(RuntimeError):
++            self.runtime.submit(rejected)
++
++class ReservationTests(unittest.TestCase):
++    def test_exclusive_scope_drains_and_allows_own_handles_reentrantly(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        events = []
++        async def work():
++            broker = runtime.broker
++            first = broker.handle('reserved', lambda: Client(events))
++            await first.connect()
++            entered = asyncio.Event()
++            release = asyncio.Event()
++            async def authorise():
++                async with broker.exclusive('reserved'):
++                    entered.set()
++                    async with broker.exclusive('reserved'):
++                        async with broker.handle('reserved', lambda: Client(events, 'auth')) as own:
++                            self.assertEqual(await own.read(), 'auth')
++                    await release.wait()
++            auth = asyncio.create_task(authorise())
++            await asyncio.sleep(0)
++            self.assertFalse(entered.is_set())
++            await first.disconnect()
++            await entered.wait()
++            reader = broker.handle('reserved', lambda: Client(events, 'reader'))
++            pending = asyncio.create_task(reader.connect())
++            await asyncio.sleep(0)
++            self.assertFalse(pending.done())
++            release.set()
++            await auth
++            await pending
++            await reader.disconnect()
++        runtime.run(work(), timeout=3)
++
++class FailureBoundaryTests(unittest.TestCase):
++    def test_disconnect_failure_does_not_allow_another_owner(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        events = []
++        class BrokenClose(Client):
++            async def disconnect(self):
++                raise OSError('close failed')
++        async def work():
++            first = runtime.broker.handle('broken', lambda: BrokenClose(events))
++            await first.connect()
++            with self.assertRaises(OSError):
++                await first.disconnect()
++            second = runtime.broker.handle('broken', lambda: Client(events, 'second'))
++            with self.assertRaises(RuntimeError):
++                await second.connect()
++        runtime.run(work(), timeout=2)
++        self.assertEqual(events, [('connect', 'client')])
++
++    def test_awaiting_forwarded_call_on_wrong_loop_is_rejected(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        async def prepare():
++            handle = runtime.broker.handle('example', lambda: Client([]))
++            await handle.connect()
++            return handle.read()
++        pending = runtime.run(prepare())
++        async def wrong():
++            with self.assertRaises(RuntimeError):
++                await pending
++        asyncio.run(wrong())
++
++    def test_cached_method_uses_current_connected_client(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        names = iter(['first', 'second'])
++        async def work():
++            handle = runtime.broker.handle('cached', lambda: Client([], next(names)))
++            await handle.connect()
++            read = handle.read
++            await handle.disconnect()
++            await handle.connect()
++            self.assertEqual(await read(), 'second')
++            await handle.disconnect()
++        runtime.run(work(), timeout=2)
++
++    def test_legacy_lease_blocks_managed_client_factory(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        events = []
++        started = threading.Event()
++        async def work():
++            started.set()
++            async with runtime.broker.handle('leased', lambda: Client(events)):
++                pass
++        with runtime.leases.lease(['leased']):
++            pending = runtime.submit(work())
++            self.assertTrue(started.wait(1))
++            self.assertFalse(pending.done())
++            self.assertEqual(events, [])
++        pending.result(2)
++        self.assertEqual(events, [('connect', 'client'), ('disconnect', 'client')])
++
++class TrackingBoundaryTests(unittest.TestCase):
++    def test_waiting_for_session_updates_only_current_operation(self):
++        from tam_core.operations import OperationRegistry
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        registry = OperationRegistry()
++        operation = registry.start('authorise')
++        unrelated = registry.start('read')
++        async def work():
++            first = runtime.broker.handle('status', lambda: Client([]))
++            await first.connect()
++            async def exclusive():
++                with runtime.broker.operation(operation):
++                    async with runtime.broker.exclusive('status'):
++                        pass
++            pending = asyncio.create_task(exclusive())
++            await asyncio.sleep(0)
++            self.assertEqual(operation.snapshot()['status'], 'waiting')
++            self.assertEqual(unrelated.snapshot()['status'], 'running')
++            await first.disconnect()
++            await pending
++            self.assertEqual(operation.snapshot()['status'], 'running')
++        runtime.run(work(), timeout=2)
++
++    def test_per_handle_flood_threshold_reaches_request_without_preconnect_lookup(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        class RequestClient(Client):
++            async def __call__(self, value, *, flood_sleep_threshold=None):
++                return value, flood_sleep_threshold
++        async def work():
++            first = runtime.broker.handle('flood', lambda: RequestClient([]))
++            first._tam_flood_sleep_threshold = 0
++            other = runtime.broker.handle('flood', lambda: RequestClient([]))
++            other._tam_flood_sleep_threshold = 60
++            async with first, other:
++                self.assertEqual(await first('admin'), ('admin', 0))
++                self.assertEqual(await other('upload'), ('upload', 60))
++                self.assertEqual(await first('explicit', flood_sleep_threshold=5), ('explicit', 5))
++        runtime.run(work(), timeout=2)
++
++    def test_suffix_alias_and_metadata_share_a_client(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        events = []
++        async def work():
++            first = runtime.broker.handle('suffix', lambda: Client(events))
++            first._tam_route = 'direct'
++            self.assertEqual(first._tam_route, 'direct')
++            second = runtime.broker.handle('suffix.session', lambda: Client(events, 'second'))
++            async with first, second:
++                self.assertEqual(await second.read(), 'client')
++        runtime.run(work(), timeout=2)
++        self.assertEqual(events, [('connect', 'client'), ('disconnect', 'client')])
++
++class ShutdownBoundaryTests(unittest.TestCase):
++    def test_hung_disconnect_has_bounded_shutdown_and_wakes_submitted_waiter(self):
++        import time
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        disconnected = threading.Event()
++        class HungClose(Client):
++            async def disconnect(self):
++                disconnected.set()
++                await asyncio.Event().wait()
++        handle = runtime.broker.handle('hung', lambda: HungClose([]))
++        runtime.run(handle.connect())
++        waiting = runtime.broker.handle('hung', lambda: Client([]), exclusive=True)
++        future = runtime.submit(waiting.connect())
++        start = time.monotonic()
++        self.assertTrue(runtime.close(timeout=0.5))
++        self.assertLess(time.monotonic() - start, 1.5)
++        self.assertTrue(disconnected.is_set())
++        self.assertTrue(future.done())
++
++    def test_failed_async_factory_does_not_poison_session(self):
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        async def failing_factory():
++            raise ValueError('factory failed')
++        async def work():
++            handle = runtime.broker.handle('factory', failing_factory)
++            with self.assertRaises(ValueError):
++                await handle.connect()
++            async with runtime.broker.handle('factory', lambda: Client([])) as good:
++                self.assertEqual(await good.read(), 'client')
++        runtime.run(work(), timeout=2)
++
++
++class KeepaliveTests(unittest.TestCase):
++    def setUp(self):
++        self.runtime = AsyncRuntime()
++        self.addCleanup(self.runtime.close)
++
++    def test_releasing_and_reacquiring_same_options_reuses_idle_connection(self):
++        events = []
++        async def work():
++            broker = self.runtime.broker
++            for n in range(3):
++                async with broker.handle('idle', lambda: Client(events), options_key=1, keepalive=True) as handle:
++                    self.assertEqual(await handle.read(), 'client')
++            self.assertEqual(events, [('connect', 'client')])
++        self.runtime.run(work(), timeout=2)
++        self.runtime.close()
++        self.assertEqual(events, [('connect', 'client'), ('disconnect', 'client')])
++
++    def test_changed_options_disconnect_idle_before_new_factory_connects(self):
++        events = []
++        async def work():
++            broker = self.runtime.broker
++            async with broker.handle('idle', lambda: Client(events, 'old'), options_key=1, keepalive=True):
++                pass
++            self.assertEqual(events, [('connect', 'old')])
++            async with broker.handle('idle', lambda: Client(events, 'new'), options_key=2, keepalive=True):
++                self.assertEqual(events, [('connect', 'old'), ('disconnect', 'old'), ('connect', 'new')])
++        self.runtime.run(work(), timeout=2)
++
++    def test_exclusive_workflow_closes_idle_and_own_keepalive_handle_really_closes(self):
++        events = []
++        async def work():
++            broker = self.runtime.broker
++            async with broker.handle('idle', lambda: Client(events, 'old'), keepalive=True):
++                pass
++            async with broker.exclusive('idle'):
++                self.assertEqual(events, [('connect', 'old'), ('disconnect', 'old')])
++                async with broker.handle('idle', lambda: Client(events, 'auth'), keepalive=True):
++                    pass
++                self.assertEqual(events[-1], ('disconnect', 'auth'))
++            async with broker.handle('idle', lambda: Client(events, 'fresh'), keepalive=True):
++                self.assertEqual(events[-1], ('connect', 'fresh'))
++        self.runtime.run(work(), timeout=2)
++
++    def test_exclusive_handle_closes_idle_even_when_options_match(self):
++        events = []
++        async def work():
++            broker = self.runtime.broker
++            async with broker.handle('idle', lambda: Client(events, 'old'), keepalive=True):
++                pass
++            async with broker.handle('idle', lambda: Client(events, 'exclusive'), exclusive=True, keepalive=True):
++                self.assertEqual(events, [('connect', 'old'), ('disconnect', 'old'), ('connect', 'exclusive')])
++            self.assertEqual(events[-1], ('disconnect', 'exclusive'))
++        self.runtime.run(work(), timeout=2)
++
++
++class SharedWaitStatusTests(unittest.TestCase):
++    def test_free_child_and_cancelled_child_do_not_clear_another_child_wait(self):
++        from tam_core.operations import OperationRegistry
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        operation = OperationRegistry().start('parallel')
++        async def work():
++            held = runtime.broker.handle('busy', lambda: Client([]))
++            await held.connect()
++            with runtime.broker.operation(operation):
++                first = runtime.broker.handle('busy', lambda: Client([]), exclusive=True)
++                second = runtime.broker.handle('busy', lambda: Client([]), exclusive=True)
++                waiting = asyncio.create_task(first.connect())
++                remaining = asyncio.create_task(second.connect())
++                await asyncio.sleep(0)
++                self.assertEqual(operation.snapshot()['status'], 'waiting')
++                async with runtime.broker.handle('free', lambda: Client([])):
++                    self.assertEqual(operation.snapshot()['status'], 'waiting')
++                waiting.cancel()
++                with self.assertRaises(asyncio.CancelledError):
++                    await waiting
++                self.assertEqual(operation.snapshot()['status'], 'waiting')
++                await held.disconnect()
++                await remaining
++                self.assertEqual(operation.snapshot()['status'], 'running')
++                await second.disconnect()
++        runtime.run(work(), timeout=2)
++
++
++class TransferSlotTests(unittest.TestCase):
++    def setUp(self):
++        self.runtime = AsyncRuntime()
++        self.addCleanup(self.runtime.close)
++
++    def test_same_account_is_serial_across_independent_runs_but_reads_continue(self):
++        async def work():
++            entered = asyncio.Event()
++            release = asyncio.Event()
++            async def second_run():
++                async with self.runtime.transfer_slot('account.session', lambda: 3):
++                    entered.set()
++                    await release.wait()
++            async with self.runtime.transfer_slot('account', lambda: 3):
++                other = asyncio.create_task(second_run())
++                await asyncio.sleep(0)
++                self.assertFalse(entered.is_set())
++                async with self.runtime.broker.handle('account', lambda: Client([])) as read:
++                    self.assertEqual(await read.read(), 'client')
++            await entered.wait()
++            release.set()
++            await other
++        self.runtime.run(work(), timeout=2)
++
++    def test_global_limit_and_decrease_drain_active_files(self):
++        async def work():
++            cap = [2]
++            first_release, second_release = asyncio.Event(), asyncio.Event()
++            first_entered, second_entered, third_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
++            async def transfer(account, entered, release):
++                async with self.runtime.transfer_slot(account, lambda: cap[0]):
++                    entered.set()
++                    await release.wait()
++            first = asyncio.create_task(transfer('a', first_entered, first_release))
++            second = asyncio.create_task(transfer('b', second_entered, second_release))
++            await first_entered.wait()
++            await second_entered.wait()
++            final_release = asyncio.Event()
++            third = asyncio.create_task(transfer('c', third_entered, final_release))
++            await asyncio.sleep(0)
++            self.assertFalse(third_entered.is_set())  # Global cap of two is full.
++            cap[0] = 1
++            first_release.set()
++            await first
++            await asyncio.sleep(0)
++            self.assertFalse(third_entered.is_set())
++            second_release.set()
++            await second
++            await third_entered.wait()
++            final_release.set()
++            await third
++        self.runtime.run(work(), timeout=2)
++
++    def test_cancelling_waiter_and_active_transfer_leaks_no_permit(self):
++        async def work():
++            entered = asyncio.Event()
++            async def active():
++                async with self.runtime.transfer_slot('a', lambda: 1):
++                    entered.set()
++                    await asyncio.Event().wait()
++            running = asyncio.create_task(active())
++            await entered.wait()
++            async def blocked():
++                async with self.runtime.transfer_slot('b', lambda: 1):
++                    self.fail('cancelled waiter acquired a permit')
++            waiting = asyncio.create_task(blocked())
++            await asyncio.sleep(0)
++            waiting.cancel()
++            with self.assertRaises(asyncio.CancelledError):
++                await waiting
++            running.cancel()
++            with self.assertRaises(asyncio.CancelledError):
++                await running
++            async with self.runtime.transfer_slot('a', lambda: 1):
++                pass
++            async with self.runtime.transfer_slot('b', lambda: 1):
++                pass
++        self.runtime.run(work(), timeout=2)
++
++    def test_busy_account_waiter_does_not_block_a_free_account(self):
++        async def work():
++            same_entered, free_entered = asyncio.Event(), asyncio.Event()
++            release = asyncio.Event()
++            async def transfer(path, entered):
++                async with self.runtime.transfer_slot(path, lambda: 2):
++                    entered.set()
++                    await release.wait()
++            async with self.runtime.transfer_slot('a', lambda: 2):
++                same = asyncio.create_task(transfer('a', same_entered))
++                free = asyncio.create_task(transfer('b', free_entered))
++                await free_entered.wait()
++                self.assertFalse(same_entered.is_set())
++                release.set()
++                await free
++            await same
++        self.runtime.run(work(), timeout=2)
++
++    def test_limit_increase_is_observed_without_a_release(self):
++        async def work():
++            cap = [1]
++            entered = asyncio.Event()
++            async def other():
++                async with self.runtime.transfer_slot('b', lambda: cap[0]):
++                    entered.set()
++            async with self.runtime.transfer_slot('a', lambda: cap[0]):
++                waiting = asyncio.create_task(other())
++                await asyncio.sleep(0)
++                self.assertFalse(entered.is_set())
++                cap[0] = 2
++                await entered.wait()
++                await waiting
++        self.runtime.run(work(), timeout=2)
++
++
++class ScopedFloodPolicyTests(unittest.TestCase):
++    def test_concurrent_utility_calls_assignment_and_explicit_request_are_isolated(self):
++        from tam_core.runtime import CLIENT_FLOOD_POLICY
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        class PolicyClient(Client):
++            @property
++            def flood_sleep_threshold(self):
++                requested = CLIENT_FLOOD_POLICY.get()
++                return 60 if requested is None else requested
++
++            async def utility(self, entered, release):
++                before = self.flood_sleep_threshold
++                entered.set()
++                await release.wait()
++                return before, self.flood_sleep_threshold
++
++            async def __call__(self, value, *, flood_sleep_threshold=None):
++                await asyncio.sleep(0)
++                return value, flood_sleep_threshold, self.flood_sleep_threshold
++
++        async def work():
++            admin = runtime.broker.handle('policy', lambda: PolicyClient([]))
++            admin.flood_sleep_threshold = 0
++            upload = runtime.broker.handle('policy', lambda: PolicyClient([]))
++            upload.flood_sleep_threshold = 60
++            admin_entered, upload_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
++            async with admin, upload:
++                pending_admin = asyncio.create_task(admin.utility(admin_entered, release))
++                pending_upload = asyncio.create_task(upload.utility(upload_entered, release))
++                await admin_entered.wait()
++                await upload_entered.wait()
++                admin.flood_sleep_threshold = 7
++                release.set()
++                self.assertEqual(await pending_admin, (0, 0))
++                self.assertEqual(await pending_upload, (60, 60))
++                self.assertEqual(await admin('next'), ('next', 7, 7))
++                self.assertEqual(await upload('upload'), ('upload', 60, 60))
++                self.assertEqual(await admin('explicit', flood_sleep_threshold=11), ('explicit', 11, 11))
++                self.assertEqual(await admin('default', flood_sleep_threshold=None), ('default', None, 60))
++                self.assertEqual(admin.flood_sleep_threshold, 7)
++                self.assertIsNone(CLIENT_FLOOD_POLICY.get())
++                admin.flood_sleep_threshold = 90000
++                self.assertEqual(admin.flood_sleep_threshold, 86400)
++                admin.flood_sleep_threshold = None
++                self.assertEqual(admin.flood_sleep_threshold, 0)
++        runtime.run(work(), timeout=2)
++
++    def test_cancelled_utility_restores_callers_policy(self):
++        from tam_core.runtime import CLIENT_FLOOD_POLICY
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        class PolicyClient(Client):
++            async def utility(self):
++                self_seen = CLIENT_FLOOD_POLICY.get()
++                raise asyncio.CancelledError(self_seen)
++        async def work():
++            handle = runtime.broker.handle('policy', lambda: PolicyClient([]))
++            handle.flood_sleep_threshold = 0
++            async with handle:
++                previous = CLIENT_FLOOD_POLICY.set(13)
++                try:
++                    with self.assertRaises(asyncio.CancelledError) as caught:
++                        await handle.utility()
++                    self.assertEqual(caught.exception.args, (0,))
++                    self.assertEqual(CLIENT_FLOOD_POLICY.get(), 13)
++                finally:
++                    CLIENT_FLOOD_POLICY.reset(previous)
++        runtime.run(work(), timeout=2)
++
++
++class ScopedIteratorPolicyTests(unittest.TestCase):
++    def test_iterators_and_await_collection_preserve_captured_policy(self):
++        from tam_core.runtime import CLIENT_FLOOD_POLICY
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        class Rows:
++            def __init__(self, client):
++                self.client, self.remaining, self.closed_policy = client, 2, None
++            def __aiter__(self):
++                return self
++            async def __anext__(self):
++                if not self.remaining:
++                    raise StopAsyncIteration
++                self.remaining -= 1
++                before = self.client.flood_sleep_threshold
++                await asyncio.sleep(0)
++                return before, self.client.flood_sleep_threshold
++            async def collect(self):
++                return [row async for row in self]
++            def __await__(self):
++                return self.collect().__await__()
++            async def aclose(self):
++                await asyncio.sleep(0)
++                self.closed_policy = self.client.flood_sleep_threshold
++                return self.closed_policy
++        class PolicyClient(Client):
++            @property
++            def flood_sleep_threshold(self):
++                policy = CLIENT_FLOOD_POLICY.get()
++                return 60 if policy is None else policy
++            def iter_rows(self):
++                return Rows(self)
++        async def work():
++            admin = runtime.broker.handle('iterator', lambda: PolicyClient([]))
++            upload = runtime.broker.handle('iterator', lambda: PolicyClient([]))
++            admin.flood_sleep_threshold = 0
++            upload.flood_sleep_threshold = 60
++            async with admin, upload:
++                rows = admin.iter_rows()
++                admin.flood_sleep_threshold = 7
++                async def consume(iterator):
++                    return [row async for row in iterator]
++                first, second = await asyncio.gather(consume(rows), consume(upload.iter_rows()))
++                self.assertEqual(first, [(0, 0), (0, 0)])
++                self.assertEqual(second, [(60, 60), (60, 60)])
++                self.assertEqual(await rows.aclose(), 0)
++                self.assertEqual(await admin.iter_rows(), [(7, 7), (7, 7)])
++                self.assertIsNone(CLIENT_FLOOD_POLICY.get())
++        runtime.run(work(), timeout=2)
++
++    def test_cancelled_next_and_explicit_close_restore_callers_context(self):
++        from tam_core.runtime import CLIENT_FLOOD_POLICY
++        runtime = AsyncRuntime()
++        self.addCleanup(runtime.close)
++        class PolicyClient(Client):
++            def iter_rows(self):
++                async def rows():
++                    try:
++                        yield CLIENT_FLOOD_POLICY.get()
++                        raise asyncio.CancelledError(CLIENT_FLOOD_POLICY.get())
++                    finally:
++                        self.closed_policy = CLIENT_FLOOD_POLICY.get()
++                return rows()
++        async def work():
++            handle = runtime.broker.handle('generator', lambda: PolicyClient([]))
++            handle.flood_sleep_threshold = 0
++            async with handle:
++                iterator = handle.iter_rows()
++                before = CLIENT_FLOOD_POLICY.set(13)
++                try:
++                    self.assertEqual(await anext(iterator), 0)
++                    with self.assertRaises(asyncio.CancelledError) as caught:
++                        await anext(iterator)
++                    self.assertEqual(caught.exception.args, (0,))
++                    self.assertEqual(CLIENT_FLOOD_POLICY.get(), 13)
++                    fresh = handle.iter_rows()
++                    self.assertEqual(await anext(fresh), 0)
++                    await fresh.aclose()
++                    self.assertEqual(handle.closed_policy, 0)
++                    self.assertEqual(CLIENT_FLOOD_POLICY.get(), 13)
++                finally:
++                    CLIENT_FLOOD_POLICY.reset(before)
++        runtime.run(work(), timeout=2)
++
++
++if __name__ == '__main__':
++    unittest.main()

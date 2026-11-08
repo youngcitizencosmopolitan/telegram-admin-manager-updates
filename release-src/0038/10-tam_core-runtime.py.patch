@@ -1,0 +1,635 @@
+--- /dev/null
++++ b/app/tam_core/runtime.py
+@@ -0,0 +1,632 @@
++"""One event-loop owner for Telegram clients and independently cancellable work."""
++from __future__ import annotations
++
++import asyncio
++import concurrent.futures
++import contextvars
++from contextlib import asynccontextmanager, contextmanager
++import inspect
++from pathlib import Path
++import threading
++import time
++from collections import deque
++
++from .operations import SessionLeaseManager, canonical_session_path
++
++
++# The concrete TelegramClient adapter consults this policy from convenience
++# methods as well as direct requests. The raw client's stored default is never
++# mutated when independent handles overlap on one connection.
++CLIENT_FLOOD_POLICY = contextvars.ContextVar('tam_client_flood_policy', default=None)
++_FLOOD_POLICY_UNSET = object()
++
++
++async def _await_if_needed(value):
++    if inspect.isawaitable(value):
++        return await value
++    return value
++
++
++async def _settle_cleanup(coroutine):
++    """Keep ownership until physical cleanup settles, even after cancellation."""
++    cleanup = asyncio.create_task(coroutine)
++    cancelled = None
++    while not cleanup.done():
++        try:
++            await asyncio.shield(cleanup)
++        except asyncio.CancelledError as error:
++            cancelled = error
++    result = cleanup.result()
++    if cancelled is not None:
++        raise cancelled
++    return result
++
++
++def _dispose_coroutine(coro):
++    if inspect.iscoroutine(coro):
++        coro.close()
++
++
++class AsyncRuntime:
++    def __init__(self, name='tam-async'):
++        self._lock = threading.RLock()
++        self._closing = False
++        self._futures = set()
++        self._ready = threading.Event()
++        self.leases = SessionLeaseManager()
++        self._thread = threading.Thread(target=self._serve, name=name, daemon=True)
++        self._thread.start()
++        self._ready.wait()
++        self.broker = ManagedClientBroker(self)
++        self._transfer_condition = asyncio.Condition()
++        self._active_transfer_sessions = set()
++        self._transfer_waiters = deque()
++
++    def _serve(self):
++        self.loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(self.loop)
++        self._ready.set()
++        try:
++            self.loop.run_forever()
++        finally:
++            for task in asyncio.all_tasks(self.loop):
++                task.cancel()
++                # A cancellation-resistant third-party task cannot hold shutdown
++                # forever. It has already received the bounded grace period.
++                task._log_destroy_pending = False
++            self.loop.close()
++
++    def assert_owner_loop(self):
++        try:
++            running = asyncio.get_running_loop()
++        except RuntimeError:
++            running = None
++        if running is not self.loop:
++            raise RuntimeError('Managed clients must be used on the runtime event loop')
++
++    def submit(self, coro):
++        with self._lock:
++            if self._closing:
++                _dispose_coroutine(coro)
++                raise RuntimeError('Async runtime is closed')
++            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
++            self._futures.add(future)
++            future.add_done_callback(self._forget_future)
++            return future
++
++    def _forget_future(self, future):
++        with self._lock:
++            self._futures.discard(future)
++
++    def run(self, coro, timeout=None):
++        if threading.current_thread() is self._thread:
++            _dispose_coroutine(coro)
++            raise RuntimeError('Blocking run() cannot be called on the runtime loop')
++        future = self.submit(coro)
++        try:
++            return future.result(timeout)
++        except concurrent.futures.TimeoutError:
++            future.cancel()
++            raise
++
++    @asynccontextmanager
++    async def transfer_slot(self, session_path, limit_provider, *, cancelled=None):
++        """Hold one file's shared global permit and exclusive account permit.
++
++        Use across assignment, upload, publication and history recording. The
++        synchronous provider must read a thread-safe settings snapshot, not Tk.
++        Reduced limits drain active files; increases are noticed within 50 ms.
++        Independent account waiters may pass a waiter whose account is active.
++        """
++        self.assert_owner_loop()
++        path = canonical_session_path(session_path)
++        token = object()
++        waiter = (token, path)
++        condition = self._transfer_condition
++        acquired = False
++        async with condition:
++            self._transfer_waiters.append(waiter)
++            try:
++                while True:
++                    if self._closing:
++                        raise RuntimeError('Async runtime is closed')
++                    if cancelled is not None and cancelled():
++                        raise asyncio.CancelledError()
++                    limit = max(1, int(limit_provider()))
++                    eligible = next((candidate for candidate, account in self._transfer_waiters
++                                     if account not in self._active_transfer_sessions), None)
++                    if eligible is token and len(self._active_transfer_sessions) < limit:
++                        self._active_transfer_sessions.add(path)
++                        acquired = True
++                        break
++                    self.broker._status(True, path, token, reason='transfer slot')
++                    try:
++                        await asyncio.wait_for(condition.wait(), timeout=0.05)
++                    except asyncio.TimeoutError:
++                        pass
++            finally:
++                self._transfer_waiters.remove(waiter)
++                self.broker._status(False, token=token)
++                condition.notify_all()
++        try:
++            yield
++        finally:
++            if acquired:
++                async def release():
++                    async with condition:
++                        self._active_transfer_sessions.discard(path)
++                        condition.notify_all()
++                cleanup = asyncio.create_task(release())
++                try:
++                    await asyncio.shield(cleanup)
++                except asyncio.CancelledError:
++                    await cleanup
++                    raise
++
++    @asynccontextmanager
++    async def network_slot(self, limit_provider, *, cancelled=None):
++        """Reserve shared network capacity only while a network action runs."""
++        self.assert_owner_loop()
++        if not hasattr(self, '_network_condition'):
++            self._network_condition = asyncio.Condition()
++            self._network_waiters = deque()
++            self._network_active = 0
++        condition = self._network_condition
++        token = object()
++        acquired = False
++        async with condition:
++            self._network_waiters.append(token)
++            try:
++                while True:
++                    if self._closing:
++                        raise RuntimeError('Async runtime is closed')
++                    if cancelled is not None and cancelled():
++                        raise asyncio.CancelledError()
++                    if self._network_waiters[0] is token and self._network_active < max(1, int(limit_provider())):
++                        self._network_active += 1
++                        acquired = True
++                        break
++                    self.broker._status(True, '', token, reason='network slot')
++                    try:
++                        await asyncio.wait_for(condition.wait(), .05)
++                    except asyncio.TimeoutError:
++                        pass
++            finally:
++                self._network_waiters.remove(token)
++                self.broker._status(False, token=token)
++                condition.notify_all()
++        try:
++            yield
++        finally:
++            if acquired:
++                async def release():
++                    async with condition:
++                        self._network_active -= 1
++                        condition.notify_all()
++                await _settle_cleanup(release())
++
++    async def _shutdown(self, timeout):
++        self.broker._closed = True
++        current = asyncio.current_task()
++        tasks = [task for task in asyncio.all_tasks() if task is not current]
++        for task in tasks:
++            task.cancel()
++        if tasks:
++            await asyncio.wait(tasks, timeout=max(0, timeout / 2))
++        cleanup = asyncio.create_task(self.broker.close())
++        done, _ = await asyncio.wait([cleanup], timeout=max(0, timeout / 2))
++        if not done:
++            cleanup.cancel()
++            # Let gather/child cancellation settle before the loop is stopped.
++            await asyncio.wait([cleanup], timeout=min(0.05, max(0, timeout / 8)))
++
++    def shutdown(self, timeout=5):
++        if threading.current_thread() is self._thread:
++            raise RuntimeError('Shutdown must be called outside the runtime loop')
++        deadline = time.monotonic() + max(0, timeout)
++        with self._lock:
++            if not self._closing:
++                self._closing = True
++                shutdown = asyncio.run_coroutine_threadsafe(self._shutdown(max(0, timeout * 0.8)), self.loop)
++            else:
++                shutdown = None
++        if shutdown is not None:
++            try:
++                shutdown.result(max(0, deadline - time.monotonic()))
++            except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
++                pass
++            finally:
++                self.leases.close()
++                with self._lock:
++                    for future in tuple(self._futures):
++                        future.cancel()
++                if not self.loop.is_closed():
++                    self.loop.call_soon_threadsafe(self.loop.stop)
++        self._thread.join(max(0, deadline - time.monotonic()))
++        return not self._thread.is_alive()
++
++    close = shutdown
++
++
++class _Session:
++    def __init__(self):
++        self.condition = asyncio.Condition()
++        self.waiters = deque()
++        self.client = None
++        self.options_key = None
++        self.handles = set()
++        self.exclusive = False
++        self.lease_owner = object()
++        self.reservation_owner = None
++        self.failure = None
++
++
++class ManagedClientBroker:
++    def __init__(self, runtime):
++        self.runtime = runtime
++        self._sessions = {}
++        self._closed = False
++        self._reservations = contextvars.ContextVar('tam_session_reservations', default={})
++        self._operation = contextvars.ContextVar('tam_operation', default=None)
++        self._wait_tokens = {}
++
++    @contextmanager
++    def operation(self, operation):
++        """Bind waiting messages to one operation (also inherited by submit())."""
++        token = self._operation.set(operation)
++        try:
++            yield operation
++        finally:
++            self._operation.reset(token)
++
++    def _status(self, waiting, path='', token=None, reason='session'):
++        operation = self._operation.get()
++        if operation is None:
++            return
++        if waiting:
++            outstanding = self._wait_tokens.setdefault(operation, {})
++            label = 'Ожидает свободный слот' if reason in ('transfer slot', 'network slot') else 'Ожидает аккаунт'
++            outstanding[token] = label + (': ' + Path(path).stem if path else '')
++        else:
++            outstanding = self._wait_tokens.get(operation)
++            if outstanding is None or token not in outstanding:
++                return
++            del outstanding[token]
++        if outstanding:
++            operation.update(status='waiting', detail=next(reversed(outstanding.values())))
++        else:
++            self._wait_tokens.pop(operation, None)
++            operation.update(status='running', detail='')
++
++    @asynccontextmanager
++    async def exclusive(self, session_path):
++        """Reserve a session across a whole authorization/file-swap workflow.
++
++        Child tasks inherit ownership; callers must join them before leaving.
++        Handles opened in this context may use the reserved session.
++        """
++        self.runtime.assert_owner_loop()
++        path = canonical_session_path(session_path)
++        inherited = self._reservations.get()
++        session = self._sessions.setdefault(path, _Session())
++        if path in inherited and session.reservation_owner is inherited[path]:
++            yield
++            return
++        token = object()
++        acquired = False
++        context_token = None
++        async with session.condition:
++            session.waiters.append(token)
++            try:
++                while True:
++                    if self._closed:
++                        raise RuntimeError('Client broker is closed')
++                    if session.failure is not None:
++                        raise RuntimeError('Session cleanup failed; restart the runtime before reusing it') from session.failure
++                    if session.waiters[0] is token and not session.handles and session.reservation_owner is None:
++                        break
++                    self._status(True, path, token)
++                    await session.condition.wait()
++                if session.client is not None:
++                    await self._disconnect_client(path, session)
++                while not self.runtime.leases.try_acquire([path], session.lease_owner):
++                    self._status(True, path, token)
++                    await asyncio.sleep(0.05)
++                    if self._closed:
++                        raise RuntimeError('Client broker is closed')
++                    if session.failure is not None:
++                        raise RuntimeError('Session cleanup failed; restart the runtime before reusing it') from session.failure
++                self._status(False, token=token)
++                session.reservation_owner = token
++                acquired = True
++                context_token = self._reservations.set({**inherited, path: token})
++            finally:
++                session.waiters.remove(token)
++                self._status(False, token=token)
++                session.condition.notify_all()
++        try:
++            yield
++        finally:
++            if acquired:
++                self._reservations.reset(context_token)
++                async def release_reservation():
++                    async with session.condition:
++                        session.reservation_owner = None
++                        if not session.handles and session.client is None:
++                            self.runtime.leases.release([path], session.lease_owner)
++                        session.condition.notify_all()
++                await _settle_cleanup(release_reservation())
++
++    def handle(self, session_path, factory, options_key=None, exclusive=False, keepalive=False):
++        """Create a lease handle, optionally retaining an idle reusable client.
++
++        Idle connections retain session ownership until a route/options change,
++        an exclusive workflow, or runtime teardown. Exclusive handles and handles
++        inside exclusive workflows always close on their final disconnect.
++        """
++        return ManagedClientHandle(self, canonical_session_path(session_path), factory,
++                                   options_key, exclusive, keepalive)
++
++    async def _acquire(self, handle):
++        self.runtime.assert_owner_loop()
++        if self._closed:
++            raise RuntimeError('Client broker is closed')
++        session = self._sessions.setdefault(handle.session_path, _Session())
++        token = object()
++        async with session.condition:
++            session.waiters.append(token)
++            try:
++                while True:
++                    if self._closed:
++                        raise RuntimeError('Client broker is closed')
++                    if session.failure is not None:
++                        raise RuntimeError('Session cleanup failed; restart the runtime before reusing it') from session.failure
++                    owns_reservation = (session.reservation_owner is not None and
++                                        self._reservations.get().get(handle.session_path) is session.reservation_owner)
++                    allowed = session.reservation_owner is None or owns_reservation
++                    compatible = allowed and (not session.handles or
++                                  (not session.exclusive and not handle.exclusive and
++                                   session.options_key == handle.options_key))
++                    if (session.waiters[0] is token or owns_reservation) and compatible:
++                        break
++                    self._status(True, handle.session_path, token)
++                    await session.condition.wait()
++                if (session.client is not None and not session.handles and
++                        (session.options_key != handle.options_key or handle.exclusive)):
++                    await self._disconnect_client(handle.session_path, session)
++                if session.client is None:
++                    while not self.runtime.leases.try_acquire([handle.session_path], session.lease_owner):
++                        self._status(True, handle.session_path, token)
++                        await asyncio.sleep(0.05)
++                        if self._closed:
++                            raise RuntimeError('Client broker is closed')
++                    self._status(False, token=token)
++                    client = None
++                    try:
++                        candidate = handle.factory()
++                        client = await _await_if_needed(candidate)
++                        await _await_if_needed(client.connect())
++                    except BaseException:
++                        if client is not None:
++                            session.client = client
++                            await self._disconnect_client(handle.session_path, session)
++                        elif session.reservation_owner is None:
++                            self.runtime.leases.release([handle.session_path], session.lease_owner)
++                        raise
++                    session.client = client
++                    session.options_key = handle.options_key
++                    session.exclusive = handle.exclusive
++                else:
++                    await self._reconnect_if_needed(session)
++                session.handles.add(handle)
++                handle._session = session
++            finally:
++                session.waiters.remove(token)
++                self._status(False, token=token)
++                session.condition.notify_all()
++
++    async def _disconnect_client(self, path, session):
++        """Caller holds the session condition; retain ownership on failure."""
++        if session.client is None:
++            return
++        async def physical_disconnect():
++            try:
++                await _await_if_needed(session.client.disconnect())
++            except BaseException as error:
++                session.failure = error
++                raise
++            else:
++                session.client = None
++                if session.reservation_owner is None:
++                    self.runtime.leases.release([path], session.lease_owner)
++        await _settle_cleanup(physical_disconnect())
++
++    async def _reconnect_if_needed(self, session):
++        connected = getattr(session.client, 'is_connected', None)
++        if callable(connected) and not await _await_if_needed(connected()):
++            await _await_if_needed(session.client.connect())
++
++    async def ensure_connected(self, handle):
++        self.runtime.assert_owner_loop()
++        session = handle._session
++        async with session.condition:
++            if session.failure is not None:
++                raise RuntimeError('Session cleanup failed; restart the runtime before reusing it') from session.failure
++            await self._reconnect_if_needed(session)
++
++    async def _release(self, handle):
++        session = handle._session
++        if session is None:
++            return
++        async with session.condition:
++            session.handles.discard(handle)
++            handle._session = None
++            retain_idle = (handle.keepalive and not session.exclusive and
++                           session.reservation_owner is None and not self._closed)
++            try:
++                if not session.handles and not retain_idle:
++                    await self._disconnect_client(handle.session_path, session)
++            finally:
++                session.condition.notify_all()
++
++    async def close(self):
++        self.runtime.assert_owner_loop()
++        self._closed = True
++        async def close_session(path, session):
++            async with session.condition:
++                for handle in session.handles:
++                    handle._session = None
++                session.handles.clear()
++                client, session.client = session.client, None
++                try:
++                    if client is not None:
++                        await _await_if_needed(client.disconnect())
++                finally:
++                    self.runtime.leases.release([path], session.lease_owner)
++                    session.condition.notify_all()
++        results = await asyncio.gather(*(close_session(path, session) for path, session in self._sessions.items()), return_exceptions=True)
++        return results
++
++
++class _PolicyAsyncIterator:
++    """Preserve lazy async iteration without dropping the handle's policy."""
++    def __init__(self, handle, source, flood_policy):
++        self._handle = handle
++        self._source = source
++        self._iterator = source if hasattr(source, '__anext__') else None
++        self._flood_policy = flood_policy
++
++    def _invoke(self, method, *args, **kwargs):
++        self._handle.broker.runtime.assert_owner_loop()
++        token = CLIENT_FLOOD_POLICY.set(self._flood_policy)
++        try:
++            value = method(*args, **kwargs)
++        finally:
++            CLIENT_FLOOD_POLICY.reset(token)
++        return self._handle._guard_result(value, flood_policy=self._flood_policy)
++
++    def __aiter__(self):
++        self._handle.broker.runtime.assert_owner_loop()
++        token = CLIENT_FLOOD_POLICY.set(self._flood_policy)
++        try:
++            self._iterator = self._source.__aiter__()
++        finally:
++            CLIENT_FLOOD_POLICY.reset(token)
++        return self
++
++    async def __anext__(self):
++        if self._iterator is None:
++            self.__aiter__()
++        return await self._invoke(self._iterator.__anext__)
++
++    def __getattr__(self, name):
++        self._handle.broker.runtime.assert_owner_loop()
++        target = self._iterator if self._iterator is not None and hasattr(self._iterator, name) else self._source
++        attribute = getattr(target, name)
++        if callable(attribute):
++            def call(*args, **kwargs):
++                return self._invoke(attribute, *args, **kwargs)
++            return call
++        return attribute
++
++
++class _PolicyAwaitableAsyncIterator(_PolicyAsyncIterator):
++    def __await__(self):
++        return self._handle._guard_awaitable(self._source, self._flood_policy).__await__()
++
++
++class ManagedClientHandle:
++    def __init__(self, broker, session_path, factory, options_key, exclusive, keepalive=False):
++        self.broker = broker
++        self.session_path = session_path
++        self.factory = factory
++        self.options_key = options_key
++        self.exclusive = exclusive
++        self.keepalive = keepalive
++        self._session = None
++        self._lock = None
++
++    @property
++    def flood_sleep_threshold(self):
++        if '_tam_flood_sleep_threshold' in self.__dict__:
++            return self.__dict__['_tam_flood_sleep_threshold']
++        if self._session is None:
++            return 60
++        return getattr(self._client(), 'flood_sleep_threshold', 60)
++
++    @flood_sleep_threshold.setter
++    def flood_sleep_threshold(self, value):
++        # Match Telethon's upper bound and its None/zero handling.
++        self._tam_flood_sleep_threshold = min(value or 0, 86400)
++
++    def _owner_lock(self):
++        self.broker.runtime.assert_owner_loop()
++        if self._lock is None:
++            self._lock = asyncio.Lock()
++        return self._lock
++
++    async def connect(self):
++        async with self._owner_lock():
++            if self._session is None:
++                await self.broker._acquire(self)
++            else:
++                await self.broker.ensure_connected(self)
++        return self
++
++    async def disconnect(self):
++        async with self._owner_lock():
++            await _settle_cleanup(self.broker._release(self))
++
++    def _client(self):
++        self.broker.runtime.assert_owner_loop()
++        if self._session is None:
++            raise RuntimeError('Managed client handle is not connected')
++        return self._session.client
++
++    def __getattr__(self, name):
++        attribute = getattr(self._client(), name)
++        if callable(attribute):
++            def call(*args, **kwargs):
++                # Resolve again after reconnect rather than retain an old client.
++                return self._guard_result(getattr(self._client(), name)(*args, **kwargs))
++            return call
++        return attribute
++
++    def _guard_result(self, value, flood_policy=_FLOOD_POLICY_UNSET):
++        if flood_policy is _FLOOD_POLICY_UNSET:
++            flood_policy = self.__dict__.get('_tam_flood_sleep_threshold')
++        # RequestIter implements both protocols. Preserve iteration before
++        # considering await-based collection rather than turning it into a coro.
++        if hasattr(value, '__aiter__'):
++            wrapper = _PolicyAwaitableAsyncIterator if inspect.isawaitable(value) else _PolicyAsyncIterator
++            return wrapper(self, value, flood_policy)
++        if inspect.isawaitable(value):
++            return self._guard_awaitable(value, flood_policy)
++        return value
++
++    def _guard_awaitable(self, value, flood_policy):
++        async def guarded():
++            try:
++                self.broker.runtime.assert_owner_loop()
++            except RuntimeError:
++                _dispose_coroutine(value)
++                raise
++            context_token = CLIENT_FLOOD_POLICY.set(flood_policy)
++            try:
++                return await value
++            finally:
++                CLIENT_FLOOD_POLICY.reset(context_token)
++        return guarded()
++
++    def __call__(self, *args, **kwargs):
++        if '_tam_flood_sleep_threshold' in self.__dict__:
++            kwargs.setdefault('flood_sleep_threshold', self.__dict__['_tam_flood_sleep_threshold'])
++        return self._guard_result(self._client()(*args, **kwargs),
++                                  flood_policy=kwargs.get('flood_sleep_threshold'))
++
++    async def __aenter__(self):
++        await self.connect()
++        return self
++
++    async def __aexit__(self, *exc):
++        await self.disconnect()

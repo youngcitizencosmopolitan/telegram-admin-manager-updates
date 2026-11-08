@@ -1,0 +1,56 @@
+--- a/app/tam_ui/monitor_view.py
++++ b/app/tam_ui/monitor_view.py
+@@ -3,6 +3,8 @@
+ 
+ import tkinter as tk
+ from tkinter import ttk
++
++from tam_ui.table_clipboard import install_table_actions, telegram_link
+ 
+ 
+ class MonitorView:
+@@ -13,7 +15,7 @@
+                 'retry_unfinished_uploads', 'clear_selected_group_cache', '_save_cache_ttl',
+                 'resume_queue', 'toggle_pause_all', 'stop', 'clear_finished_activity')
+ 
+-    def __init__(self, parent, commands: dict, metrics: dict | None = None, *, ttl='24', on_select=None, queue_var=None):
++    def __init__(self, parent, commands: dict, metrics: dict | None = None, *, ttl='24', on_select=None, queue_var=None, activity_path_of=None):
+         self.commands = commands
+         self.selected = None
+         self.frame = ttk.Frame(parent)
+@@ -70,7 +72,7 @@
+         self.body_pane.add(rules, minsize=155, stretch='always')
+         cols = ('on', 'folder', 'target', 'caption', 'interval', 'new', 'queue', 'progress', 'speed', 'eta', 'state')
+         self.tree = ttk.Treeview(rules, columns=cols, displaycolumns=('queue', 'progress', 'speed', 'eta'),
+-                                 show='tree headings', selectmode='browse', height=7)
++                                 show='tree headings', selectmode='extended', height=7)
+         headings = {'#0':'Правило', 'on':'Мон.', 'folder':'Папка', 'target':'Группа', 'caption':'Подпись',
+                     'interval':'Интервал', 'new':'Новые', 'queue':'Состояние', 'progress':'%', 'speed':'Скорость',
+                     'eta':'Осталось', 'state':'Подробности'}
+@@ -86,6 +88,9 @@
+         self.tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+         if on_select:
+             self.tree.bind('<<TreeviewSelect>>', lambda _e: on_select())
++        install_table_actions(self.tree, columns=tuple(headings), id_of=str,
++                              path_of=lambda iid: self.tree.set(iid, 'folder'),
++                              link_of=lambda iid: telegram_link(self.tree.set(iid, 'target')))
+         self.summary_var = tk.StringVar(value='Правил: 0')
+         ttk.Label(rules, textvariable=self.summary_var, style='Muted.TLabel').grid(row=2, column=0, sticky='w')
+ 
+@@ -154,7 +159,7 @@
+         self.stop_button.pack(side='left')
+         ttk.Button(file_tools, text='Очистить завершённые', command=commands['clear_finished_activity']).pack(side='right')
+         acols = ('task', 'account', 'size', 'progress', 'speed', 'status')
+-        self.activity = ttk.Treeview(files, columns=acols, show='tree headings', height=5, selectmode='browse')
++        self.activity = ttk.Treeview(files, columns=acols, show='tree headings', height=5, selectmode='extended')
+         self.activity_headings = {'#0':'Файл', 'task':'Правило', 'account':'Аккаунт', 'size':'Размер',
+                                  'progress':'%', 'speed':'Скорость', 'status':'Статус'}
+         for key, label in self.activity_headings.items():
+@@ -165,6 +170,7 @@
+         ay = ttk.Scrollbar(files, orient='vertical', command=self.activity.yview); ay.grid(row=1, column=1, sticky='ns')
+         ax = ttk.Scrollbar(files, orient='horizontal', command=self.activity.xview); ax.grid(row=2, column=0, sticky='ew')
+         self.activity.configure(yscrollcommand=ay.set, xscrollcommand=ax.set)
++        install_table_actions(self.activity, columns=tuple(self.activity_headings), path_of=activity_path_of)
+         self.queue_var = queue_var or tk.StringVar(value='Очередь пуста')
+         ttk.Label(files, textvariable=self.queue_var, style='Muted.TLabel').grid(row=3, column=0, sticky='w')
+         for tag, color in [('uploading','#205ac1'), ('success','#12623f'), ('error','#a51c2b'), ('skipped','#805000')]:

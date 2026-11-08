@@ -1,0 +1,72 @@
+--- /dev/null
++++ b/app/tam_core/live_rules.py
+@@ -0,0 +1,69 @@
++"""Pure helpers for revisioned rule commands and live upload permits."""
++import asyncio
++import copy
++from types import MappingProxyType
++from tam_core.monitor_delta import monitor_identity
++
++DETECTION_FIELDS = frozenset({"monitor_signature", "monitor_last_success", "monitor_seen_initialized", "monitor_last_new_count", "monitor_last_detection"})
++
++def validate_patch(fields):
++    if {"id", "revision", "route_revision"}.intersection(fields):
++        raise ValueError("Нельзя менять ID или ревизию.")
++    for key, minimum, maximum in (("parallel", 1, 100), ("monitor_interval", 15, 3600), ("delay", 0, 86400)):
++        if key in fields:
++            value = float(fields[key])
++            if not minimum <= value <= maximum or (key != "delay" and value != int(value)):
++                raise ValueError(f"{key}: допустимо {minimum}–{maximum}")
++    if "account_sessions" in fields:
++        if not isinstance(fields["account_sessions"], (list, tuple)):
++            raise ValueError("Список аккаунтов должен быть списком сессий.")
++        if not fields["account_sessions"] and not fields.get("use_all_accounts"):
++            raise ValueError("Выберите хотя бы один аккаунт.")
++
++
++def route_changed(old, new):
++    return monitor_identity(old) != monitor_identity(new)
++
++def route_matches(old, new):
++    return not route_changed(old, new) and int(old.get("route_revision", 1)) == int(new.get("route_revision", 1))
++
++def revise(old, new):
++    result = copy.deepcopy(new)
++    changed = bool(old and route_changed(old, result))
++    result["revision"] = int(old.get("revision", 0)) + 1
++    result["route_revision"] = int(old.get("route_revision", 1)) + int(changed)
++    if changed:
++        for key in DETECTION_FIELDS:
++            result.pop(key, None)
++    return result, changed
++
++def immutable_settings(task):
++    return MappingProxyType(copy.deepcopy(task))
++
++class LiveSemaphore:
++    """A loop-owned permit counter whose limit can shrink without cancellation."""
++    def __init__(self, limit):
++        self.limit = limit
++        self.active = 0
++    async def __aenter__(self):
++        while self.active >= max(1, int(self.limit())):
++            await asyncio.sleep(0.05)
++        self.active += 1
++        return self
++    async def __aexit__(self, *exc):
++        self.active -= 1
++
++
++class RevisionedSeenStore:
++    """Bind legacy incremental membership writes to a single route revision."""
++    def __init__(self, store, rule):
++        self.store = store
++        self.route_revision = rule.get("route_revision", 1)
++    def seen_files(self, tid):
++        return self.store.seen_files(tid)
++    def replace_seen_files(self, tid, paths):
++        if not self.store.commit_scan(tid, self.route_revision, {}, paths):
++            raise ValueError("stale monitor route")
++    def apply_seen_delta(self, tid, added, removed):
++        if not self.store.db.monitor_rule_commit_scan(tid, self.route_revision, {}, delta=(added, removed)):
++            raise ValueError("stale monitor route")
