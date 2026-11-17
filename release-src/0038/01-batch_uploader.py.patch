@@ -1,0 +1,155 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -19,6 +19,7 @@
+ from tam_core.file_metadata import has_active_writer, stat_identity
+ from tam_core.folder_events import FolderSnapshotIndex
+ from tam_core.folder_scan import FolderWalker
++from tam_core.monitor_remaining import remaining_upload_text
+ from tam_core.monitor_delta import MonitorSeenState, monitor_identity, selected_delta_files, task_for_dispatch
+ from tam_core.preparation import PreparationPool
+ from tam_core.repositories import HISTORY_CHECK_BATCH_SIZE
+@@ -947,10 +948,10 @@
+         headings = {
+             "#0": "Правило", "on": "Мон.", "source": "Источник", "folder": "Папка", "target": "Группа",
+             "interval": "Интервал", "last": "Последняя проверка", "next": "Следующая",
+-            "admins": "Админы (кэш)", "topics": "Темы (кэш)", "new": "Новые", "queue": "Очередь", "state": "Состояние",
++            "admins": "Админы (кэш)", "topics": "Темы (кэш)", "new": "Осталось файлов", "queue": "Очередь", "state": "Состояние",
+         }
+         widths = {"#0": 145, "on": 50, "source": 95, "folder": 225, "target": 180, "interval": 70, "last": 120,
+-                  "next": 95, "admins": 100, "topics": 85, "new": 70, "queue": 95, "state": 160}
++                  "next": 95, "admins": 100, "topics": 85, "new": 100, "queue": 95, "state": 160}
+         for col, title in headings.items():
+             self.monitor_tree.heading(col, text=title)
+             self.monitor_tree.column(col, width=widths[col], minwidth=50, anchor="w" if col not in {"on", "source", "interval", "admins", "topics", "new", "queue"} else "center")
+@@ -1035,12 +1036,12 @@
+         self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="browse")
+         headings = {
+             "#0": "Правило", "on": "Мон.", "folder": "Папка", "target": "Группа",
+-            "caption": "Подпись", "interval": "Интервал", "new": "Новые", "queue": "Работа",
++            "caption": "Подпись", "interval": "Интервал", "new": "Осталось файлов", "queue": "Работа",
+             "progress": "%", "speed": "Скорость", "eta": "Осталось", "state": "Состояние",
+         }
+         widths = {
+             "#0": 145, "on": 45, "folder": 220, "target": 175, "caption": 220,
+-            "interval": 65, "new": 55, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
++            "interval": 65, "new": 100, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
+         }
+         centered = {"on", "interval", "new", "queue", "progress"}
+         for col, title in headings.items():
+@@ -1332,9 +1333,9 @@
+                         self.app.group_display_name(str(rule.get("target", ""))) if hasattr(self.app, "group_display_name") else str(rule.get("target", "")),
+                         caption if caption else "—",
+                         f"{interval}с",
+-                        str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
++                        remaining_upload_text(task_state),
+                         presentation['status'],
+-                        f"{progress:.0f}%" if tid in live_ids and not blocked_count else "—",
++                        presentation['progress'] if tid in live_ids else '—',
+                         _fmt_speed(speed),
+                         _fmt_eta(eta_seconds) if work_text == "Выполняется" else ("0с" if progress >= 100.0 and work_text == "—" else "—"),
+                         state_text,
+@@ -1350,7 +1351,7 @@
+                         self.app.group_display_name(str(rule.get("target", ""))) if hasattr(self.app, "group_display_name") else str(rule.get("target", "")),
+                         f"{interval}с", self._clock(runtime.get("last_check") or rule.get("monitor_last_check", 0)), next_text,
+                         f"{known_admins}/{len(accounts)}" if accounts else "0/0", str(topics_count),
+-                        str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
++                        remaining_upload_text(task_state),
+                         work_text, state_text,
+                     ),
+                 )
+@@ -4619,6 +4620,16 @@
+         self.app.store.save()
+         self._queue_task_row(tid, files=total_files, size=_fmt_bytes(total_bytes), status='Подключение…')
+         if not files and not bool(task.get("forum_topics_from_subfolders", False)):
++            # No history query is necessary for an empty candidate snapshot.
++            self.task_states[tid] = {
++                '_monitor_identity': monitor_identity(task),
++                'name': name, 'target': str(task.get('target', '')),
++                'total_files': 0, 'processed_files': 0,
++                'total_bytes': 0, 'processed_bytes': 0,
++                'active': {}, 'success': 0, 'skipped': 0, 'limit_skipped': 0,
++                'failed': 0, 'blocked': 0, 'deferred': 0,
++            }
++            self._emit_dashboard(force=True)
+             self._queue_task_row(tid, status='Нет медиа', progress='100%')
+             return
+ 
+@@ -4687,16 +4698,13 @@
+                 return str(target_key)
+             return _forum_history_key(str(target_key), self._topic_title_for_path(task, path))
+ 
+-        if not files:
+-            self._queue_task_row(tid, status='✅ Темы синхронизированы', progress='100%', speed='—', eta='0с')
+-            return
+-
+         state = {
+             '_monitor_identity': monitor_identity(task),
+             "name": name,
+-            "target": str(task_target),
++            "target": str(task.get("target", "")),
+             "total_bytes": total_bytes,
+             "total_files": total_files,
++            "checking_history": bool(files),
+             "processed_bytes": 0,
+             "processed_files": 0,
+             "success": 0,
+@@ -4710,6 +4718,10 @@
+         }
+         self.task_states[tid] = state
+         self._emit_dashboard(force=True)
++
++        if not files:
++            self._queue_task_row(tid, status='✅ Нечего загружать', progress='100%', speed='—', eta='0с')
++            return
+ 
+         premium_sessions = [s for s in sessions if premium_by_session.get(s, False)]
+         self.app.log(
+@@ -4797,6 +4809,7 @@
+                 last_history_update = now
+                 self._queue_task_row(tid, status=f'Проверка кеша: {checked}/{total_files}')
+             await asyncio.sleep(0)
++        state['checking_history'] = self.stop_event.is_set()
+         self._emit_task_metrics(tid, force=True)
+ 
+         if self.stop_event.is_set():
+@@ -5047,23 +5060,23 @@
+                         big_queue.put_nowait(item)
+                         return
+ 
+-                async with account_locks[session]:
+-                    if prepared is not None and await asyncio.to_thread(read_stamp, path) != prepared.stamp:
+-                        queue_for_path(path).put_nowait(item)
+-                        continue
+-                    if health(session).get("disabled"):
+-                        queue_for_path(path).put_nowait(item)
+-                        return
+-                    if not self._runtime_task_account_allowed(task, session):
+-                        queue_for_path(path).put_nowait(item)
+-                        continue
+-                    if (
+-                        premium_priority is not None and premium_by_session.get(session, False)
+-                        and upload_lane != "premium" and premium_priority.has_work(session)
+-                    ):
+-                        small_queue.put_nowait(item)
+-                        continue
+-                    async with task_sem:
++                async with task_sem:
++                    async with account_locks[session]:
++                        if prepared is not None and await asyncio.to_thread(read_stamp, path) != prepared.stamp:
++                            queue_for_path(path).put_nowait(item)
++                            continue
++                        if health(session).get("disabled"):
++                            queue_for_path(path).put_nowait(item)
++                            return
++                        if not self._runtime_task_account_allowed(task, session):
++                            queue_for_path(path).put_nowait(item)
++                            continue
++                        if (
++                            premium_priority is not None and premium_by_session.get(session, False)
++                            and upload_lane != "premium" and premium_priority.has_work(session)
++                        ):
++                            small_queue.put_nowait(item)
++                            continue
+                         if not await self._wait_gate(tid):
+                             queue_for_path(path).put_nowait(item)
+                             return
