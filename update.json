@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0038",
-  "display_version": "0038",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0038/TelegramAdminManager_v0038_update.zip",
-  "sha256": "e4be6125c7d15d8d090788d0560fe73ba16482865551024f90c2b654abed7cc7",
-  "notes": "0038: независимые линии мониторинга и ручных загрузок; редактирование правил, подписей, аккаунтов и лимитов без остановки мониторинга. Параметры применяются к следующим файлам; текущий файл завершается со своими прежними настройками. Множественный выбор Ctrl/Shift, Ctrl+A/Ctrl+C, копирование строк/путей/ссылок и массовое редактирование отмеченных полей. Окно «Операции…» с прогрессом и отдельной отменой. Общие лимиты загрузки и защита от дублей сохранены; исправлена очистка сессий и фоновых задач при отмене и ошибках подключения. Для установки необходим обычный перезапуск приложения."
+  "version": "4.3.8.0039",
+  "display_version": "0039",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0039/TelegramAdminManager_v0039_update.zip",
+  "sha256": "8b40ccd2cf236882b7ad074631a767f88eab16ea8ed74ca90bab3c92024ed66b",
+  "notes": "0039: preserve the published 0038 concurrent runtime and live settings. Replace scan-arrival counts with remaining files in the last history-verified pass, including errors/deferred/unconfirmed work while excluding completed duplicates and oversized skips. Show unknown while checking and reset empty scans. Add local dispatch diagnostics: actual transmitting accounts, preparation, slot waiting, checks, publication and ordinary/Premium queues, without extra Telegram or disk queries. Preserve scheduling, rate limits, FloodWait handling and sessions. Add multi-account and slot-wait regression coverage."
 }
