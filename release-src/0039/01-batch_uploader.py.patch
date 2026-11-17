@@ -1,0 +1,273 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -22,6 +22,8 @@
+ from tam_core.file_metadata import has_active_writer, stat_identity
+ from tam_core.folder_events import FolderSnapshotIndex
+ from tam_core.folder_scan import FolderWalker
++from tam_core.monitor_remaining import remaining_upload_text
++from tam_core.monitor_dispatch import dispatch_snapshot, dispatch_text
+ from tam_core.monitor_delta import MonitorSeenState, monitor_identity, selected_delta_files, task_for_dispatch
+ from tam_core.preparation import PreparationPool
+ from tam_core.repositories import HISTORY_CHECK_BATCH_SIZE
+@@ -1157,10 +1159,10 @@
+         headings = {
+             "#0": "Правило", "on": "Мон.", "source": "Источник", "folder": "Папка", "target": "Группа",
+             "interval": "Интервал", "last": "Последняя проверка", "next": "Следующая",
+-            "admins": "Админы (кэш)", "topics": "Темы (кэш)", "new": "Новые", "queue": "Очередь", "state": "Состояние",
++            "admins": "Админы (кэш)", "topics": "Темы (кэш)", "new": "Осталось файлов", "queue": "Очередь", "state": "Состояние",
+         }
+         widths = {"#0": 145, "on": 50, "source": 95, "folder": 225, "target": 180, "interval": 70, "last": 120,
+-                  "next": 95, "admins": 100, "topics": 85, "new": 70, "queue": 95, "state": 160}
++                  "next": 95, "admins": 100, "topics": 85, "new": 100, "queue": 95, "state": 160}
+         for col, title in headings.items():
+             self.monitor_tree.heading(col, text=title)
+             self.monitor_tree.column(col, width=widths[col], minwidth=50, anchor="w" if col not in {"on", "source", "interval", "admins", "topics", "new", "queue"} else "center")
+@@ -1245,12 +1247,12 @@
+         self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="extended")
+         headings = {
+             "#0": "Правило", "on": "Мон.", "folder": "Папка", "target": "Группа",
+-            "caption": "Подпись", "interval": "Интервал", "new": "Новые", "queue": "Работа",
++            "caption": "Подпись", "interval": "Интервал", "new": "Осталось файлов", "queue": "Работа",
+             "progress": "%", "speed": "Скорость", "eta": "Осталось", "state": "Состояние",
+         }
+         widths = {
+             "#0": 145, "on": 45, "folder": 220, "target": 175, "caption": 220,
+-            "interval": 65, "new": 55, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
++            "interval": 65, "new": 100, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
+         }
+         centered = {"on", "interval", "new", "queue", "progress"}
+         for col, title in headings.items():
+@@ -1587,6 +1589,10 @@
+                     work_text = f'Нужен повтор: {blocked_count}'
+             from tam_ui.monitor_presentation import rule_presentation
+             presentation = rule_presentation(rule, runtime, task_state, running=tid in live_ids, queued=tid in queued)
++            if tid in live_ids:
++                dispatch = dispatch_text(task_state.get('dispatch'))
++                if dispatch:
++                    state_text += ' · ' + dispatch
+             caption = str(rule.get("caption", ""))
+             if self.unified_monitor:
+                 self._upsert_monitor_row(
+@@ -1597,9 +1603,9 @@
+                         self.app.group_display_name(str(rule.get("target", ""))) if hasattr(self.app, "group_display_name") else str(rule.get("target", "")),
+                         caption if caption else "—",
+                         f"{interval}с",
+-                        str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
++                        remaining_upload_text(task_state),
+                         presentation['status'],
+-                        f"{progress:.0f}%" if tid in live_ids and not blocked_count else "—",
++                        presentation['progress'] if tid in live_ids else '—',
+                         _fmt_speed(speed),
+                         _fmt_eta(eta_seconds) if work_text == "Выполняется" else ("0с" if progress >= 100.0 and work_text == "—" else "—"),
+                         state_text,
+@@ -1615,7 +1621,7 @@
+                         self.app.group_display_name(str(rule.get("target", ""))) if hasattr(self.app, "group_display_name") else str(rule.get("target", "")),
+                         f"{interval}с", self._clock(runtime.get("last_check") or rule.get("monitor_last_check", 0)), next_text,
+                         f"{known_admins}/{len(accounts)}" if accounts else "0/0", str(topics_count),
+-                        str(int(runtime.get("new_files", 0) or 0)) if int(runtime.get("new_files", 0) or 0) > 0 else "—",
++                        remaining_upload_text(task_state),
+                         work_text, state_text,
+                     ),
+                 )
+@@ -1626,8 +1632,13 @@
+         selected = tuple(iid for iid in selected if self.monitor_tree.exists(iid))
+         if selected and tuple(self.monitor_tree.selection()) != selected:
+             self.monitor_tree.selection_set(selected)
++        dispatch_states = [self.task_states.get(tid, {}).get('dispatch', {}) for tid in live_ids]
++        dispatch_totals = {key: sum(int(snapshot.get(key, 0)) for snapshot in dispatch_states)
++                           for key in ('sending', 'preparing', 'waiting', 'publishing', 'checking')}
+         self.monitor_summary_var.set(
+-            f"Правил: {enabled_count}/{len(rules)} · выполняется: {active_count} · кэш групп: {len(self.app.group_state_cache.all_entries())}"
++            f"Правил: {enabled_count}/{len(rules)} · передают: {dispatch_totals['sending']}"
++            f" · подготовка: {dispatch_totals['preparing']} · ожидание: {dispatch_totals['waiting']}"
++            f" · проверка: {dispatch_totals['checking']} · публикация: {dispatch_totals['publishing']}"
+         )
+         self.monitor_state_var.set("Работает" if self.monitor_active else "Остановлен")
+         self._update_monitor_details()
+@@ -5354,6 +5365,16 @@
+             self.app.store.save()
+         self._queue_task_row(tid, files=total_files, size=_fmt_bytes(total_bytes), status='Подключение…')
+         if not files and not bool(task.get("forum_topics_from_subfolders", False)):
++            # No history query is necessary for an empty candidate snapshot.
++            self.task_states[tid] = {
++                '_monitor_identity': monitor_identity(task),
++                'name': name, 'target': str(task.get('target', '')),
++                'total_files': 0, 'processed_files': 0,
++                'total_bytes': 0, 'processed_bytes': 0,
++                'active': {}, 'success': 0, 'skipped': 0, 'limit_skipped': 0,
++                'failed': 0, 'blocked': 0, 'deferred': 0,
++            }
++            self._emit_dashboard(force=True)
+             self._queue_task_row(tid, status='Нет медиа', progress='100%')
+             return
+ 
+@@ -5423,16 +5444,13 @@
+                 return str(target_key)
+             return _forum_history_key(str(target_key), self._topic_title_for_path(task, path))
+ 
+-        if not files:
+-            self._queue_task_row(tid, status='✅ Темы синхронизированы', progress='100%', speed='—', eta='0с')
+-            return
+-
+         state = {
+             '_monitor_identity': monitor_identity(task),
+             "name": name,
+             "target": str(task_target),
+             "total_bytes": total_bytes,
+             "total_files": total_files,
++            "checking_history": bool(files),
+             "processed_bytes": 0,
+             "processed_files": 0,
+             "success": 0,
+@@ -5446,6 +5464,10 @@
+         }
+         self.task_states[tid] = state
+         self._emit_dashboard(force=True)
++
++        if not files:
++            self._queue_task_row(tid, status='✅ Нечего загружать', progress='100%', speed='—', eta='0с')
++            return
+ 
+         premium_sessions = [s for s in sessions if premium_by_session.get(s, False)]
+         self.app.log(
+@@ -5533,6 +5555,7 @@
+                 last_history_update = now
+                 self._queue_task_row(tid, status=f'Проверка кеша: {checked}/{total_files}')
+             await asyncio.sleep(0)
++        state['checking_history'] = self.stop_event.is_set()
+         self._emit_task_metrics(tid, force=True)
+ 
+         if self.stop_event.is_set():
+@@ -5564,6 +5587,22 @@
+                 big_queue.put_nowait(item)
+             else:
+                 small_queue.put_nowait(item)
++
++        dispatch_stages = {}
++
++        def mark_dispatch(session=None, stage=None, lane=None):
++            # All mutations occur on the owning asyncio loop. Publish immutable
++            # scalar snapshots for Tk/run-controller readers; never query disks.
++            if session is not None:
++                if stage is None:
++                    dispatch_stages.pop(session, None)
++                else:
++                    old_lane = dispatch_stages.get(session, (None, None))[1]
++                    dispatch_stages[session] = stage, lane if lane is not None else old_lane
++            state['dispatch'] = dispatch_snapshot(small_queue.qsize(), big_queue.qsize(),
++                dispatch_stages, len(resolved), sum(bool(premium_by_session.get(s)) for s in resolved))
++
++        mark_dispatch()
+ 
+         parallel_auto = bool(task.get("parallel_auto", True))
+         task_parallel = 100 if parallel_auto else max(1, min(100, int(task.get("parallel", 2) or 2)))
+@@ -5761,6 +5800,7 @@
+                 claim_taken = reservation_held = publication_started = unconfirmed_recorded = False
+                 size = 0
+                 file_body = _FileBody(lambda interrupted=item: settle_interrupted_file(interrupted))
++                mark_dispatch(session, 'preparing')
+                 try:
+                     if not await self._wait_gate(tid):
+                         queue_for_path(path).put_nowait(item)
+@@ -5774,6 +5814,7 @@
+                         continue
+ 
+                     upload_lane = _telegram_upload_lane(size)
++                    mark_dispatch(session, 'preparing', upload_lane)
+                     if upload_lane == "too_large":
+                         state["processed_bytes"] += size
+                         state["processed_files"] += 1
+@@ -5827,7 +5868,9 @@
+                             big_queue.put_nowait(item)
+                             return
+ 
++                    mark_dispatch(session, 'account', upload_lane)
+                     async with self._task_admission(task_sem, tid), account_locks[session], self._shared_transfer_slot(session), self._file_client_lease(session, clients, client) as client, file_body:
++                        mark_dispatch(session, 'checking')
+                         if prepared is not None and await asyncio.to_thread(read_stamp, path) != prepared.stamp:
+                             queue_for_path(path).put_nowait(item)
+                             continue
+@@ -5970,6 +6013,8 @@
+ 
+                             def progress_callback(current: int, total: int) -> None:
+                                 nonlocal last_ui
++                                if media_kind == 'photo':
++                                    mark_dispatch(session, 'publishing' if total and current >= total else 'sending')
+                                 self._diagnostic('progress', key, current)
+                                 if self.stop_event.is_set():
+                                     raise BatchUploadStopped()
+@@ -6005,6 +6050,7 @@
+                                         queue_for_path(path).put_nowait(item)
+                                         state["active"].pop(key, None)
+                                         return
++                                    mark_dispatch(session, 'capacity')
+                                     async with global_sem:
+                                         if prepared is not None and (
+                                             await asyncio.to_thread(read_stamp, path) != prepared.stamp
+@@ -6049,8 +6095,10 @@
+                                         return ((all_event is not None and not all_event.is_set())
+                                                 or (task_event is not None and not task_event.is_set()))
+ 
+-                                    async def bounded_action(action):
++                                    async def bounded_action(action, phase='sending'):
++                                        mark_dispatch(session, 'capacity')
+                                         while await self._wait_gate(tid):
++                                            mark_dispatch(session, 'capacity')
+                                             async with global_sem:
+                                                 if self.stop_event.is_set():
+                                                     raise BatchUploadStopped()
+@@ -6062,7 +6110,11 @@
+                                                         raise BatchUploadStopped()
+                                                     if gate_closed():
+                                                         continue
+-                                                    return await action()
++                                                    mark_dispatch(session, phase)
++                                                    try:
++                                                        return await action()
++                                                    finally:
++                                                        mark_dispatch(session, 'checking')
+                                         raise BatchUploadStopped()
+ 
+                                     async def before_upload():
+@@ -6094,6 +6146,7 @@
+                                                 self._ui_latest(('monitor',), self.refresh_monitor_tab)
+ 
+                                     async def publish(send):
++                                        mark_dispatch(session, 'publishing')
+                                         if media_kind == 'video':
+                                             transfer['speed'] = 0.0
+                                             self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, 'Видео • публикация')
+@@ -6106,7 +6159,7 @@
+                                                 if not owned:
+                                                     raise BatchUploadStopped()
+                                                 publication_started = True
+-                                            return await bounded_action(send)
++                                            return await bounded_action(send, phase='sending' if media_kind == 'photo' and not safe_parts_retry_used else 'publishing')
+                                         return await _publish_with_min_gap(self._publication_state, session, delay,
+                                             marked_send, lambda: self._wait_gate(tid), self._sleep_stop)
+ 
+@@ -6194,6 +6247,7 @@
+                                         )
+                                     self._ui_latest(('health',), self.app.refresh_safety_health_table)
+                                     self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'Cooldown {wait_seconds}с')
++                                    mark_dispatch(session, 'backoff')
+                                     if not await self._sleep_stop(wait_seconds):
+                                         release_reservation()
+                                         queue_for_path(path).put_nowait(item)
+@@ -6336,6 +6390,7 @@
+                                             f"повтор {transient_retry_count}/{max_transient_retries} через {wait_seconds:.0f}с"
+                                         )
+                                         self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, f'↻ Повтор {transient_retry_count}/{max_transient_retries} через {wait_seconds:.0f}с')
++                                        mark_dispatch(session, 'backoff')
+                                         if not await self._sleep_stop(wait_seconds):
+                                             release_reservation()
+                                             queue_for_path(path).put_nowait(item)
+@@ -6381,6 +6436,8 @@
+                     if isinstance(exc, BatchUploadStopped):
+                         return
+                     raise
++                finally:
++                    mark_dispatch(session)
+ 
+                 # The next byte upload can begin immediately. Publication of
+                 # its handle observes the shared per-account interval above.

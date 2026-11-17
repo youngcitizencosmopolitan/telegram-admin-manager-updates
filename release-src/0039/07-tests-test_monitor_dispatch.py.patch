@@ -1,0 +1,29 @@
+--- /dev/null
++++ b/app/tests/test_monitor_dispatch.py
+@@ -0,0 +1,26 @@
++import unittest
++from tam_core.monitor_dispatch import dispatch_snapshot, dispatch_text
++
++class DispatchTests(unittest.TestCase):
++    def test_queues_and_actual_network_phase_are_separate(self):
++        stages = {'a': ('sending', 'premium'), 'b': ('preparing', 'small'), 'c': ('capacity', 'small')}
++        snapshot = dispatch_snapshot(0, 8, stages, 15, 1)
++        self.assertEqual(snapshot['sending'], 1)
++        self.assertEqual(snapshot['preparing'], 1)
++        self.assertEqual(snapshot['waiting'], 1)
++        self.assertEqual(snapshot['regular_inflight'], 2)
++        self.assertEqual(snapshot['premium_inflight'], 1)
++        self.assertIn('Premium: 8', dispatch_text(snapshot))
++        self.assertIn('передают: 1', dispatch_text(snapshot))
++    def test_publishing_and_backoff_are_not_counted_as_sending(self):
++        snapshot = dispatch_snapshot(0, 0, {'a': ('publishing','small'), 'b': ('backoff','small')}, 2, 0)
++        self.assertEqual(snapshot['sending'], 0)
++        self.assertEqual(snapshot['publishing'], 1)
++        self.assertEqual(snapshot['waiting'], 1)
++    def test_snapshot_does_not_retain_mutable_stage_mapping(self):
++        stages = {'a': ('sending', 'small')}
++        snapshot = dispatch_snapshot(1, 0, stages, 2, 0)
++        stages.clear()
++        self.assertEqual(snapshot['sending'], 1)
++    def test_unknown_snapshot_has_no_invented_explanation(self):
++        self.assertEqual(dispatch_text(None), '')

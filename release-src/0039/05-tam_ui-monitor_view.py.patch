@@ -1,0 +1,15 @@
+--- a/app/tam_ui/monitor_view.py
++++ b/app/tam_ui/monitor_view.py
+@@ -71,10 +71,10 @@
+         rules.columnconfigure(0, weight=1); rules.rowconfigure(0, weight=1)
+         self.body_pane.add(rules, minsize=155, stretch='always')
+         cols = ('on', 'folder', 'target', 'caption', 'interval', 'new', 'queue', 'progress', 'speed', 'eta', 'state')
+-        self.tree = ttk.Treeview(rules, columns=cols, displaycolumns=('queue', 'progress', 'speed', 'eta'),
++        self.tree = ttk.Treeview(rules, columns=cols, displaycolumns=('new', 'queue', 'progress', 'speed', 'eta'),
+                                  show='tree headings', selectmode='extended', height=7)
+         headings = {'#0':'Правило', 'on':'Мон.', 'folder':'Папка', 'target':'Группа', 'caption':'Подпись',
+-                    'interval':'Интервал', 'new':'Новые', 'queue':'Состояние', 'progress':'%', 'speed':'Скорость',
++                    'interval':'Интервал', 'new':'Осталось файлов', 'queue':'Состояние', 'progress':'%', 'speed':'Скорость',
+                     'eta':'Осталось', 'state':'Подробности'}
+         widths = {'#0':155, 'queue':170, 'progress':60, 'speed':95, 'eta':85}
+         for key, label in headings.items():

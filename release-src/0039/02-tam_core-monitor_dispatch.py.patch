@@ -1,0 +1,27 @@
+--- /dev/null
++++ b/app/tam_core/monitor_dispatch.py
+@@ -0,0 +1,24 @@
++"""Local dispatch observations only; never infer Telegram/network failures."""
++
++
++def dispatch_snapshot(regular, premium, stages, accounts, premium_accounts):
++    values = list(stages.values())
++    return dict(regular_queued=max(0, int(regular)), premium_queued=max(0, int(premium)),
++        accounts=max(0, int(accounts)), premium_accounts=max(0, int(premium_accounts)),
++        sending=sum(stage == 'sending' for stage, lane in values),
++        preparing=sum(stage == 'preparing' for stage, lane in values),
++        publishing=sum(stage == 'publishing' for stage, lane in values),
++        checking=sum(stage == 'checking' for stage, lane in values),
++        waiting=sum(stage in ('account', 'capacity', 'backoff') for stage, lane in values),
++        regular_inflight=sum(lane == 'small' for stage, lane in values),
++        premium_inflight=sum(lane == 'premium' for stage, lane in values))
++
++
++def dispatch_text(snapshot):
++    if not snapshot:
++        return ''
++    return (f"Аккаунты: передают: {snapshot['sending']}, подготовка: {snapshot['preparing']}, "
++            f"проверка: {snapshot['checking']}, ожидание: {snapshot['waiting']}, "
++            f"публикация: {snapshot['publishing']}. "
++            f"В очереди: обычные: {snapshot['regular_queued']}, Premium: {snapshot['premium_queued']}. "
++            f"Группу открыли в этом запуске: {snapshot['accounts']} (Premium: {snapshot['premium_accounts']}).")
