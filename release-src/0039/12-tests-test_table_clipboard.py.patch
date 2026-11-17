@@ -1,0 +1,13 @@
+--- a/app/tests/test_table_clipboard.py
++++ b/app/tests/test_table_clipboard.py
+@@ -541,8 +541,8 @@
+         view.tree.selection_set('r1')
+         actions = actions_for(view.tree)
+         actions.copy_rows()
+-        self.assertEqual(parse_tsv(self.copied), [['Правило', 'Состояние', '%', 'Скорость', 'Осталось'],
+-                                                  ['VIP', 'Загрузка', '20%', '1 МБ/с', '5с']])
++        self.assertEqual(parse_tsv(self.copied), [['Правило', 'Осталось файлов', 'Состояние', '%', 'Скорость', 'Осталось'],
++                                                  ['VIP', '—', 'Загрузка', '20%', '1 МБ/с', '5с']])
+         actions.copy_paths()
+         self.assertEqual(self.copied, 'D:/media')
+         actions.copy_links()

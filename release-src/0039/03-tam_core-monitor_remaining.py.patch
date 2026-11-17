@@ -1,0 +1,36 @@
+--- /dev/null
++++ b/app/tam_core/monitor_remaining.py
+@@ -0,0 +1,33 @@
++"""Remaining work in the last known, history-checked upload-pass snapshot.
++
++This metric describes unfulfilled files in that prepared pass, not the entire
++folder catalog or newly detected arrivals. Errors and deferred files still need
++attention after processing finishes; duplicates and oversized skips do not.
++No filesystem, history database, or Telegram queries are made here. Callers must
++mark history checking and withhold totals until a candidate snapshot is known.
++"""
++
++
++def remaining_upload_count(state: dict) -> int | None:
++    """Return known unfulfilled files, or None before history verification.
++
++    Active and blocked files are already included in unprocessed work. A blocked
++    warning overlay can have a smaller total, so its count supplies a lower bound
++    instead of being added twice. Failed/deferred files were processed but remain
++    unfulfilled. All counters are normalized to nonnegative integers.
++    """
++    if state.get('total_files') is None or state.get('checking_history'):
++        return None
++
++    total = max(0, int(state['total_files'] or 0))
++    processed = max(0, int(state.get('processed_files', 0) or 0))
++    blocked = max(0, int(state.get('blocked', 0) or 0))
++    failed = max(0, int(state.get('failed', 0) or 0))
++    deferred = max(0, int(state.get('deferred', 0) or 0))
++    return max(0, total - processed, blocked) + failed + deferred
++
++
++def remaining_upload_text(state: dict) -> str:
++    """Format known remaining work, using an ellipsis for an unknown snapshot."""
++    count = remaining_upload_count(state)
++    return '…' if count is None else str(count)

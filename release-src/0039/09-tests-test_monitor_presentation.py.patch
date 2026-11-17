@@ -1,0 +1,21 @@
+--- a/app/tests/test_monitor_presentation.py
++++ b/app/tests/test_monitor_presentation.py
+@@ -3,6 +3,18 @@
+ 
+ 
+ class RulePresentationTests(unittest.TestCase):
++    def test_history_check_has_explicit_status_and_no_completion(self):
++        row = rule_presentation({}, {}, {'checking_history': True,
++            'total_bytes': 100, 'processed_bytes': 100}, running=True, queued=False)
++        self.assertIn('кеша', row['status'])
++        self.assertEqual(row['progress'], '—')
++        self.assertIn('Осталось', row['detail'])
++
++    def test_failed_check_does_not_keep_transient_checking_status(self):
++        row = rule_presentation({}, {}, {'checking_history': True, 'failed': 1},
++                                running=False, queued=False)
++        self.assertIn('ошиб', row['status'].lower())
++
+     def test_deferred_empty_file_is_visible_without_false_completion(self):
+         row = rule_presentation({}, {'state': 'Без изменений'}, {'deferred': 1,
+             'total_bytes': 100, 'processed_bytes': 100}, running=False, queued=False)

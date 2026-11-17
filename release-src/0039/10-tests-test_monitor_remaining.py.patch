@@ -1,0 +1,79 @@
+--- /dev/null
++++ b/app/tests/test_monitor_remaining.py
+@@ -0,0 +1,76 @@
++import unittest
++
++from tam_core.monitor_remaining import remaining_upload_count, remaining_upload_text
++
++
++class MonitorRemainingTests(unittest.TestCase):
++    def test_unknown_snapshot_stays_unknown(self):
++        for state in ({}, {'scanning': True}, {'blocked': 3}, {'total_files': None}):
++            with self.subTest(state=state):
++                self.assertIsNone(remaining_upload_count(state))
++                self.assertEqual(remaining_upload_text(state), '…')
++
++    def test_history_check_hides_unverified_total(self):
++        state = {'total_files': 20, 'processed_files': 2, 'checking_history': True}
++        self.assertIsNone(remaining_upload_count(state))
++        self.assertEqual(remaining_upload_text(state), '…')
++
++    def test_pending_files_include_active_upload_once(self):
++        state = {'total_files': 10, 'processed_files': 6,
++                 'active': {'upload-1': {'done': 100}}}
++        self.assertEqual(remaining_upload_count(state), 4)
++        self.assertEqual(remaining_upload_text(state), '4')
++
++    def test_failed_uploads_remain_after_pass_finishes(self):
++        state = {'total_files': 10, 'processed_files': 10, 'failed': 2}
++        self.assertEqual(remaining_upload_count(state), 2)
++
++    def test_deferred_uploads_remain_after_pass_finishes(self):
++        state = {'total_files': 10, 'processed_files': 10, 'deferred': 3}
++        self.assertEqual(remaining_upload_count(state), 3)
++
++    def test_pending_failed_and_deferred_all_need_attention(self):
++        state = {'total_files': 12, 'processed_files': 8, 'failed': 2, 'deferred': 1}
++        self.assertEqual(remaining_upload_count(state), 7)
++
++    def test_blocked_files_already_in_unprocessed_are_not_added_twice(self):
++        state = {'total_files': 10, 'processed_files': 6, 'blocked': 3}
++        self.assertEqual(remaining_upload_count(state), 4)
++
++    def test_blocked_warning_overlay_preserves_remaining_count(self):
++        state = {'total_files': 0, 'processed_files': 0, 'blocked': 3,
++                 'failed': 1, 'deferred': 2}
++        self.assertEqual(remaining_upload_count(state), 6)
++
++    def test_duplicate_and_oversized_skips_are_fulfilled(self):
++        state = {'total_files': 10, 'processed_files': 10,
++                 'success': 5, 'skipped': 3, 'limit_skipped': 2}
++        self.assertEqual(remaining_upload_count(state), 0)
++        self.assertEqual(remaining_upload_text(state), '0')
++
++    def test_premium_size_block_remains_unfulfilled(self):
++        state = {'total_files': 4, 'processed_files': 2, 'blocked': 2,
++                 'limit_skipped': 0}
++        self.assertEqual(remaining_upload_count(state), 2)
++
++    def test_empty_verified_snapshot_is_zero(self):
++        self.assertEqual(remaining_upload_count({'total_files': 0}), 0)
++
++    def test_processed_overshoot_does_not_cancel_failures(self):
++        state = {'total_files': 2, 'processed_files': 5, 'failed': 1, 'deferred': 1}
++        self.assertEqual(remaining_upload_count(state), 2)
++
++    def test_negative_counters_do_not_produce_negative_remaining(self):
++        state = {'total_files': -1, 'processed_files': -5,
++                 'failed': -2, 'deferred': -3, 'blocked': -4}
++        self.assertEqual(remaining_upload_count(state), 0)
++
++    def test_counter_read_does_not_mutate_snapshot(self):
++        state = {'total_files': 5, 'processed_files': 2, 'failed': 1}
++        before = dict(state)
++        remaining_upload_text(state)
++        self.assertEqual(state, before)
++
++
++if __name__ == '__main__':
++    unittest.main()

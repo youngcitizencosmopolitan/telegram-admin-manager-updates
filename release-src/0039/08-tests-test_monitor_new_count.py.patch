@@ -1,0 +1,45 @@
+--- a/app/tests/test_monitor_new_count.py
++++ b/app/tests/test_monitor_new_count.py
+@@ -127,11 +127,18 @@
+             pane._persist_monitor_signature('r1', 'sig', processed_before=150.0)
+         self.assertEqual(pane.monitor_runtime['r1']['new_files'], 1)
+ 
+-    def test_tables_do_not_show_historical_arrivals_after_restart(self):
+-        for unified, new_column in ((True, 5), (False, 9)):
+-            with self.subTest(unified=unified):
++    def test_tables_show_verified_remaining_instead_of_arrivals(self):
++        for unified, new_column, state, expected in (
++            (unified, column, state, expected)
++            for unified, column in ((True, 5), (False, 9))
++            for state, expected in (({}, '…'),
++                ({'total_files': 20, 'processed_files': 15, 'failed': 2}, '7'),
++                ({'total_files': 20, 'processed_files': 20}, '0'),
++                ({'total_files': 20, 'checking_history': True}, '…'))
++        ):
++            with self.subTest(unified=unified, state=state):
+                 pane = self.pane()
+-                pane.monitor_runtime = {}
++                pane.monitor_runtime = {'r1': {'new_files': 139}}
+                 pane.unified_monitor = unified
+                 pane.monitor_tree = Tree()
+                 pane._monitor_selected_tid = lambda: None
+@@ -140,14 +147,16 @@
+                 pane.app.store = SimpleNamespace(accounts=lambda: [])
+                 pane.app.group_state_cache = SimpleNamespace(entry=lambda target: {}, all_entries=lambda: [])
+                 pane._live_task_lock = threading.Lock()
+-                pane.live_tasks = {}
+-                pane.task_states = {}
++                pane.live_tasks = {'r1': pane.app.monitor_rules.rule}
++                pane.task_states = {'r1': state}
+                 pane.monitor_active = False
+                 pane.running = False
+                 pane.monitor_summary_var = SimpleNamespace(set=lambda value: None)
+                 pane.monitor_state_var = SimpleNamespace(set=lambda value: None)
+                 pane.refresh_monitor_tab(force=True)
+-                self.assertEqual(pane.monitor_tree.rows['r1'][new_column], '\u2014')
++                self.assertEqual(pane.monitor_tree.rows['r1'][new_column], expected)
++                if unified and state.get('checking_history'):
++                    self.assertEqual(pane.monitor_tree.rows['r1'][7], '—')
+ 
+     def test_successful_batch_clears_its_detection(self):
+         pane = self.pane()

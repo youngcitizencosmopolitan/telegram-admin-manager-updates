@@ -1,0 +1,128 @@
+--- a/app/tests/test_prefetch_upload_boundary.py
++++ b/app/tests/test_prefetch_upload_boundary.py
+@@ -114,6 +114,125 @@
+         self.assertEqual([Path(p) for p, _ in self.sent], [first, second])
+         self.assertEqual(self.errors, [])
+ 
++    async def test_automatic_rule_starts_two_accounts_concurrently(self):
++        self.file('a.mp4', b'first')
++        self.file('b.mp4', b'second')
++        started = set()
++        both = asyncio.Event()
++        release = asyncio.Event()
++
++        class Client:
++            def __init__(self, session): self.session = session
++            async def upload_file(self, path, **kwargs):
++                started.add(self.session)
++                if len(started) == 2: both.set()
++                await release.wait()
++                return SimpleNamespace(path=path, name=Path(path).name)
++            async def send_file(self, *args, **kwargs): return SimpleNamespace(id=1)
++
++        clients = {s: (self.account, Client(s)) for s in ('s1', 's2')}
++        self.pane._effective_task_sessions = lambda *args: list(clients)
++        running = asyncio.create_task(self.pane._run_one_task(dict(self.rule), clients, {},
++            {s: asyncio.Lock() for s in clients}, asyncio.Semaphore(100), asyncio.Semaphore(2),
++            asyncio.Semaphore(2), preparation=self.pool))
++        try:
++            await asyncio.wait_for(both.wait(), 3)
++            self.assertEqual(started, {'s1', 's2'})
++            self.assertEqual(self.pane.task_states['r1']['dispatch']['sending'], 2)
++        finally:
++            release.set()
++            await asyncio.wait_for(running, 3)
++        self.assertEqual(self.pane.task_states['r1']['dispatch']['sending'], 0)
++
++    async def test_capacity_wait_is_visible_without_claiming_actual_upload(self):
++        self.file()
++        capacity = asyncio.Semaphore(0)
++        running = asyncio.create_task(self.run_task(semaphore=capacity))
++        try:
++            async def wait_for_claim():
++                while not self.pane.task_states.get('r1', {}).get('active'):
++                    await asyncio.sleep(0.01)
++            await asyncio.wait_for(wait_for_claim(), 3)
++            snapshot = self.pane.task_states['r1']['dispatch']
++            self.assertEqual(snapshot['waiting'], 1)
++            self.assertEqual(snapshot['sending'], 0)
++            self.assertEqual(self.sent, [])
++        finally:
++            capacity.release()
++            await asyncio.wait_for(running, 3)
++        self.assertEqual(self.pane.task_states['r1']['dispatch']['waiting'], 0)
++
++    async def test_photo_byte_transfer_is_not_reported_as_publication(self):
++        self.file('image.jpg', b'image')
++        self.rule['send_photos'] = True
++        phases = []
++        owner = self
++
++        class Client:
++            async def send_file(self, entity, path, **kwargs):
++                kwargs['progress_callback'](1, 5)
++                phases.append(dict(owner.pane.task_states['r1']['dispatch']))
++                kwargs['progress_callback'](5, 5)
++                phases.append(dict(owner.pane.task_states['r1']['dispatch']))
++                return SimpleNamespace(id=1)
++
++        await self.pane._run_one_task(dict(self.rule), {'s1': (self.account, Client())}, {},
++            {'s1': self.account_lock}, asyncio.Semaphore(100), asyncio.Semaphore(2),
++            asyncio.Semaphore(2), preparation=self.pool)
++        self.assertEqual(phases[0]['sending'], 1)
++        self.assertEqual(phases[1]['sending'], 0)
++        self.assertEqual(phases[1]['publishing'], 1)
++
++    async def test_empty_scan_replaces_previous_failed_pass_with_zero(self):
++        from tam_core.monitor_remaining import remaining_upload_count
++        self.pane.task_states['r1'] = {'total_files': 20, 'processed_files': 20, 'failed': 5}
++        await self.run_task()
++        self.assertEqual(remaining_upload_count(self.pane.task_states['r1']), 0)
++
++    async def test_rule_limit_does_not_reserve_idle_account_from_other_rule(self):
++        self.file('a.mp4', b'first')
++        self.file('b.mp4', b'second')
++        other_folder = self.root / 'other'
++        other_folder.mkdir()
++        (other_folder / 'c.mp4').write_bytes(b'other')
++        first_started, other_started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
++        busy = []
++
++        class Client:
++            def __init__(self, session): self.session = session
++            async def upload_file(self, path, **kwargs):
++                if Path(path).parent == other_folder:
++                    other_started.set()
++                else:
++                    busy.append(self.session)
++                    first_started.set()
++                    await release.wait()
++                return SimpleNamespace(path=path, name=Path(path).name)
++            async def send_file(self, *args, **kwargs): return SimpleNamespace(id=1)
++
++        clients = {s: (self.account, Client(s)) for s in ('s1', 's2')}
++        locks = {s: asyncio.Lock() for s in clients}
++        self.pane._effective_task_sessions = lambda task, *args: (
++            [s for s in clients if s != busy[0]] if task['id'] == 'r2' else list(clients))
++        first = dict(self.rule, parallel_auto=False, parallel=1)
++        other = dict(self.rule, id='r2', folder=str(other_folder))
++        self.pane.live_tasks['r2'] = other
++
++        async def run(rule):
++            await self.pane._run_one_task(rule, clients, {}, locks, asyncio.Semaphore(100),
++                asyncio.Semaphore(2), asyncio.Semaphore(2), preparation=self.pool)
++
++        tasks = [asyncio.create_task(run(first))]
++        try:
++            await asyncio.wait_for(first_started.wait(), 3)
++            # Let the second worker of the limited rule reach its slot wait.
++            await asyncio.sleep(0.1)
++            tasks.append(asyncio.create_task(run(other)))
++            await asyncio.wait_for(other_started.wait(), 2)
++        finally:
++            release.set()
++            await asyncio.wait_for(asyncio.gather(*tasks), 5)
++
+     async def test_monitor_delta_upload_does_not_rescan_completed_siblings(self):
+         from tam_core.folder_events import FolderSnapshotIndex
+         from test_folder_events import FakeEvents

@@ -1,0 +1,33 @@
+--- a/app/tam_ui/monitor_presentation.py
++++ b/app/tam_ui/monitor_presentation.py
+@@ -1,4 +1,7 @@
+ """Translate existing local state to UI text without querying Telegram."""
++
++
++from tam_core.monitor_dispatch import dispatch_text
+ 
+ 
+ def rule_presentation(rule: dict, runtime: dict, task_state: dict, *, running: bool, queued: bool) -> dict:
+@@ -10,7 +13,11 @@
+     failed = int(task_state.get('failed', 0) or 0)
+     deferred = int(task_state.get('deferred', 0) or 0)
+     progress = f'{min(100, done/total*100):.0f}%' if total and not blocked and not deferred else '—'
+-    if blocked:
++    if running and task_state.get('checking_history'):
++        status = 'Проверка кеша'
++        detail = 'Сверяется история отправок. «Осталось» появится после исключения уже загруженных файлов и файлов сверх лимита.'
++        progress = '—'
++    elif blocked:
+         status = 'Загружается · нужен повтор' if active else 'Нужен повтор'
+         detail = f'Для {blocked} отправок результат прошлого запуска не подтвержден. Повтор может создать дубль, если Telegram уже принял файл.'
+     elif failed:
+@@ -29,6 +36,9 @@
+     else:
+         status = str(runtime.get('state') or 'Ожидает изменений')
+         detail = status if runtime.get('state') else 'Новые изменения появятся в очереди после проверки папки.'
++    dispatch = dispatch_text(task_state.get('dispatch')) if running else ''
++    if dispatch:
++        detail += '\n' + dispatch
+     return dict(name=rule.get('name', 'Правило'), folder=rule.get('folder', ''),
+                 target=rule.get('target', ''), status=status, progress=progress,
+                 detail=detail, recovery_count=blocked, caption=rule.get('caption', ''),
