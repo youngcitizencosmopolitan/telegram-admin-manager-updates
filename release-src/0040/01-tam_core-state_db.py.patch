@@ -1,0 +1,162 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -10,7 +10,27 @@
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 13
++SCHEMA_VERSION = 14
++
++
++def _history_group_key(target_key: str) -> str:
++    # Only the two versioned forum suffixes are aliases of a group identity.
++    for marker in ('#topic:', '#forum:'):
++        if marker in target_key:
++            return target_key.split(marker, 1)[0]
++    return target_key
++
++
++def _history_scope_params(target_key: str) -> tuple[str, ...]:
++    base = _history_group_key(target_key)
++    return (base, base + '#topic:', base + '#topic:' + '\uffff',
++            base + '#forum:', base + '#forum:' + '\uffff')
++
++
++def _history_scope_sql(column: str = 'target_key') -> str:
++    # Internal column names only; every destination value is bound separately.
++    return (f'({column}=? OR ({column}>=? AND {column}<?) '
++            f'OR ({column}>=? AND {column}<?))')
+ 
+ 
+ class StateDatabase:
+@@ -169,6 +189,9 @@
+                 CREATE INDEX IF NOT EXISTS idx_uploads_source
+                     ON uploads(path, size, mtime_ns, target_key, fingerprint);
+ 
++                CREATE INDEX IF NOT EXISTS idx_uploads_fingerprint_scope
++                    ON uploads(fingerprint, target_key);
++
+                 CREATE TABLE IF NOT EXISTS file_fingerprints (
+                     path TEXT PRIMARY KEY,
+                     signature_json TEXT NOT NULL,
+@@ -186,6 +209,9 @@
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_upload_reservations_run
+                     ON upload_reservations(run_token, reserved_at);
++
++                CREATE INDEX IF NOT EXISTS idx_upload_reservations_fingerprint_scope
++                    ON upload_reservations(fingerprint, target_key);
+ 
+                 CREATE TABLE IF NOT EXISTS created_groups (
+                     id TEXT PRIMARY KEY,
+@@ -835,22 +861,30 @@
+         if not candidates:
+             return set()
+         with self.session() as conn:
+-            conn.execute('CREATE TEMP TABLE candidates(target_key TEXT, path TEXT, size INTEGER, mtime_ns INTEGER, fingerprint TEXT, allow_exact INTEGER)')
+-            conn.executemany('INSERT INTO candidates VALUES(?,?,?,?,?,?)', candidates)
++            conn.execute('CREATE TEMP TABLE candidates(target_key TEXT, path TEXT, size INTEGER, mtime_ns INTEGER, fingerprint TEXT, allow_exact INTEGER, scope_key TEXT)')
++            scoped = []
++            for candidate in candidates:
++                base = _history_group_key(candidate[0])
++                if forum_target_key is not None and base != _history_group_key(forum_target_key):
++                    base = candidate[0]  # Inconsistent forum context: exact destination only.
++                scoped.append((*candidate, base))
++            conn.executemany('INSERT INTO candidates VALUES(?,?,?,?,?,?,?)', scoped)
+             result = {row[0] for row in conn.execute(
+                 'SELECT c.rowid-1 FROM candidates c WHERE '
+                 '(c.allow_exact AND EXISTS (SELECT 1 FROM uploads u WHERE u.target_key=c.target_key AND u.path=c.path '
+                 'AND u.size=c.size AND u.mtime_ns=c.mtime_ns)) OR '
+-                "(c.fingerprint<>'' AND EXISTS (SELECT 1 FROM uploads u WHERE u.target_key=c.target_key AND u.fingerprint=c.fingerprint))"
++                "(c.fingerprint<>'' AND EXISTS (SELECT 1 FROM uploads u WHERE u.fingerprint=c.fingerprint AND ("
++                "u.target_key=c.scope_key OR (u.target_key>=c.scope_key||'#topic:' AND u.target_key<c.scope_key||'#topic:\uffff') OR "
++                "(u.target_key>=c.scope_key||'#forum:' AND u.target_key<c.scope_key||'#forum:\uffff'))))"
+             )}
+             if forum_target_key is not None:
+                 prefix = f'{forum_target_key}#topic:'
+                 result.update(row[0] for row in conn.execute(
+-                    'SELECT c.rowid-1 FROM candidates c WHERE EXISTS ('
++                    'SELECT c.rowid-1 FROM candidates c WHERE c.scope_key=? AND EXISTS ('
+                     'SELECT 1 FROM uploads u WHERE u.path=c.path AND u.size=c.size AND u.mtime_ns=c.mtime_ns '
+                     'AND u.target_key>=? AND u.target_key<? '
+                     "AND (c.allow_exact OR (c.fingerprint<>'' AND u.fingerprint=c.fingerprint)))",
+-                    (prefix, prefix + '\uffff'),
++                    (_history_group_key(forum_target_key), prefix, prefix + '\uffff'),
+                 ))
+         return result
+ 
+@@ -874,8 +908,8 @@
+     def upload_fingerprint_completed(self, target_key: str, fingerprint: str) -> bool:
+         with self.session() as conn:
+             row = conn.execute(
+-                "SELECT 1 FROM uploads WHERE target_key=? AND fingerprint=? LIMIT 1",
+-                (target_key, fingerprint),
++                "SELECT 1 FROM uploads WHERE fingerprint=? AND " + _history_scope_sql() + " LIMIT 1",
++                (fingerprint, *_history_scope_params(target_key)),
+             ).fetchone()
+         return row is not None
+ 
+@@ -898,22 +932,24 @@
+         with self.session() as conn:
+             conn.execute("BEGIN IMMEDIATE")
+             done = conn.execute(
+-                "SELECT 1 FROM uploads WHERE target_key=? AND fingerprint=? LIMIT 1",
+-                (target_key, fingerprint),
++                "SELECT 1 FROM uploads WHERE fingerprint=? AND " + _history_scope_sql() + " LIMIT 1",
++                (fingerprint, *_history_scope_params(target_key)),
+             ).fetchone()
+             if done is not None:
+                 return "completed"
+             existing = conn.execute(
+-                "SELECT run_token, prepublication FROM upload_reservations WHERE target_key=? AND fingerprint=? LIMIT 1",
+-                (target_key, fingerprint),
+-            ).fetchone()
+-            if existing is not None:
+-                if str(existing[0]) == str(run_token):
+-                    return 'in_progress'
+-                if not existing[1]:
+-                    return 'stale'
++                "SELECT run_token, prepublication, target_key FROM upload_reservations WHERE fingerprint=? AND "
++                + _history_scope_sql(), (fingerprint, *_history_scope_params(target_key)),
++            ).fetchall()
++            # Current work and uncertain publication always win over reclaimable
++            # reservations, including those written under another topic scheme.
++            if any(str(row[0]) == str(run_token) for row in existing):
++                return 'in_progress'
++            if any(not row[1] for row in existing):
++                return 'stale'
++            for row in existing:
+                 conn.execute('DELETE FROM upload_reservations WHERE target_key=? AND fingerprint=?',
+-                             (target_key, fingerprint))
++                             (row[2], fingerprint))
+             conn.execute(
+                 """
+                 INSERT INTO upload_reservations(target_key, fingerprint, path, run_token, claim_token, reserved_at, prepublication)
+@@ -945,10 +981,9 @@
+             rows = conn.execute(
+                 'SELECT target_key,fingerprint,path,run_token,claim_token FROM upload_reservations '
+                 'WHERE run_token<>? AND (target_key=? OR substr(target_key,1,?)=?) '
+-                'AND NOT EXISTS(SELECT 1 FROM uploads u WHERE u.target_key=upload_reservations.target_key '
+-                'AND u.fingerprint=upload_reservations.fingerprint) '
+-                'ORDER BY path,target_key,fingerprint',
+-                (current_run, target_key, len(prefix), prefix)).fetchall()
++                'AND NOT EXISTS(SELECT 1 FROM uploads u WHERE u.fingerprint=upload_reservations.fingerprint AND '
++                + _history_scope_sql('u.target_key') + ') ORDER BY path,target_key,fingerprint',
++                (current_run, target_key, len(prefix), prefix, *_history_scope_params(target_key))).fetchall()
+         return [dict(row) for row in rows]
+ 
+     def upload_release_stale_reservations(self, rows, current_run: str) -> int:
+@@ -958,9 +993,10 @@
+                 cur = conn.execute(
+                     'DELETE FROM upload_reservations WHERE target_key=? AND fingerprint=? '
+                     'AND run_token=? AND claim_token=? AND run_token<>? '
+-                    'AND NOT EXISTS(SELECT 1 FROM uploads u WHERE u.target_key=upload_reservations.target_key '
+-                    'AND u.fingerprint=upload_reservations.fingerprint)',
+-                    (row['target_key'], row['fingerprint'], row['run_token'], row['claim_token'], current_run))
++                    'AND NOT EXISTS(SELECT 1 FROM uploads u WHERE u.fingerprint=upload_reservations.fingerprint AND '
++                    + _history_scope_sql('u.target_key') + ')',
++                    (row['target_key'], row['fingerprint'], row['run_token'], row['claim_token'], current_run,
++                     *_history_scope_params(row['target_key'])))
+                 removed += cur.rowcount
+         return removed
+ 

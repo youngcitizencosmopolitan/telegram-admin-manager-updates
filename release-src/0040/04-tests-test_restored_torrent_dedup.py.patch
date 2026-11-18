@@ -1,0 +1,140 @@
+--- /dev/null
++++ b/app/tests/test_restored_torrent_dedup.py
+@@ -0,0 +1,137 @@
++import os
++import tempfile
++import unittest
++from pathlib import Path
++from tam_core.state_db import StateDatabase
++import test_prefetch_upload_boundary as fixture
++
++
++class RestoredHistoryTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.db = StateDatabase(Path(self.tmp.name) / 'state.db')
++
++    def record(self, target='Channel:42#topic:111', fp='same-video'):
++        self.db.upload_record(target_key=target, fingerprint=fp, path='/old/video.mp4',
++            size=5, mtime_ns=1, account_user_id=1, account_label='test', message_id=9)
++
++    def claim(self, target, fp='same-video', run='now', token='claim', pre=False):
++        return self.db.upload_claim_fingerprint(target_key=target, fingerprint=fp,
++            path='/restored/video.mp4', run_token=run, claim_token=token, prepublication=pre)
++
++    def test_completed_content_survives_path_date_and_topic_changes(self):
++        for old in ('Channel:42#topic:111', 'Channel:42#forum:old', 'Channel:42'):
++            with self.subTest(old=old):
++                self.record(old)
++                self.assertTrue(self.db.upload_fingerprint_completed('Channel:42#forum:new', 'same-video'))
++                self.assertEqual(self.claim('Channel:42#forum:new'), 'completed')
++        self.assertFalse(self.db.upload_fingerprint_completed('Channel:420#forum:new', 'same-video'))
++        self.assertEqual(self.claim('Channel:43#forum:new'), 'reserved')
++        self.assertEqual(self.claim('Channel:42#forum:new', fp='changed-video'), 'reserved')
++
++    def test_bulk_cached_content_matches_legacy_without_same_path_or_date(self):
++        self.record()
++        rows = [('Channel:42#forum:new', '/restored/video.mp4', 5, 999, 'same-video', 0),
++                ('Channel:420#forum:new', '/restored/video.mp4', 5, 999, 'same-video', 0),
++                ('Channel:42#forum:new', '/restored/video.mp4', 5, 999, 'changed', 0)]
++        self.assertEqual(self.db.upload_completed_candidates(rows, 'Channel:42'), {0})
++
++    def test_legacy_metadata_fallback_cannot_use_another_groups_context(self):
++        self.record('Channel:43#topic:111')
++        rows = [('Channel:42#forum:new', '/old/video.mp4', 5, 1, '', 1)]
++        self.assertEqual(self.db.upload_completed_candidates(rows, 'Channel:43'), set())
++
++    def test_parallel_topics_cannot_reserve_identical_content_twice(self):
++        self.assertEqual(self.claim('Channel:42#forum:a', token='a'), 'reserved')
++        self.assertEqual(self.claim('Channel:42#forum:b', token='b'), 'in_progress')
++        self.assertEqual(self.claim('Channel:43#forum:b', token='c'), 'reserved')
++
++    def test_two_concurrent_accounts_claim_only_one_topic_copy(self):
++        from concurrent.futures import ThreadPoolExecutor
++        from threading import Barrier
++        barrier = Barrier(2)
++        def attempt(topic):
++            barrier.wait(timeout=3)
++            return self.claim('Channel:42#forum:' + topic, token=topic, pre=True)
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            results = list(pool.map(attempt, ('a', 'b')))
++        self.assertCountEqual(results, ['reserved', 'in_progress'])
++        with self.db.session() as c:
++            self.assertEqual(c.execute('select count(*) from upload_reservations').fetchone()[0], 1)
++
++    def test_prior_ambiguous_topic_publication_blocks_restored_file(self):
++        self.assertEqual(self.claim('Channel:42#topic:111', run='old', token='old'), 'reserved')
++        self.assertEqual(self.claim('Channel:42#forum:new'), 'stale')
++        with self.db.session() as c:
++            self.assertEqual(c.execute('select count(*) from upload_reservations').fetchone()[0], 1)
++
++    def test_safe_prepublication_alias_is_reclaimed_and_old_worker_is_fenced(self):
++        self.assertEqual(self.claim('Channel:42#topic:111', run='old', token='old', pre=True), 'reserved')
++        self.assertEqual(self.claim('Channel:42#forum:new', token='new', pre=True), 'reserved')
++        self.assertFalse(self.db.upload_mark_publishing('Channel:42#topic:111', 'same-video', 'old'))
++        self.assertTrue(self.db.upload_mark_publishing('Channel:42#forum:new', 'same-video', 'new'))
++
++    def test_ambiguous_alias_is_not_erased_by_safe_alias_reclaim(self):
++        with self.db.session() as c:
++            c.executemany('insert into upload_reservations(target_key,fingerprint,path,run_token,claim_token,reserved_at,prepublication) values(?,?,?,?,?,?,?)',
++                [('Channel:42#topic:1','same-video','/old','past','unsafe',1,0),
++                 ('Channel:42#forum:2','same-video','/old','past','safe',1,1)])
++        self.assertEqual(self.claim('Channel:42#forum:new', pre=True), 'stale')
++        with self.db.session() as c:
++            self.assertEqual(c.execute('select count(*) from upload_reservations').fetchone()[0], 2)
++
++    def test_cross_topic_completed_reservation_is_not_offered_as_unconfirmed(self):
++        self.claim('Channel:42#topic:111', run='old')
++        self.record('Channel:42#forum:new')
++        self.assertEqual(self.db.upload_stale_reservations('Channel:42', 'now'), [])
++
++    def test_completion_in_other_topic_wins_during_recovery_confirmation(self):
++        self.claim('Channel:42#topic:111', run='old')
++        rows = self.db.upload_stale_reservations('Channel:42', 'now')
++        self.assertEqual(len(rows), 1)
++        self.record('Channel:42#forum:new')
++        self.assertEqual(self.db.upload_release_stale_reservations(rows, 'now'), 0)
++
++    def test_cross_topic_lookup_uses_fingerprint_index_on_large_history(self):
++        with self.db.session() as c:
++            c.executemany('insert into uploads(target_key,fingerprint,path,size,mtime_ns,completed_at) values(?,?,?,?,?,?)',
++                [('Channel:42#topic:111', 'other-%d' % i, '/old/%d' % i, 5, 1, 1) for i in range(10000)])
++            c.set_progress_handler(lambda: 1, 2000)
++        # The progress bound is applied to every query connection below.
++        import contextlib
++        from unittest.mock import patch
++        original = self.db.session
++        @contextlib.contextmanager
++        def bounded():
++            with original() as c:
++                c.set_progress_handler(lambda: 1, 2000)
++                yield c
++        with patch.object(self.db, 'session', bounded):
++            self.assertFalse(self.db.upload_fingerprint_completed('Channel:42#forum:new', 'missing'))
++            self.assertEqual(self.db.upload_completed_candidates([
++                ('Channel:42#forum:new','/restored',5,99,'missing',0)], 'Channel:42'), set())
++
++
++class RestoredUploaderTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    run_task = fixture.PrefetchUploadTests.run_task
++    file = fixture.PrefetchUploadTests.file
++    read = fixture.PrefetchUploadTests.read
++
++    async def test_restored_torrent_with_legacy_topic_history_is_never_sent(self):
++        folder = self.root / 'old-location'
++        folder.mkdir()
++        original = folder / 'old-name.mp4'
++        original.write_bytes(b'video')
++        self.history.record_completed(original, 'group#topic:111', b'video'.hex(), self.account, 9)
++        restored = self.file('restored.mp4', b'video')
++        os.utime(restored, ns=(original.stat().st_atime_ns, original.stat().st_mtime_ns + 9000000000))
++        self.rule['forum_topics_from_subfolders'] = True
++        async def topics(*args): return {}
++        self.pane._prepare_forum_topics = topics
++        await self.run_task()
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.pane.task_states['r1']['success'], 0)
++        self.assertEqual(self.pane.task_states['r1']['skipped'], 1)
