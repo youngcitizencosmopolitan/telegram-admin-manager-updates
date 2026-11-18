@@ -1,21 +1,13 @@
 {
-  "version": "0039",
-  "base_version": "0038",
-  "manifest_version": "4.3.8.0039",
-  "display_version": "0039",
+  "version": "0040",
+  "base_version": "0039",
+  "manifest_version": "4.3.8.0040",
+  "display_version": "0040",
   "patch_files": [
-    "release-src/0039/01-batch_uploader.py.patch",
-    "release-src/0039/02-tam_core-monitor_dispatch.py.patch",
-    "release-src/0039/03-tam_core-monitor_remaining.py.patch",
-    "release-src/0039/04-tam_ui-monitor_presentation.py.patch",
-    "release-src/0039/05-tam_ui-monitor_view.py.patch",
-    "release-src/0039/06-telegram_admin_manager.py.patch",
-    "release-src/0039/07-tests-test_monitor_dispatch.py.patch",
-    "release-src/0039/08-tests-test_monitor_new_count.py.patch",
-    "release-src/0039/09-tests-test_monitor_presentation.py.patch",
-    "release-src/0039/10-tests-test_monitor_remaining.py.patch",
-    "release-src/0039/11-tests-test_prefetch_upload_boundary.py.patch",
-    "release-src/0039/12-tests-test_table_clipboard.py.patch"
+    "release-src/0040/01-tam_core-state_db.py.patch",
+    "release-src/0040/02-telegram_admin_manager.py.patch",
+    "release-src/0040/03-tests-test_bounded_history.py.patch",
+    "release-src/0040/04-tests-test_restored_torrent_dedup.py.patch"
   ],
-  "notes": "0039: preserve the published 0038 concurrent runtime and live settings. Replace scan-arrival counts with remaining files in the last history-verified pass, including errors/deferred/unconfirmed work while excluding completed duplicates and oversized skips. Show unknown while checking and reset empty scans. Add local dispatch diagnostics: actual transmitting accounts, preparation, slot waiting, checks, publication and ordinary/Premium queues, without extra Telegram or disk queries. Preserve scheduling, rate limits, FloodWait handling and sessions. Add multi-account and slot-wait regression coverage."
+  "notes": "0040: recognize restored torrent files against all existing upload-history formats within the same Telegram group. Content fingerprints match legacy topic-ID, topic-title and group records despite changed local paths or timestamps. Atomic cross-topic claims prevent concurrent duplicate uploads and preserve uncertain-publication guards. Add fingerprint-first SQLite indexes for fast large-history lookups. Retain all history, sessions, settings, per-topic destination records and independent uploads to other groups. Include restored-file, changed-content, prefix-isolation, concurrent-claim and recovery regression tests."
 }
