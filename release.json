@@ -1,13 +1,17 @@
 {
-  "version": "0040",
-  "base_version": "0039",
-  "manifest_version": "4.3.8.0040",
-  "display_version": "0040",
+  "version": "0041",
+  "base_version": "0040",
+  "manifest_version": "4.3.8.0041",
+  "display_version": "0041",
   "patch_files": [
-    "release-src/0040/01-tam_core-state_db.py.patch",
-    "release-src/0040/02-telegram_admin_manager.py.patch",
-    "release-src/0040/03-tests-test_bounded_history.py.patch",
-    "release-src/0040/04-tests-test_restored_torrent_dedup.py.patch"
+    "release-src/0041/01-batch_uploader.py.patch",
+    "release-src/0041/02-tam_core-defaults.py.patch",
+    "release-src/0041/03-tam_core-repositories.py.patch",
+    "release-src/0041/04-tam_core-source_history.py.patch",
+    "release-src/0041/05-tam_core-state_db.py.patch",
+    "release-src/0041/06-telegram_admin_manager.py.patch",
+    "release-src/0041/07-tests-test_premium_global_priority.py.patch",
+    "release-src/0041/08-tests-test_sent_source_history.py.patch"
   ],
-  "notes": "0040: recognize restored torrent files against all existing upload-history formats within the same Telegram group. Content fingerprints match legacy topic-ID, topic-title and group records despite changed local paths or timestamps. Atomic cross-topic claims prevent concurrent duplicate uploads and preserve uncertain-publication guards. Add fingerprint-first SQLite indexes for fast large-history lookups. Retain all history, sessions, settings, per-topic destination records and independent uploads to other groups. Include restored-file, changed-content, prefix-isolation, concurrent-claim and recovery regression tests."
+  "notes": "0041: add an enabled-by-default monitoring sent-source history guard. Previously sent sources are recognized within the same Telegram group by normalized filename and last two parent folders, even while torrent size, timestamps and content fingerprint change. Bounded preflight skips them before hashing, and atomic source reservations prevent parallel versions or uncertain publications from being resent. Add a persistent monitor checkbox for intentional replacements. Schema15 backfills indexed source metadata without reading media, retaining all history and first-launch legacy imports. Content dedup and manual task behavior remain unchanged. No qBittorrent connection required."
 }

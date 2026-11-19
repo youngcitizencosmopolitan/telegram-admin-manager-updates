@@ -1,0 +1,22 @@
+--- /dev/null
++++ b/app/tam_core/source_history.py
+@@ -0,0 +1,19 @@
++"""Stable source identity for the optional monitoring sent-file guard.
++
++Uses the filename and its last two parent components. Relocated drive/share
++roots, timestamps, byte size and partial-download content are not identity.
++This is a deliberate source-history policy, separate from content dedup.
++"""
++import hashlib
++import json
++import unicodedata
++from pathlib import PureWindowsPath
++
++
++def source_key(path: str) -> str:
++    parsed = PureWindowsPath(str(path))
++    parts = [part for part in parsed.parts if part != parsed.anchor]
++    if not parts:
++        return ''
++    normalized = [unicodedata.normalize('NFC', part).casefold() for part in parts[-3:]]
++    return hashlib.sha256(json.dumps(normalized, ensure_ascii=False).encode('utf-8')).hexdigest()

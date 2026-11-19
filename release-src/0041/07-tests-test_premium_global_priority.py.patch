@@ -1,0 +1,11 @@
+--- a/app/tests/test_premium_global_priority.py
++++ b/app/tests/test_premium_global_priority.py
+@@ -194,7 +194,7 @@
+                 store=SimpleNamespace(data={'upload_tasks': []}, save=noop),
+                 group_state_cache=SimpleNamespace(fresh_admin_sessions=lambda *args: set()),
+                 upload_history=SimpleNamespace(exact_completed=lambda *args: False,
+-                    claim_fingerprint=lambda *args: 'reserved',
++                    claim_fingerprint=lambda *args, **kwargs: 'reserved',
+                     release_fingerprint_reservation=lambda *args: True, record_completed=noop),
+                 safety_policy=lambda: {'enabled': False}, account_usage_allows=lambda *args: True,
+                 _resolve_or_join_target=resolve, _target_key=lambda entity: entity.title,

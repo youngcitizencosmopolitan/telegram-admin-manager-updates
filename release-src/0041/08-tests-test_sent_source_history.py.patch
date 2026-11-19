@@ -1,0 +1,199 @@
+--- /dev/null
++++ b/app/tests/test_sent_source_history.py
+@@ -0,0 +1,196 @@
++import tempfile
++import unittest
++from pathlib import Path
++from tam_core.state_db import StateDatabase
++import test_prefetch_upload_boundary as fixture
++
++
++class SourceHistoryTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.db = StateDatabase(Path(self.tmp.name) / 'state.db')
++        self.old = r'C:\old\VIP\Studio\Movie.mp4'
++        self.restored = r'\\server\share\VIP\Studio\movie.mp4'
++
++    def record(self):
++        self.db.upload_record(target_key='Channel:1#topic:7', fingerprint='old-complete',
++            path=self.old, size=100, mtime_ns=1, account_user_id=1, account_label='test', message_id=7)
++
++    def claim(self, fp='partial', path=None, target='Channel:1#forum:new', run='current', token='new'):
++        return self.db.upload_claim_fingerprint(target_key=target, fingerprint=fp,
++            path=path or self.restored, run_token=run, claim_token=token, prepublication=True, match_source=True)
++
++    def test_sent_source_blocks_changed_size_date_and_fingerprint(self):
++        self.record()
++        rows=[('Channel:1#forum:new',self.restored,20,99,'partial',0)]
++        self.assertEqual(self.db.upload_completed_candidates(rows,'Channel:1',match_source=True),{0})
++        self.assertEqual(self.claim(),'completed')
++        self.assertEqual(self.db.upload_completed_candidates(rows,'Channel:1'),set())
++
++    def test_other_group_and_other_subfolder_remain_independent(self):
++        self.record()
++        self.assertEqual(self.claim(target='Channel:10#forum:new'), 'reserved')
++        self.assertEqual(self.claim(path=r'Z:\VIP\Other\movie.mp4'), 'reserved')
++
++    def test_different_partial_versions_cannot_be_claimed_together(self):
++        self.assertEqual(self.claim(fp='part1',token='one'),'reserved')
++        self.assertEqual(self.claim(fp='part2',token='two'),'in_progress')
++
++    def test_uncertain_sent_source_remains_blocked_across_content_changes(self):
++        self.assertEqual(self.claim(fp='part1',run='old',token='old'),'reserved')
++        self.assertTrue(self.db.upload_mark_publishing('Channel:1#forum:new','part1','old'))
++        self.assertEqual(self.claim(fp='part2'),'stale')
++
++    def test_safe_source_reclaim_fences_old_content_worker(self):
++        self.assertEqual(self.claim(fp='part1',run='old',token='old'),'reserved')
++        self.assertEqual(self.claim(fp='part2'),'reserved')
++        self.assertFalse(self.db.upload_mark_publishing('Channel:1#forum:new','part1','old'))
++
++    def test_two_threads_reserve_one_source_even_with_different_fingerprints(self):
++        from concurrent.futures import ThreadPoolExecutor
++        from threading import Barrier
++        barrier=Barrier(2)
++        def attempt(fp):
++            barrier.wait(timeout=3)
++            return self.claim(fp=fp,token=fp)
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            self.assertCountEqual(list(pool.map(attempt,('part1','part2'))),['reserved','in_progress'])
++
++
++class SourceWorkerTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp=fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown=fixture.PrefetchUploadTests.asyncTearDown
++    run_task=fixture.PrefetchUploadTests.run_task
++    file=fixture.PrefetchUploadTests.file
++    read=fixture.PrefetchUploadTests.read
++
++    def setup_restoration(self, *, monitor=True, folder='Studio'):
++        old=self.root/'old'/'VIP'/'Studio'/'movie.mp4'
++        old.parent.mkdir(parents=True);old.write_bytes(b'complete-video')
++        self.history.record_completed(old,'group#topic:7',b'complete-video'.hex(),self.account,7)
++        current=self.root/'restored'/'VIP'/folder/'movie.mp4'
++        current.parent.mkdir(parents=True);current.write_bytes(b'part')
++        self.rule.update(folder=str(current.parent),monitor_folder=monitor,forum_topics_from_subfolders=True)
++        async def topics(*args):return {}
++        self.pane._prepare_forum_topics=topics
++        return current
++
++    async def test_partial_restoration_of_sent_source_is_skipped_without_hashing(self):
++        self.setup_restoration()
++        await self.run_task()
++        self.assertEqual(self.sent,[])
++        self.assertEqual(self.reads,[])
++        self.assertEqual(self.pane.task_states['r1']['skipped'],1)
++
++    async def test_disabling_guard_allows_intentional_replacement(self):
++        self.setup_restoration()
++        self.pane.app.store.data['monitor_skip_sent_sources']=False
++        await self.run_task()
++        self.assertEqual(len(self.sent),1)
++
++    async def test_manual_task_keeps_content_based_behavior(self):
++        self.setup_restoration(monitor=False)
++        await self.run_task()
++        self.assertEqual(len(self.sent),1)
++
++    async def test_other_subfolder_can_send_same_generic_filename(self):
++        self.setup_restoration(folder='Other')
++        await self.run_task()
++        self.assertEqual(len(self.sent),1)
++
++    async def test_new_group_can_send_previously_known_source(self):
++        self.setup_restoration()
++        self.pane.app._target_key=lambda entity:'new-group'
++        await self.run_task()
++        self.assertEqual(len(self.sent),1)
++
++
++class SourceMigrationTests(unittest.TestCase):
++    def test_first_launch_legacy_import_is_guarded_immediately(self):
++        import sqlite3
++        from tam_core.repositories import UploadHistory
++        with tempfile.TemporaryDirectory() as td:
++            legacy=Path(td)/'uploads.db'
++            c=sqlite3.connect(legacy)
++            c.execute('CREATE TABLE uploads(target_key TEXT,fingerprint TEXT,path TEXT,size INTEGER,mtime_ns INTEGER,account_user_id INTEGER,account_label TEXT,message_id INTEGER,completed_at REAL)')
++            c.execute('INSERT INTO uploads VALUES(?,?,?,?,?,?,?,?,?)',
++                ('Channel:1#topic:7','old-full','C:/old/VIP/Studio/movie.mp4',100,1,1,'test',7,1))
++            c.commit();c.close()
++            history=UploadHistory(legacy)
++            self.assertEqual(history.db.upload_claim_fingerprint(target_key='Channel:1#forum:new',fingerprint='partial',
++                path='Z:/VIP/Studio/movie.mp4',run_token='now',claim_token='new',match_source=True),'completed')
++
++    def test_existing_history_and_reservations_get_metadata_keys_without_media_reads(self):
++        import sqlite3
++        from unittest.mock import patch
++        with tempfile.TemporaryDirectory() as td:
++            path=Path(td)/'state.db'
++            c=sqlite3.connect(path)
++            c.executescript("""
++                CREATE TABLE uploads(id INTEGER PRIMARY KEY, target_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
++                    path TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,account_user_id INTEGER,
++                    account_label TEXT,message_id INTEGER,completed_at REAL NOT NULL, UNIQUE(target_key,fingerprint));
++                CREATE TABLE upload_reservations(target_key TEXT NOT NULL,fingerprint TEXT NOT NULL,path TEXT NOT NULL,
++                    run_token TEXT NOT NULL,claim_token TEXT NOT NULL,reserved_at REAL NOT NULL,prepublication INTEGER NOT NULL DEFAULT 0,
++                    PRIMARY KEY(target_key,fingerprint));
++                INSERT INTO uploads VALUES(1,'Channel:1#topic:7','old-complete','C:/old/VIP/Studio/movie.mp4',100,12,1,'test',7,1);
++                INSERT INTO upload_reservations VALUES('Channel:2#topic:7','old-part','C:/old/VIP/Studio/movie.mp4','past','old',1,1);
++            """)
++            c.commit();c.close()
++            with patch.object(Path,'stat',side_effect=AssertionError('Migration must not stat media')):
++                # Parent directory creation itself may use stat on some platforms;
++                # only the pure key builder must be filesystem-independent.
++                from tam_core.source_history import source_key
++                self.assertEqual(len(source_key('C:/old/VIP/Studio/movie.mp4')),64)
++            db=StateDatabase(path)
++            with db.session() as c:
++                row=c.execute('select fingerprint,path,size,mtime_ns,message_id,source_key from uploads').fetchone()
++                self.assertEqual(tuple(row[:5]),('old-complete','C:/old/VIP/Studio/movie.mp4',100,12,7))
++                self.assertEqual(len(row[5]),64)
++            self.assertEqual(db.upload_claim_fingerprint(target_key='Channel:1#forum:new',fingerprint='partial',
++                path='Z:/VIP/Studio/movie.mp4',run_token='now',claim_token='new',match_source=True),'completed')
++            self.assertEqual(db.upload_claim_fingerprint(target_key='Channel:2#forum:new',fingerprint='new-part',
++                path='Z:/VIP/Studio/movie.mp4',run_token='now',claim_token='new',prepublication=True,match_source=True),'reserved')
++            self.assertFalse(db.upload_mark_publishing('Channel:2#topic:7','old-part','old'))
++
++    def test_policy_save_uses_one_thread_safe_setting_patch(self):
++        from types import SimpleNamespace
++        from batch_uploader import BatchUploaderPane
++        pane=BatchUploaderPane.__new__(BatchUploaderPane)
++        patches=[]
++        pane.app=SimpleNamespace(store=SimpleNamespace(update=patches.append))
++        pane.source_history_var=SimpleNamespace(get=lambda:False)
++        pane._save_source_history_guard()
++        self.assertEqual(patches,[{'monitor_skip_sent_sources':False}])
++
++
++class SourceIdentityTests(unittest.TestCase):
++    def test_case_unicode_and_relocated_root_keep_source_identity(self):
++        from tam_core.source_history import source_key
++        self.assertEqual(source_key('C:/old/VIP/Studio/caf\u00e9.mp4'),
++                         source_key('Z:/new/vip/STUDIO/cafe\u0301.MP4'))
++        self.assertNotEqual(source_key('Z:/VIP/Studio/movie.mp4'),source_key('Z:/VIP/Other/movie.mp4'))
++        self.assertEqual(source_key(''), '')
++
++    def test_indexed_source_lookup_is_bounded_with_large_history(self):
++        import contextlib
++        from unittest.mock import patch
++        from tam_core.source_history import source_key
++        with tempfile.TemporaryDirectory() as td:
++            db=StateDatabase(Path(td)/'state.db')
++            with db.session() as c:
++                c.executemany('INSERT INTO uploads(target_key,fingerprint,path,size,mtime_ns,completed_at,source_key) VALUES(?,?,?,?,?,?,?)',
++                    [('Channel:1#topic:7','fp%d'%i,'C:/old/VIP/Studio/%d.mp4'%i,100,1,1,
++                      source_key('C:/old/VIP/Studio/%d.mp4'%i)) for i in range(10000)])
++            original=db.session
++            @contextlib.contextmanager
++            def bounded():
++                with original() as c:
++                    c.set_progress_handler(lambda:1,2000)
++                    yield c
++            with patch.object(db,'session',bounded):
++                self.assertEqual(db.upload_completed_candidates([
++                    ('Channel:1#forum:new','Z:/VIP/Studio/9999.mp4',0,9,'partial',0)],'Channel:1',match_source=True),{0})
++                self.assertEqual(db.upload_claim_fingerprint(target_key='Channel:1#forum:new',fingerprint='partial',
++                    path='Z:/VIP/Studio/9999.mp4',run_token='now',claim_token='new',match_source=True),'completed')
