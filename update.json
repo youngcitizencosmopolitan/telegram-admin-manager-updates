@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0040",
-  "display_version": "0040",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0040/TelegramAdminManager_v0040_update.zip",
-  "sha256": "aa1355a0dd2c77c0e99f1076ec97c80470a3781da2b46c4bd48c76e759445a78",
-  "notes": "0040: recognize restored torrent files against all existing upload-history formats within the same Telegram group. Content fingerprints match legacy topic-ID, topic-title and group records despite changed local paths or timestamps. Atomic cross-topic claims prevent concurrent duplicate uploads and preserve uncertain-publication guards. Add fingerprint-first SQLite indexes for fast large-history lookups. Retain all history, sessions, settings, per-topic destination records and independent uploads to other groups. Include restored-file, changed-content, prefix-isolation, concurrent-claim and recovery regression tests."
+  "version": "4.3.8.0041",
+  "display_version": "0041",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0041/TelegramAdminManager_v0041_update.zip",
+  "sha256": "eefffab674f2310c4194ad7ddeb908dc68e6efc08d12cf8c3cfc9da963011326",
+  "notes": "0041: add an enabled-by-default monitoring sent-source history guard. Previously sent sources are recognized within the same Telegram group by normalized filename and last two parent folders, even while torrent size, timestamps and content fingerprint change. Bounded preflight skips them before hashing, and atomic source reservations prevent parallel versions or uncertain publications from being resent. Add a persistent monitor checkbox for intentional replacements. Schema15 backfills indexed source metadata without reading media, retaining all history and first-launch legacy imports. Content dedup and manual task behavior remain unchanged. No qBittorrent connection required."
 }
