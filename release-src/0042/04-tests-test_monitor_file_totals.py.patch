@@ -1,0 +1,34 @@
+--- /dev/null
++++ b/app/tests/test_monitor_file_totals.py
+@@ -0,0 +1,31 @@
++import unittest
++from tam_core.monitor_totals import file_totals
++
++class FileTotalsTests(unittest.TestCase):
++    def test_history_duplicates_are_sent_errors_and_deferred_are_remaining(self):
++        totals=file_totals([dict(total_files=100,success=5,skipped=80,limit_skipped=3,
++            failed=2,deferred=1,processed_files=88,blocked=2)])
++        self.assertEqual(totals['total'],100)
++        self.assertEqual(totals['sent'],82)
++        self.assertEqual(totals['remaining'],15)
++        self.assertEqual(totals['limits'],3)
++        self.assertEqual(totals['total'],totals['sent']+totals['remaining']+totals['limits'])
++
++    def test_preflight_does_not_show_unverified_remaining_or_sent(self):
++        totals=file_totals([dict(total_files=57464,checking_history=True,skipped=100)])
++        self.assertEqual(totals['total'],57464)
++        self.assertIsNone(totals['sent'])
++        self.assertIsNone(totals['remaining'])
++
++    def test_multiple_rules_include_completed_and_active_files_once(self):
++        totals=file_totals([dict(total_files=10,success=2,skipped=5,active={'a':{}}),
++                           dict(total_files=20,success=10,skipped=10)])
++        self.assertEqual((totals['total'],totals['sent'],totals['remaining']),(30,27,3))
++
++    def test_empty_and_unknown_catalogs_are_distinct(self):
++        self.assertEqual(file_totals([])['remaining'],0)
++        self.assertIsNone(file_totals([{'checking_history':True}])['total'])
++
++    def test_processed_failures_do_not_become_sent(self):
++        totals=file_totals([dict(total_files=10,processed_files=10,failed=10)])
++        self.assertEqual((totals['sent'],totals['remaining']),(0,10))
