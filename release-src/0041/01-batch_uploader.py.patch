@@ -1,0 +1,106 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -641,7 +641,7 @@
+         self._tree_sort_controllers.append(controller)
+         return controller
+ 
+-    def _claim_upload_fingerprint(self, fingerprint: str, target_key: str, path: Path) -> tuple[str, str]:
++    def _claim_upload_fingerprint(self, fingerprint: str, target_key: str, path: Path, match_source: bool = False) -> tuple[str, str]:
+         claim_token = uuid.uuid4().hex
+         claim = getattr(self.app.upload_history, 'claim_prepublication', None) or self.app.upload_history.claim_fingerprint
+         status = claim(
+@@ -650,8 +650,12 @@
+             path,
+             self.dedup_run_token,
+             claim_token,
++            **({"match_source": True} if match_source else {}),
+         )
+         return status, claim_token
++
++    def _match_sent_source(self, task):
++        return bool(task.get('monitor_folder') and self.app.store.data.get('monitor_skip_sent_sources', True))
+ 
+     def _run_async(self, coro):
+         runner = getattr(self.app, "run_async", None)
+@@ -1136,14 +1140,15 @@
+ 
+         cache_bar = ttk.LabelFrame(p, text="Кэш состояния Telegram", padding=8)
+         cache_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+-        ttk.Label(cache_bar, text="Не перепроверять известные права/темы:").pack(side="left")
++        cache_controls = self._source_history_controls(cache_bar)
++        ttk.Label(cache_controls, text="Не перепроверять известные права/темы:").pack(side="left")
+         self.cache_ttl_var = tk.StringVar(value=str(self.app.store.data.get("group_cache_ttl_hours", 24)))
+-        ttl = ttk.Spinbox(cache_bar, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
++        ttl = ttk.Spinbox(cache_controls, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
+         ttl.pack(side="left", padx=(6, 3))
+         ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+-        ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+-        ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
+-        ttk.Button(cache_bar, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
++        ttk.Label(cache_controls, text="ч. (0 = без срока)").pack(side="left")
++        ttk.Button(cache_controls, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
++        ttk.Button(cache_controls, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
+         ttk.Label(
+             cache_bar,
+             text="Кэш обновляется после успешного автоадмина и синхронизации тем; ошибки прав автоматически его инвалидируют.",
+@@ -1225,14 +1230,15 @@
+ 
+         cache_bar = ttk.LabelFrame(p, text="Кэш Telegram", padding=7)
+         cache_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+-        ttk.Label(cache_bar, text="Права/темы не перепроверять:").pack(side="left")
++        cache_controls = self._source_history_controls(cache_bar)
++        ttk.Label(cache_controls, text="Права/темы не перепроверять:").pack(side="left")
+         self.cache_ttl_var = tk.StringVar(value=str(self.app.store.data.get("group_cache_ttl_hours", 24)))
+-        ttl = ttk.Spinbox(cache_bar, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
++        ttl = ttk.Spinbox(cache_controls, from_=0, to=720, width=6, textvariable=self.cache_ttl_var, command=self._save_cache_ttl)
+         ttl.pack(side="left", padx=(6, 3))
+         ttl.bind("<FocusOut>", lambda _e: self._save_cache_ttl())
+-        ttk.Label(cache_bar, text="ч. (0 = без срока)").pack(side="left")
+-        ttk.Button(cache_bar, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
+-        ttk.Button(cache_bar, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
++        ttk.Label(cache_controls, text="ч. (0 = без срока)").pack(side="left")
++        ttk.Button(cache_controls, text="Сбросить кэш выбранной группы", command=self.clear_selected_group_cache).pack(side="right")
++        ttk.Button(cache_controls, text="Незавершённые отправки…", command=self.retry_unfinished_uploads).pack(side="right", padx=5)
+ 
+         body = tk.PanedWindow(p, orient="vertical", sashwidth=7, bg="#d8dee8", bd=0, relief="flat")
+         body.grid(row=3, column=0, sticky="nsew")
+@@ -1487,6 +1493,23 @@
+         text = format_preflight_report(report)
+         self.app.log("Preflight:\n" + text.replace("\n", " | "))
+         self.app.ui_call(lambda: messagebox.showinfo("Telegram Admin Manager — Preflight", text, parent=self.app))
++
++    def _source_history_controls(self, cache_bar):
++        controls = ttk.Frame(cache_bar)
++        controls.pack(fill='x')
++        self.source_history_var = tk.BooleanVar(value=bool(self.app.store.data.get('monitor_skip_sent_sources', True)))
++        ttk.Checkbutton(cache_bar, text='Не повторять отправленные файлы с прежним именем и подпапкой',
++            variable=self.source_history_var, command=self._save_source_history_guard).pack(anchor='w', pady=(5, 0))
++        return controls
++
++    def _save_source_history_guard(self):
++        fields = {'monitor_skip_sent_sources': bool(self.source_history_var.get())}
++        update = getattr(self.app.store, 'update', None)
++        if callable(update):
++            update(fields)
++        else:
++            self.app.store.data.update(fields)
++            self.app.store.save()
+ 
+     def _save_cache_ttl(self) -> None:
+         if not hasattr(self, "cache_ttl_var"):
+@@ -5497,6 +5520,7 @@
+                         lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
+                         forum_target_key=str(target_key) if forum_mode else None,
+                         stopped=self.stop_event.is_set,
++                        **({"match_source": True} if self._match_sent_source(task) else {}),
+                     )
+             if self.stop_event.is_set():
+                 break
+@@ -5923,6 +5947,7 @@
+                             dedup_fingerprint,
+                             history_key,
+                             path,
++                            *([True] if self._match_sent_source(task) else []),
+                         )
+                         claim_action = _dedup_claim_disposition(claim_status)
+                         if claim_cancelled is not None:

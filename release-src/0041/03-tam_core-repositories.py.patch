@@ -1,0 +1,47 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -137,7 +137,7 @@
+         return fingerprint
+ 
+     def completed_paths(self, paths: Iterable[Path], target_key_for_path, fingerprint_key_for_path,
+-                        *, forum_target_key: str | None = None, stopped=None) -> dict[Path, tuple[int, ...]]:
++                        *, forum_target_key: str | None = None, stopped=None, match_source: bool = False) -> dict[Path, tuple[int, ...]]:
+         """Metadata-only scan with bounded query buffers; cancellation discards results.
+ 
+         The return value grows with matches. Callers processing large queues should
+@@ -175,7 +175,8 @@
+                 candidates.append((target_key_for_path(path), norm, st.st_size, st.st_mtime_ns, fingerprint, int(row is None)))
+             if stopped():
+                 return {}
+-            completed = self.db.upload_completed_candidates(candidates, forum_target_key)
++            completed = (self.db.upload_completed_candidates(candidates, forum_target_key, match_source=True)
++                         if match_source else self.db.upload_completed_candidates(candidates, forum_target_key))
+             for i in completed:
+                 if stopped():
+                     return {}
+@@ -213,6 +214,7 @@
+         path: Path,
+         run_token: str,
+         claim_token: str,
++        *, match_source: bool = False,
+     ) -> str:
+         return self.db.upload_claim_fingerprint(
+             target_key=target_key,
+@@ -220,14 +222,15 @@
+             path=str(path.resolve()),
+             run_token=run_token,
+             claim_token=claim_token,
++            match_source=match_source,
+         )
+ 
+     def release_fingerprint_reservation(self, fingerprint: str, target_key: str, claim_token: str) -> bool:
+         return self.db.upload_release_fingerprint_reservation(target_key, fingerprint, claim_token)
+ 
+-    def claim_prepublication(self, fingerprint, target_key, path, run_token, claim_token):
++    def claim_prepublication(self, fingerprint, target_key, path, run_token, claim_token, *, match_source=False):
+         return self.db.upload_claim_fingerprint(target_key=target_key, fingerprint=fingerprint,
+-            path=str(path.resolve()), run_token=run_token, claim_token=claim_token, prepublication=True)
++            path=str(path.resolve()), run_token=run_token, claim_token=claim_token, prepublication=True, match_source=match_source)
+ 
+     def mark_publishing(self, fingerprint, target_key, claim_token):
+         return self.db.upload_mark_publishing(target_key, fingerprint, claim_token)

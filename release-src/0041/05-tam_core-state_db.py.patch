@@ -1,0 +1,154 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -10,7 +10,9 @@
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+-SCHEMA_VERSION = 14
++from .source_history import source_key as sent_source_key
++
++SCHEMA_VERSION = 15
+ 
+ 
+ def _history_group_key(target_key: str) -> str:
+@@ -282,6 +284,14 @@
+             columns = {row[1] for row in conn.execute('PRAGMA table_info(upload_reservations)')}
+             if 'prepublication' not in columns:
+                 conn.execute('ALTER TABLE upload_reservations ADD COLUMN prepublication INTEGER NOT NULL DEFAULT 0')
++            # Pure path metadata only: never read or stat media during migration.
++            conn.create_function('tam_sent_source_key', 1, sent_source_key, deterministic=True)
++            for table in ('uploads', 'upload_reservations'):
++                columns = {row[1] for row in conn.execute('PRAGMA table_info(' + table + ')')}
++                if 'source_key' not in columns:
++                    conn.execute("ALTER TABLE " + table + " ADD COLUMN source_key TEXT NOT NULL DEFAULT ''")
++                conn.execute('CREATE INDEX IF NOT EXISTS idx_' + table + '_sent_source ON ' + table + '(source_key,target_key)')
++                conn.execute("UPDATE " + table + " SET source_key=tam_sent_source_key(path) WHERE source_key='' AND path<>''")
+             conn.execute(
+                 "INSERT INTO meta(key, value_json) VALUES('schema_version', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+@@ -560,11 +570,11 @@
+                         cur = conn.execute(
+                             """
+                             INSERT INTO uploads(target_key, fingerprint, path, size, mtime_ns,
+-                                                account_user_id, account_label, message_id, completed_at)
+-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                                                account_user_id, account_label, message_id, completed_at, source_key)
++                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             ON CONFLICT(target_key, fingerprint) DO NOTHING
+                             """,
+-                            tuple(row),
++                            (*tuple(row), sent_source_key(row["path"])),
+                         )
+                         copied += int(cur.rowcount > 0)
+             except Exception as exc:
+@@ -855,20 +865,20 @@
+             )
+ 
+     def upload_completed_candidates(
+-        self, candidates: list[tuple[str, str, int, int, str, int]], forum_target_key: str | None = None
++        self, candidates: list[tuple[str, str, int, int, str, int]], forum_target_key: str | None = None, *, match_source: bool = False
+     ) -> set[int]:
+         """Check one scan using indexed joins and a single connection, not one per file."""
+         if not candidates:
+             return set()
+         with self.session() as conn:
+-            conn.execute('CREATE TEMP TABLE candidates(target_key TEXT, path TEXT, size INTEGER, mtime_ns INTEGER, fingerprint TEXT, allow_exact INTEGER, scope_key TEXT)')
++            conn.execute('CREATE TEMP TABLE candidates(target_key TEXT, path TEXT, size INTEGER, mtime_ns INTEGER, fingerprint TEXT, allow_exact INTEGER, scope_key TEXT, source_key TEXT)')
+             scoped = []
+             for candidate in candidates:
+                 base = _history_group_key(candidate[0])
+                 if forum_target_key is not None and base != _history_group_key(forum_target_key):
+                     base = candidate[0]  # Inconsistent forum context: exact destination only.
+-                scoped.append((*candidate, base))
+-            conn.executemany('INSERT INTO candidates VALUES(?,?,?,?,?,?,?)', scoped)
++                scoped.append((*candidate, base, sent_source_key(candidate[1]) if match_source else ''))
++            conn.executemany('INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?)', scoped)
+             result = {row[0] for row in conn.execute(
+                 'SELECT c.rowid-1 FROM candidates c WHERE '
+                 '(c.allow_exact AND EXISTS (SELECT 1 FROM uploads u WHERE u.target_key=c.target_key AND u.path=c.path '
+@@ -877,6 +887,12 @@
+                 "u.target_key=c.scope_key OR (u.target_key>=c.scope_key||'#topic:' AND u.target_key<c.scope_key||'#topic:\uffff') OR "
+                 "(u.target_key>=c.scope_key||'#forum:' AND u.target_key<c.scope_key||'#forum:\uffff'))))"
+             )}
++            if match_source:
++                result.update(row[0] for row in conn.execute(
++                    "SELECT c.rowid-1 FROM candidates c WHERE c.source_key<>'' AND EXISTS ("
++                    "SELECT 1 FROM uploads u WHERE u.source_key=c.source_key AND (u.target_key=c.scope_key OR "
++                    "(u.target_key>=c.scope_key||'#topic:' AND u.target_key<c.scope_key||'#topic:\uffff') OR "
++                    "(u.target_key>=c.scope_key||'#forum:' AND u.target_key<c.scope_key||'#forum:\uffff')))"))
+             if forum_target_key is not None:
+                 prefix = f'{forum_target_key}#topic:'
+                 result.update(row[0] for row in conn.execute(
+@@ -922,6 +938,7 @@
+         run_token: str,
+         claim_token: str,
+         prepublication: bool = False,
++        match_source: bool = False,
+     ) -> str:
+         """Atomically claim one target+fingerprint for upload.
+ 
+@@ -935,12 +952,22 @@
+                 "SELECT 1 FROM uploads WHERE fingerprint=? AND " + _history_scope_sql() + " LIMIT 1",
+                 (fingerprint, *_history_scope_params(target_key)),
+             ).fetchone()
++            source = sent_source_key(path)
++            if done is None and match_source and source:
++                done = conn.execute('SELECT 1 FROM uploads WHERE source_key=? AND '
++                    + _history_scope_sql() + ' LIMIT 1',
++                    (source, *_history_scope_params(target_key))).fetchone()
+             if done is not None:
+                 return "completed"
+             existing = conn.execute(
+-                "SELECT run_token, prepublication, target_key FROM upload_reservations WHERE fingerprint=? AND "
++                "SELECT run_token, prepublication, target_key, fingerprint FROM upload_reservations WHERE fingerprint=? AND "
+                 + _history_scope_sql(), (fingerprint, *_history_scope_params(target_key)),
+             ).fetchall()
++            if match_source and source:
++                source_rows = conn.execute(
++                    'SELECT run_token,prepublication,target_key,fingerprint FROM upload_reservations WHERE source_key=? AND '
++                    + _history_scope_sql(), (source, *_history_scope_params(target_key))).fetchall()
++                existing = list({(row[2], row[3]): row for row in [*existing, *source_rows]}.values())
+             # Current work and uncertain publication always win over reclaimable
+             # reservations, including those written under another topic scheme.
+             if any(str(row[0]) == str(run_token) for row in existing):
+@@ -949,13 +976,13 @@
+                 return 'stale'
+             for row in existing:
+                 conn.execute('DELETE FROM upload_reservations WHERE target_key=? AND fingerprint=?',
+-                             (row[2], fingerprint))
++                             (row[2], row[3]))
+             conn.execute(
+                 """
+-                INSERT INTO upload_reservations(target_key, fingerprint, path, run_token, claim_token, reserved_at, prepublication)
+-                VALUES (?, ?, ?, ?, ?, ?, ?)
++                INSERT INTO upload_reservations(target_key, fingerprint, path, run_token, claim_token, reserved_at, prepublication, source_key)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 """,
+-                (target_key, fingerprint, path, run_token, claim_token, time.time(), int(prepublication)),
++                (target_key, fingerprint, path, run_token, claim_token, time.time(), int(prepublication), source),
+             )
+             return "reserved"
+ 
+@@ -1018,10 +1045,11 @@
+             conn.execute(
+                 """
+                 INSERT INTO uploads(target_key, fingerprint, path, size, mtime_ns,
+-                                    account_user_id, account_label, message_id, completed_at)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                                    account_user_id, account_label, message_id, completed_at, source_key)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(target_key, fingerprint) DO UPDATE SET
+                     path=excluded.path,
++                    source_key=excluded.source_key,
+                     size=excluded.size,
+                     mtime_ns=excluded.mtime_ns,
+                     account_user_id=excluded.account_user_id,
+@@ -1031,7 +1059,7 @@
+                 """,
+                 (
+                     target_key, fingerprint, path, int(size), int(mtime_ns), account_user_id,
+-                    account_label, message_id, float(completed_at or time.time()),
++                    account_label, message_id, float(completed_at or time.time()), sent_source_key(path),
+                 ),
+             )
+             if reservation_claim_token:
