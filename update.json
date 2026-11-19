@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0041",
-  "display_version": "0041",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0041/TelegramAdminManager_v0041_update.zip",
-  "sha256": "eefffab674f2310c4194ad7ddeb908dc68e6efc08d12cf8c3cfc9da963011326",
-  "notes": "0041: add an enabled-by-default monitoring sent-source history guard. Previously sent sources are recognized within the same Telegram group by normalized filename and last two parent folders, even while torrent size, timestamps and content fingerprint change. Bounded preflight skips them before hashing, and atomic source reservations prevent parallel versions or uncertain publications from being resent. Add a persistent monitor checkbox for intentional replacements. Schema15 backfills indexed source metadata without reading media, retaining all history and first-launch legacy imports. Content dedup and manual task behavior remain unchanged. No qBittorrent connection required."
+  "version": "4.3.8.0042",
+  "display_version": "0042",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0042/TelegramAdminManager_v0042_update.zip",
+  "sha256": "d165e0993ed4f67070d02d637da3bce5aa2cc94c615a312a3bb7ee75e1825561",
+  "notes": "0042: replace the long monitoring summary line with a compact vertical file panel: total files, sent, remaining to send. Sent includes successful uploads and files found in history, excluding errors, deferred files and over-limit skips. History verification shows an explicit checking state; over-limit skips are explained separately. Existing speed, volume, ETA and 10/30/60-minute statistics remain alongside the panel. Counts use existing in-memory dashboard snapshots with no new disk or Telegram queries; uploader, cache and sessions are unchanged."
 }
