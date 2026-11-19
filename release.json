@@ -1,17 +1,14 @@
 {
-  "version": "0041",
-  "base_version": "0040",
-  "manifest_version": "4.3.8.0041",
-  "display_version": "0041",
+  "version": "0042",
+  "base_version": "0041",
+  "manifest_version": "4.3.8.0042",
+  "display_version": "0042",
   "patch_files": [
-    "release-src/0041/01-batch_uploader.py.patch",
-    "release-src/0041/02-tam_core-defaults.py.patch",
-    "release-src/0041/03-tam_core-repositories.py.patch",
-    "release-src/0041/04-tam_core-source_history.py.patch",
-    "release-src/0041/05-tam_core-state_db.py.patch",
-    "release-src/0041/06-telegram_admin_manager.py.patch",
-    "release-src/0041/07-tests-test_premium_global_priority.py.patch",
-    "release-src/0041/08-tests-test_sent_source_history.py.patch"
+    "release-src/0042/01-batch_uploader.py.patch",
+    "release-src/0042/02-tam_core-monitor_totals.py.patch",
+    "release-src/0042/03-telegram_admin_manager.py.patch",
+    "release-src/0042/04-tests-test_monitor_file_totals.py.patch",
+    "release-src/0042/05-tests-test_redesign_integration.py.patch"
   ],
-  "notes": "0041: add an enabled-by-default monitoring sent-source history guard. Previously sent sources are recognized within the same Telegram group by normalized filename and last two parent folders, even while torrent size, timestamps and content fingerprint change. Bounded preflight skips them before hashing, and atomic source reservations prevent parallel versions or uncertain publications from being resent. Add a persistent monitor checkbox for intentional replacements. Schema15 backfills indexed source metadata without reading media, retaining all history and first-launch legacy imports. Content dedup and manual task behavior remain unchanged. No qBittorrent connection required."
+  "notes": "0042: replace the long monitoring summary line with a compact vertical file panel: total files, sent, remaining to send. Sent includes successful uploads and files found in history, excluding errors, deferred files and over-limit skips. History verification shows an explicit checking state; over-limit skips are explained separately. Existing speed, volume, ETA and 10/30/60-minute statistics remain alongside the panel. Counts use existing in-memory dashboard snapshots with no new disk or Telegram queries; uploader, cache and sessions are unchanged."
 }

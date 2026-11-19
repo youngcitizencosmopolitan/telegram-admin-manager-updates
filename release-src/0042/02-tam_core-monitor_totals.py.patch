@@ -1,0 +1,22 @@
+--- /dev/null
++++ b/app/tam_core/monitor_totals.py
+@@ -0,0 +1,19 @@
++"""File totals from existing upload-pass snapshots; no I/O or Telegram queries."""
++
++
++def file_totals(states):
++    rows=list(states)
++    unknown=any(row.get('total_files') is None for row in rows)
++    checking=unknown or any(row.get('checking_history') for row in rows)
++    total=sent=limits=0
++    for row in rows:
++        count=max(0,int(row.get('total_files',0) or 0))
++        limit=min(count,max(0,int(row.get('limit_skipped',0) or 0)))
++        confirmed=max(0,int(row.get('success',0) or 0))+max(0,int(row.get('skipped',0) or 0))-limit
++        total+=count
++        limits+=limit
++        sent+=min(count-limit,max(0,confirmed))
++    return dict(total=None if unknown else total,
++        sent=None if checking else sent,
++        remaining=None if checking else max(0,total-sent-limits),
++        limits=limits,checking=checking)

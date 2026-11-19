@@ -1,0 +1,24 @@
+--- a/app/tests/test_redesign_integration.py
++++ b/app/tests/test_redesign_integration.py
+@@ -52,6 +52,21 @@
+         # subsequent async tests can trigger cyclic GC in a worker thread.
+         self.app = None
+         gc.collect()
++
++    def test_monitor_file_panel_separates_total_sent_and_remaining(self):
++        from tam_core.monitor_totals import file_totals
++        pane = self.app.batch_uploader
++        pane._monitor_file_totals = file_totals([dict(total_files=12, success=2, skipped=7, failed=2, deferred=1)])
++        pane._transfer_window_rates = {10: 1024**2, 30: 0, 60: 0}
++        pane._set_dashboard(100, 12, 12, 600, 6, 2, 50)
++        self.assertEqual({key: value.get() for key, value in pane.monitor_file_vars.items()},
++                         {'total': '12', 'sent': '9', 'remaining': '3'})
++        for row, text in enumerate(('Всего файлов', 'Отправлено', 'Осталось отправить')):
++            label = pane.monitor_file_panel.grid_slaves(row=row, column=0)[0]
++            self.assertEqual(label.cget('text'), text)
++        self.assertNotIn('файлов:', pane.monitor_transfer_summary_var.get())
++        self.assertIn('скорость:', pane.monitor_transfer_summary_var.get())
++        self.assertIn('10 мин:', pane.monitor_transfer_summary_var.get())
+ 
+     def test_classic_tabs_and_shared_journal_are_restored(self):
+         from tkinter import ttk
