@@ -1,0 +1,17 @@
+--- a/app/tests/test_monitor_delta_upload.py
++++ b/app/tests/test_monitor_delta_upload.py
+@@ -33,8 +33,13 @@
+     def test_event_batch_selects_only_changed_file(self):
+         self.assertEqual(self.pane._scan_task_files(self.task), ([self.new], 3))
+ 
+-    def test_removed_queued_file_does_not_expand_to_whole_tree(self):
++    def test_removed_queued_file_uses_snapshot_until_deletion_event(self):
+         self.new.unlink()
++        # Selection freezes the catalog without a network stat per candidate.
++        # Final preparation still validates existence before upload.
++        self.assertEqual(self.pane._scan_task_files(self.task), ([self.new], 3))
++        self.index.events.notify(self.new, kind='deleted')
++        self.index.snapshot()
+         self.assertEqual(self.pane._scan_task_files(self.task), ([], 0))
+ 
+     def test_restart_unknown_epoch_falls_back_to_complete_scan(self):

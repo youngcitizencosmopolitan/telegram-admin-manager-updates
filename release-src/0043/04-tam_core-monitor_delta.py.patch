@@ -1,0 +1,78 @@
+--- a/app/tam_core/monitor_delta.py
++++ b/app/tam_core/monitor_delta.py
+@@ -18,9 +18,10 @@
+     return result
+ 
+ 
+-def selected_delta_files(task, indexes, lane):
++def selected_delta_files(task, indexes, lane, *, capture_sizes=None):
++    """Select from a matching catalog; optionally capture this exact size snapshot."""
+     delta = task.get('_monitor_delta')
+-    if not isinstance(delta, dict) or delta.get('full'):
++    if not isinstance(delta, dict):
+         return None
+     index = (indexes or {}).get(str(task.get('id', '')))
+     if (index is None or index.closed or delta.get('epoch') != index.epoch
+@@ -28,36 +29,37 @@
+             or monitor_identity(index.task) != monitor_identity(task)):
+         return None
+     caption = str(task.get('caption', ''))
+-    if '{index}' in caption or '{total}' in caption:
+-        return None
+-    names = delta.get('files')
+-    if not isinstance(names, list) or len(names) > 10000:
+-        return None
+-    root = Path(os.path.abspath(task['folder']))
+-    selected = set()
+-    for name in names:
+-        if not isinstance(name, str) or not name:
++    whole_catalog = delta.get('full') or '{index}' in caption or '{total}' in caption
++    if whole_catalog:
++        sizes = index.freeze_sizes()
++    else:
++        names = delta.get('files')
++        if not isinstance(names, list) or len(names) > 10000:
+             return None
+-        relative = Path(name)
+-        if relative.is_absolute() or relative.drive or '..' in relative.parts:
+-            return None
+-        path = Path(os.path.abspath(root / relative))
+-        if not path.is_relative_to(root):
+-            return None
+-        selected.add(path)
++        root = Path(os.path.abspath(task['folder']))
++        selected = set()
++        for name in names:
++            if not isinstance(name, str) or not name:
++                return None
++            relative = Path(name)
++            if relative.is_absolute() or relative.drive or '..' in relative.parts:
++                return None
++            path = Path(os.path.abspath(root / relative))
++            if not path.is_relative_to(root):
++                return None
++            selected.add(path)
++        sizes = index.freeze_sizes(selected)
+     files, total = [], 0
+-    for path in sorted(selected, key=lambda p: str(p).lower()):
+-        try:
+-            if index._eligible(path) and path.is_file():
+-                size = path.stat().st_size
+-                if lane(size) != 'too_large':
+-                    files.append(path)
+-                    total += size
+-        except FileNotFoundError:
+-            continue
++    for path in sorted(sizes, key=lambda p: str(p).lower()):
++        size = sizes.get(path)
++        if size is not None and index._eligible(path) and lane(size) != 'too_large':
++            files.append(path)
++            total += size
+     # Freeze cached path references only, without filesystem reads. A later live
+     # caption edit may introduce {index}/{total}; derive ranks lazily in that case.
+     task['_monitor_numbering'] = {'paths': index.numbering_snapshot(), 'positions': None}
++    if capture_sizes is not None:
++        capture_sizes({path: sizes[path] for path in files})
+     return files, total
+ 
+ 

@@ -1,0 +1,302 @@
+--- a/app/tam_core/folder_events.py
++++ b/app/tam_core/folder_events.py
+@@ -3,12 +3,14 @@
+ 
+ import hashlib
+ import os
++import stat as stat_module
+ import threading
+ import time
+ from collections import deque
+ from pathlib import Path
+ 
+ from .file_readiness import FileReadiness, read_stamp
++from .file_metadata import change_token, has_active_writer, stat_identity
+ from .media import PHOTO_EXTENSIONS, VIDEO_EXTENSIONS
+ 
+ 
+@@ -86,7 +88,7 @@
+ class FolderSnapshotIndex:
+     def __init__(self, task, scan, lane, *, clock=time.monotonic, event_factory=WatchEvents,
+                  quiet=3.0, reconcile=300.0, walk_factory=None, batch_size=256,
+-                 budget=0.025, phase=0.0):
++                 budget=0.025, phase=0.0, source_known=None):
+         import uuid
+         self.task = dict(task)
+         self.root = Path(os.path.abspath(task['folder']))
+@@ -94,14 +96,19 @@
+         self.clock, self.event_factory = clock, event_factory
+         self.reconcile, self.phase = reconcile, phase
+         self.walk_factory, self.batch_size, self.budget = walk_factory, batch_size, budget
++        # Advisory source-history lookup, never an upload-completion authority.
++        self.source_known = source_known
++        self._discovered = deque()
+         self.readiness = FileReadiness(quiet, clock)
+         self.events = None
+         self._watcher_healthy = None
+         self._event_backlog = deque()
++        self._event_batch = deque()
+         self.epoch = uuid.uuid4().hex
+         self._lock = threading.RLock()
+         self._entries, self._work, self._membership = {}, {}, {}
+         self._ready, self._pending_paths = set(), set()
++        self._source_hinted = set()
+         self._pending_heap = []
+         self._relative_files, self._relative_counts = set(), {}
+         self._revision = self._counter = 0
+@@ -131,13 +138,13 @@
+     @property
+     def needs_poll(self):
+         return (self._last_full is None or self.reconciling or self.pending
+-                or bool(self._event_backlog) or bool(self.events and self.events.pending)
++                or bool(self._event_backlog) or bool(self._event_batch) or bool(self.events and self.events.pending)
+                 or bool(self.events and self._watcher_healthy and not self.events.healthy)
+                 or self.clock() >= self._next_full)
+ 
+     @property
+     def busy(self):
+-        return (self.reconciling or bool(self._event_backlog)
++        return (self.reconciling or bool(self._event_backlog) or bool(self._event_batch)
+                 or bool(self._pending_heap and self._pending_heap[0][0] <= self.clock()))
+ 
+     def _eligible(self, path):
+@@ -173,6 +180,7 @@
+         self._entries.pop(path)
+         self._work.pop(path, None)
+         self._pending_paths.discard(path)
++        self._source_hinted.discard(path)
+         self.readiness.forget(path)
+         relative = self._relative(path)
+         self._relative_counts[relative] -= 1
+@@ -194,20 +202,62 @@
+             self._revision += 1
+             self._work[path] = self._revision
+ 
+-    def _refresh(self, path):
++    def _source_hints(self, paths):
++        if self.source_known is None or not paths:
++            return set()
++        try:
++            return set(self.source_known(list(paths))) & set(paths)
++        except Exception:
++            # An unavailable/stale hint must fall back to normal readiness.
++            return set()
++
++    def _catalog_stamp(self, path, stamp):
++        previous = self._entries.get(path)
++        # Windows DirEntry.stat deliberately omits device/inode. Keep that
++        # representation stable when a later live readiness stat supplies them.
++        # Fingerprint/upload identity checks still use their full live stamps.
++        if previous is not None and previous[3:5] == (0, 0):
++            return (*stamp[:3], 0, 0, stamp[5])
++        return stamp
++
++    def _check_ready(self, path):
++        previous = self._entries.get(path)
++        if previous is None or previous[3:5] != (0, 0):
++            return self.readiness.check(path)
++        stamp = self._catalog_stamp(path, read_stamp(path))
++        since = self.readiness.observe(path, stamp)
++        if (stamp[0] <= 0 or self.clock() - since < self.readiness.quiet
++                or has_active_writer(path)):
++            return None
++        return stamp
++
++    def _refresh(self, path, *, metadata=None, source_hint=False, stamp=None, checked=False):
+         path = Path(os.path.abspath(path))
+         previous = self._entries.get(path)
+         try:
+-            stamp = read_stamp(path) if self._eligible(path) and path.is_file() else None
++            if not self._eligible(path):
++                stamp = None
++            elif stamp is None:
++                if metadata is None and source_hint:
++                    metadata = path.stat()
++                    if not stat_module.S_ISREG(metadata.st_mode):
++                        self._remove(path)
++                        return
++                if metadata is not None:
++                    stamp = (*stat_identity(metadata), None if source_hint else change_token(path, metadata))
++                else:
++                    stamp = read_stamp(path) if path.is_file() else None
+             if stamp is not None and self.lane(stamp[0]) == 'too_large':
+                 stamp = None
++            if stamp is not None:
++                stamp = self._catalog_stamp(path, stamp)
+         except FileNotFoundError:
+             stamp = None
+         except OSError:
+             return  # A transient access failure must not delete known membership.
+         if stamp is None:
+             self._remove(path)
+-        elif previous != stamp:
++        elif previous != stamp or (path in self._source_hinted) != source_hint:
+             self._unready(path)
+             self._work.pop(path, None)
+             if previous is None:
+@@ -218,11 +268,28 @@
+                     self._relative_files.add(relative)
+                     self._member(relative, True)
+             self._entries[path] = stamp
++            if source_hint:
++                # Keep catalog membership and work even if this hint is stale.
++                # The upload boundary must resolve history against its real group.
++                self.readiness.forget(path)
++                self._source_hinted.add(path)
++                self._make_ready(path, stamp)
++                return
++            self._source_hinted.discard(path)
++            if checked:
++                self._make_ready(path, stamp)
++                return
+             self._pending_paths.add(path)
+             self.readiness.forget(path)
+             self.readiness.observe(path, stamp)
+             try:
+-                ready = self.readiness.check(path)
++                if metadata is None:
++                    ready = self.readiness.check(path)
++                else:
++                    # This observation just started its quiet period. Reuse the
++                    # directory metadata instead of issuing a duplicate stat/token.
++                    ready = (stamp if stamp[0] > 0 and self.readiness.quiet == 0
++                             and not has_active_writer(path) else None)
+                 if ready == stamp:
+                     self._make_ready(path, stamp)
+                     return
+@@ -249,13 +316,18 @@
+         if self._walker is not None:
+             self._walker.close()
+         self._walker = self._cleanup = self._seen = None
++        self._discovered.clear()
+ 
+     def _reconcile_step(self):
+         if self.walk_factory is None:
+             files, _ = self.scan(self.task)
+             current = {Path(os.path.abspath(p)) for p in files}
+-            for path in current:
+-                self._refresh(path)
++            paths = list(current)
++            for start in range(0, len(paths), self.batch_size):
++                batch = paths[start:start + self.batch_size]
++                hints = self._source_hints(batch)
++                for path in batch:
++                    self._refresh(path, source_hint=path in hints)
+             for path in set(self._entries) - current:
+                 self._remove(path)
+             self._set_directories(p.name for p in self.root.iterdir() if p.is_dir())
+@@ -265,10 +337,11 @@
+             self._walker = self.walk_factory(self.task)
+             self._seen = set()
+         deadline = time.monotonic() + self.budget
+-        for _ in range(self.batch_size):
+-            if time.monotonic() >= deadline:
+-                break
+-            if self._walker is not None:
++        if self._walker is not None and not self._discovered:
++            found = []
++            for _ in range(self.batch_size):
++                if time.monotonic() >= deadline:
++                    break
+                 try:
+                     path = next(self._walker)
+                 except StopIteration:
+@@ -277,11 +350,21 @@
+                     self._walker = None
+                     self._set_directories(directories)
+                     self._cleanup = iter(tuple(self._entries))
+-                    continue
++                    break
+                 if path is not None:
+                     path = Path(os.path.abspath(path))
+                     self._seen.add(path)
+-                    self._refresh(path)
++                    found.append((path, getattr(self._walker, 'current_stat', None)))
++            hints = self._source_hints([path for path, _ in found])
++            self._discovered.extend((path, metadata, path in hints) for path, metadata in found)
++        for _ in range(self.batch_size):
++            if time.monotonic() >= deadline:
++                break
++            if self._discovered:
++                path, metadata, hinted = self._discovered.popleft()
++                self._refresh(path, metadata=metadata, source_hint=hinted)
++            elif self._walker is not None:
++                break
+             elif self._cleanup is not None:
+                 try:
+                     path = next(self._cleanup)
+@@ -308,8 +391,10 @@
+                 self.epoch = uuid.uuid4().hex
+                 self._entries, self._work, self._membership = {}, {}, {}
+                 self._ready, self._pending_paths = set(), set()
++                self._source_hinted = set()
+                 self._relative_files, self._relative_counts = set(), {}
+                 self._pending_heap, self._event_backlog = [], deque()
++                self._event_batch.clear()
+                 self.readiness = FileReadiness(self.readiness.quiet, self.clock)
+                 self._digest = self._revision = 0
+                 self._directories = ()
+@@ -330,20 +415,34 @@
+         if force_full:
+             self._cancel_walk()
+             self._event_backlog.clear()
++            self._event_batch.clear()
+             self._next_full = 0
+         # Apply notifications even while a directory pass is in progress.
+         self._event_backlog.extend(paths)
++        if paths and self._discovered:
++            changed = {Path(os.path.abspath(p)) for p in paths}
++            self._discovered = deque(item for item in self._discovered if item[0] not in changed)
+         if self._seen is not None:
+             self._seen.update(Path(os.path.abspath(p)) for p in paths)
+         if len(self._event_backlog) > 4096:
+             self._cancel_walk()
+             self._event_backlog.clear()
++            self._event_batch.clear()
+             self._next_full = 0
+         deadline = time.monotonic() + self.budget
++        if not self._event_batch:
++            event_paths = []
++            for _ in range(self.batch_size):
++                if not self._event_backlog or time.monotonic() >= deadline:
++                    break
++                event_paths.append(Path(os.path.abspath(self._event_backlog.popleft())))
++            hints = self._source_hints(event_paths)
++            self._event_batch.extend((path, path in hints) for path in event_paths)
+         for _ in range(self.batch_size):
+-            if not self._event_backlog or time.monotonic() >= deadline:
++            if not self._event_batch or time.monotonic() >= deadline:
+                 break
+-            self._refresh(self._event_backlog.popleft())
++            path, hinted = self._event_batch.popleft()
++            self._refresh(path, source_hint=hinted)
+         if (self.reconciling or self._last_full is None or now >= self._next_full
+                 or (self.walk_factory is None and not self.events.healthy)):
+             try:
+@@ -361,10 +460,10 @@
+             if path not in self._pending_paths:
+                 continue
+             try:
+-                stamp = self.readiness.check(path)
++                stamp = self._check_ready(path)
+                 if stamp is not None:
+                     if self._entries.get(path) != stamp:
+-                        self._refresh(path)
++                        self._refresh(path, stamp=stamp, checked=True)
+                     else:
+                         self._make_ready(path, stamp)
+                 else:
+@@ -403,6 +502,13 @@
+         with self._lock:
+             return tuple(self._entries)
+ 
++    def freeze_sizes(self, paths=None):
++        """Copy catalog sizes without filesystem I/O; final upload checks remain live."""
++        with self._lock:
++            if paths is None:
++                return {path: stamp[0] for path, stamp in self._entries.items()}
++            return {path: self._entries[path][0] for path in paths if path in self._entries}
++
+     def ack_work(self, cutoff):
+         with self._lock:
+             self._work = {p: revision for p, revision in self._work.items() if revision > cutoff}

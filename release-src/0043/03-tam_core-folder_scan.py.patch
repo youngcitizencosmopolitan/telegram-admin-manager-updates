@@ -1,0 +1,32 @@
+--- a/app/tam_core/folder_scan.py
++++ b/app/tam_core/folder_scan.py
+@@ -18,11 +18,14 @@
+         self._directory = None
+         self.directories = set()
+         self.closed = False
++        # Only the last yielded entry is retained; iteration still yields Paths.
++        self.current_stat = None
+ 
+     def __iter__(self):
+         return self
+ 
+     def __next__(self):
++        self.current_stat = None
+         if self.closed:
+             raise StopIteration
+         if self._iterator is None:
+@@ -48,12 +51,14 @@
+                     self._todo.append(Path(entry.path))
+                 return None
+             if Path(entry.name).suffix.lower() in self.allowed and entry.is_file():
++                self.current_stat = entry.stat()
+                 return Path(entry.path)
+         except FileNotFoundError:
+             pass
+         return None
+ 
+     def close(self):
++        self.current_stat = None
+         self.closed = True
+         if self._iterator is not None:
+             self._iterator.close()

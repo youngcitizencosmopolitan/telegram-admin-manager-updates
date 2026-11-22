@@ -1,0 +1,288 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -43,6 +43,7 @@
+ 
+ import tkinter as tk
+ from tkinter import filedialog, messagebox, simpledialog, ttk
++from tkinter import font as tkfont
+ 
+ try:
+     from telethon import TelegramClient, errors, utils as telethon_utils
+@@ -1206,7 +1207,10 @@
+         if p is None:
+             return
+         p.columnconfigure(0, weight=1)
+-        p.rowconfigure(2, weight=1)
++        p.rowconfigure(0, weight=0)
++        p.rowconfigure(1, weight=0)
++        p.rowconfigure(2, weight=0)
++        p.rowconfigure(3, weight=1)
+ 
+         top = ttk.Frame(p)
+         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+@@ -1246,7 +1250,7 @@
+         rules_panel = ttk.LabelFrame(body, text="Правила мониторинга", padding=6)
+         rules_panel.columnconfigure(0, weight=1)
+         rules_panel.rowconfigure(0, weight=1)
+-        body.add(rules_panel, stretch="always", minsize=260)
++        body.add(rules_panel, stretch="always", minsize=150)
+ 
+         cols = ("on", "folder", "target", "caption", "interval", "new", "queue", "progress", "speed", "eta", "state")
+         self.monitor_tree = ttk.Treeview(rules_panel, columns=cols, show="tree headings", selectmode="extended")
+@@ -1260,19 +1264,23 @@
+             "interval": 65, "new": 100, "queue": 100, "progress": 62, "speed": 95, "eta": 90, "state": 155,
+         }
+         centered = {"on", "interval", "new", "queue", "progress"}
++        heading_font = tkfont.Font(root=p, font=ttk.Style(p).lookup('Treeview.Heading', 'font') or 'TkDefaultFont')
+         for col, title in headings.items():
+             self.monitor_tree.heading(col, text=title)
+-            self.monitor_tree.column(col, width=widths[col], minwidth=45, anchor="center" if col in centered else "w")
++            minimum = max(45, heading_font.measure(title) + 20)
++            self.monitor_tree.column(col, width=max(widths[col], minimum), minwidth=minimum, anchor="center" if col in centered else "w")
+         self.monitor_tree.grid(row=0, column=0, sticky="nsew")
+         msb = ttk.Scrollbar(rules_panel, orient="vertical", command=self.monitor_tree.yview)
+         msb.grid(row=0, column=1, sticky="ns")
+-        self.monitor_tree.configure(yscrollcommand=msb.set)
++        mh = ttk.Scrollbar(rules_panel, orient="horizontal", command=self.monitor_tree.xview)
++        mh.grid(row=1, column=0, sticky="ew")
++        self.monitor_tree.configure(yscrollcommand=msb.set, xscrollcommand=mh.set)
+         self._register_sortable_tree(self.monitor_tree, "monitor.rules", {"interval": "number", "new": "number", "progress": "percent", "speed": "speed", "eta": "duration"}, first_descending={"speed"})
+         self.monitor_tree.bind("<Double-1>", lambda _e: self.edit_monitor_rule())
+         self.monitor_tree.bind("<Button-3>", self._show_monitor_context)
+ 
+         tools = ttk.Frame(rules_panel)
+-        tools.grid(row=1, column=0, sticky="ew", pady=(7, 0))
++        tools.grid(row=2, column=0, sticky="ew", pady=(7, 0))
+         ttk.Button(tools, text="+ Добавить", command=self.add_monitor_rule).pack(side="left")
+         ttk.Button(tools, text="Вкл / выкл", command=self.toggle_selected_monitor_rule).pack(side="left", padx=4)
+         ttk.Button(tools, text="Изменить правило…", command=self.edit_monitor_rule).pack(side="left", padx=4)
+@@ -1281,12 +1289,14 @@
+         ttk.Button(tools, text="Загрузить сейчас", command=self.enqueue_selected_monitor_rule).pack(side="left", padx=4)
+         ttk.Button(tools, text="Удалить", command=self.remove_selected_monitor_rule).pack(side="left", padx=4)
+         self.monitor_summary_var = tk.StringVar(value="Правил: 0")
+-        ttk.Label(tools, textvariable=self.monitor_summary_var).pack(side="right")
++        summary = ttk.Label(rules_panel, textvariable=self.monitor_summary_var)
++        summary.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 0))
++        rules_panel.bind('<Configure>', lambda event: summary.configure(wraplength=max(180, event.width-20)), add='+')
+ 
+         activity_panel = ttk.LabelFrame(body, text="Текущие / последние файлы", padding=6)
+         activity_panel.columnconfigure(0, weight=1)
+         activity_panel.rowconfigure(1, weight=1)
+-        body.add(activity_panel, stretch="always", minsize=220)
++        body.add(activity_panel, stretch="always", minsize=130)
+ 
+         activity_tools = ttk.Frame(activity_panel)
+         activity_tools.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+@@ -1318,7 +1328,9 @@
+         self.activity.grid(row=1, column=0, sticky="nsew")
+         asb = ttk.Scrollbar(activity_panel, orient="vertical", command=self.activity.yview)
+         asb.grid(row=1, column=1, sticky="ns")
+-        self.activity.configure(yscrollcommand=asb.set)
++        ah = ttk.Scrollbar(activity_panel, orient="horizontal", command=self.activity.xview)
++        ah.grid(row=2, column=0, sticky="ew")
++        self.activity.configure(yscrollcommand=asb.set, xscrollcommand=ah.set)
+         self.activity.bind("<Button-3>", self._show_activity_context)
+         self.activity.bind('<Double-1>', self._open_activity_rule)
+         self.activity.tag_configure("uploading", foreground="#005fb8")
+@@ -1508,7 +1520,8 @@
+         detail = ttk.Label(panel, textvariable=self.monitor_transfer_summary_var,
+                            font=('Segoe UI', 10), justify='left')
+         detail.grid(row=0, column=2, rowspan=3, sticky='w', padx=(5, 0))
+-        panel.bind('<Configure>', lambda event: detail.configure(wraplength=max(200, event.width-285)), add='+')
++        panel.bind('<Configure>', lambda event: detail.configure(
++            wraplength=max(100, event.width-detail.winfo_x()-18)), add='+')
+         self.monitor_file_note_var = tk.StringVar(value='Включая файлы, найденные в истории отправок')
+         ttk.Label(panel, textvariable=self.monitor_file_note_var).grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
+         self.monitor_file_panel = panel
+@@ -3088,13 +3101,27 @@
+         self.save_tasks(tasks)
+         self.refresh_tasks()
+ 
+-    def _scan_task_files(self, task: dict[str, Any], *, include_oversized: bool = False) -> tuple[list[Path], int]:
++    def _scan_task_snapshot(self, task):
++        # Keep metadata local to this scan; task settings are copied/persisted
++        # elsewhere and must never carry a whole catalog dictionary.
++        sizes = {}
++        scan = self._scan_task_files
++        kwargs = {'capture_sizes': sizes.update} if 'capture_sizes' in inspect.signature(scan).parameters else {}
++        files, total = scan(task, **kwargs)
++        return files, total, sizes
++
++    def _scan_task_files(self, task: dict[str, Any], *, include_oversized: bool = False,
++                         capture_sizes=None) -> tuple[list[Path], int]:
+         task.pop('_monitor_numbering', None)
+         if task.get("_explicit_files") is not None:
+             files = [Path(path) for path in task["_explicit_files"] if Path(path).is_file() and _media_kind(Path(path)) in {"video", "photo"}]
+-            return files, sum(path.stat().st_size for path in files)
++            sizes = {path: path.stat().st_size for path in files}
++            if capture_sizes is not None:
++                capture_sizes(sizes)
++            return files, sum(sizes.values())
+         if not include_oversized:
+-            selection = selected_delta_files(task, getattr(self, '_folder_indexes', None), _telegram_upload_lane)
++            selection = selected_delta_files(task, getattr(self, '_folder_indexes', None),
++                                             _telegram_upload_lane, capture_sizes=capture_sizes)
+             if selection is not None:
+                 return selection
+         folder = Path(str(task.get("folder", "")))
+@@ -3108,6 +3135,7 @@
+         # DirEntry reuses directory metadata. Do not queue impossible uploads or
+         # reread every media file's metadata in a second pass over the tree.
+         files: list[Path] = []
++        sizes = {} if capture_sizes is not None else None
+         total = 0
+         directories = [folder]
+         recursive = bool(task.get('recursive', True))
+@@ -3127,6 +3155,8 @@
+                             if not include_oversized and _telegram_upload_lane(size) == 'too_large':
+                                 continue
+                             files.append(Path(entry.path))
++                            if sizes is not None:
++                                sizes[Path(entry.path)] = size
+                             total += size
+                         except OSError:
+                             continue
+@@ -3134,6 +3164,8 @@
+                 if directory == folder:
+                     raise
+         files.sort(key=lambda p: str(p).lower())
++        if capture_sizes is not None:
++            capture_sizes(sizes)
+         return files, total
+ 
+     def scan_all(self) -> None:
+@@ -3210,6 +3242,28 @@
+                 titles.append(title)
+         return sorted(titles, key=self._forum_topic_title_key)
+ 
++    def _known_monitor_sources(self, task, paths):
++        # A cached peer is only a readiness hint. Completion is checked again
++        # against the actual resolved Telegram target in _run_one_task.
++        if not self._match_sent_source(task):
++            return set()
++        history = getattr(self.app.upload_history, 'completed_sources', None)
++        cache = getattr(self.app.group_state_cache, 'entry', None)
++        if not callable(history) or not callable(cache):
++            return set()
++        try:
++            peer = int((cache(str(task.get('target', ''))) or {}).get('peer_id') or 0)
++        except (ValueError, TypeError):
++            return set()
++        if peer < -1000000000000:
++            target = f'Channel:{-peer - 1000000000000}'
++        elif peer < 0:
++            target = f'Chat:{-peer}'
++        else:
++            return set()
++        stop = getattr(self, 'monitor_stop_event', None)
++        return history(paths, target, stopped=stop.is_set if stop is not None else None)
++
+     def _scan_monitor_snapshot(self, task: dict[str, Any]) -> tuple[str, set[str]]:
+         indexes = getattr(self, '_folder_indexes', None)
+         if indexes is not None:
+@@ -3221,6 +3275,7 @@
+                 index = indexes[tid] = FolderSnapshotIndex(task, self._scan_task_files, _telegram_upload_lane)
+                 index.walk_factory = FolderWalker
+                 index.phase = int(hashlib.blake2b(tid.encode(), digest_size=2).hexdigest(), 16) % 30
++                index.source_known = lambda paths, rule=dict(task): self._known_monitor_sources(rule, paths)
+             return index.snapshot()
+         return self._scan_monitor_snapshot_full(task)
+ 
+@@ -3534,7 +3589,8 @@
+                            and (signature != old or has_work) and signature != pending
+                            and blocked != (signature, recovery_version))
+                 if signature == 'scanning':
+-                    runtime['state'] = 'Сверка папки…'
++                    count = len(index.relative_files) if index is not None else 0
++                    runtime['state'] = f'Сверка каталога: {count:,} файлов'
+                 elif signature == 'pending':
+                     runtime['state'] = 'Ожидает завершения копирования'
+                 elif new_count > 0:
+@@ -3570,7 +3626,7 @@
+             for _ in range(1 if reconciling else 10):
+                 if self.monitor_stop_event.is_set():
+                     return
+-                await asyncio.sleep(0.05 if reconciling else 0.5)
++                await asyncio.sleep(0.005 if reconciling else 0.5)
+ 
+     def _ack_monitor_work(self, task: dict[str, Any]) -> None:
+         delta = task.get('_monitor_delta')
+@@ -5401,7 +5457,7 @@
+             self._publication_state = {}
+         self._queue_task_row(tid, status='Сканирование…')
+         async with scan_sem:
+-            files, total_bytes = await asyncio.to_thread(self._scan_task_files, task)
++            files, total_bytes, scan_sizes = await asyncio.to_thread(self._scan_task_snapshot, task)
+         total_files = len(files)
+         task["scan_files"] = total_files
+         task["scan_bytes"] = total_bytes
+@@ -5533,6 +5589,8 @@
+         )
+ 
+         batch_check = getattr(self.app.upload_history, 'completed_paths', None)
++        source_check = (getattr(self.app.upload_history, 'completed_sources', None)
++                        if self._match_sent_source(task) else None)
+         pending: list[tuple[int, Path]] = []
+         last_history_update = 0.0
+         for offset in range(0, total_files, HISTORY_CHECK_BATCH_SIZE):
+@@ -5540,7 +5598,15 @@
+                 break
+             chunk = files[offset:offset + HISTORY_CHECK_BATCH_SIZE]
+             completed_paths = None
+-            if callable(batch_check):
++            completed_sources = set()
++            if callable(source_check):
++                async with scan_sem:
++                    if self.stop_event.is_set():
++                        break
++                    completed_sources = await asyncio.to_thread(
++                        source_check, chunk, str(target_key), stopped=self.stop_event.is_set)
++            unresolved = [path for path in chunk if path not in completed_sources]
++            if callable(batch_check) and unresolved:
+                 if offset == 0:
+                     self._queue_task_row(tid, status=f'Проверка кеша: 0/{total_files}')
+                 # Bound concurrent disk/SQLite scans across rules as well as the
+@@ -5549,11 +5615,10 @@
+                     if self.stop_event.is_set():
+                         break
+                     completed_paths = await asyncio.to_thread(
+-                        batch_check, chunk, history_key_for_path,
++                        batch_check, unresolved, history_key_for_path,
+                         lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
+                         forum_target_key=str(target_key) if forum_mode else None,
+                         stopped=self.stop_event.is_set,
+-                        **({"match_source": True} if self._match_sent_source(task) else {}),
+                     )
+             if self.stop_event.is_set():
+                 break
+@@ -5562,6 +5627,22 @@
+                     await asyncio.sleep(0)
+                 if self.stop_event.is_set():
+                     break
++                if path in completed_sources:
++                    size = scan_sizes.get(path)
++                    if size is None:
++                        # Compatibility for custom scanners without size capture;
++                        # the production catalog/scandir paths always capture it.
++                        try:
++                            size = path.stat().st_size
++                        except OSError:
++                            size = 0
++                    if self._remember_unconfirmed(task, path, False):
++                        self._queue_activity_update(f'{tid}:{path}', name, path, '—', size,
++                                                    100.0, 0.0, 'Дубликат • отправка подтверждена')
++                    state['processed_bytes'] += size
++                    state['processed_files'] += 1
++                    state['skipped'] += 1
++                    continue
+                 try:
+                     current_stat = path.stat()
+                     size = current_stat.st_size
+@@ -5613,6 +5694,7 @@
+                 self._queue_task_row(tid, status=f'Проверка кеша: {checked}/{total_files}')
+             await asyncio.sleep(0)
+         state['checking_history'] = self.stop_event.is_set()
++        scan_sizes.clear()
+         self._emit_task_metrics(tid, force=True)
+ 
+         if self.stop_event.is_set():

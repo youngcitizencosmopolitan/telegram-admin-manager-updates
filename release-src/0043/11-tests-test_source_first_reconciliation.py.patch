@@ -1,0 +1,113 @@
+--- /dev/null
++++ b/app/tests/test_source_first_reconciliation.py
+@@ -0,0 +1,110 @@
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from batch_uploader import BatchUploaderPane
++import test_bounded_history as fixture
++import test_prefetch_upload_boundary as upload_fixture
++
++
++class SourceFirstReconciliationTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.HistoryUploaderTests.asyncSetUp
++    run_task = fixture.HistoryUploaderTests.run_task
++
++    async def prepare_sources(self):
++        self.rule['monitor_folder'] = True
++        for i, path in enumerate(self.files):
++            self.history.db.upload_record(target_key='group', fingerprint='fp%d' % i,
++                path=str(path), size=5, mtime_ns=path.stat().st_mtime_ns,
++                account_user_id=1, account_label='test', message_id=i+1)
++        self.pane._scan_task_snapshot = lambda task: (self.files, 150, dict.fromkeys(self.files, 5))
++
++    async def test_sent_sources_skip_media_metadata_and_content_preflight(self):
++        await self.prepare_sources()
++        original = Path.stat
++        def stat(path, *args, **kwargs):
++            if path in self.files:
++                raise AssertionError('Already sent media was probed')
++            return original(path, *args, **kwargs)
++        with patch.object(Path, 'stat', stat), patch.object(self.history, 'completed_paths',
++                side_effect=AssertionError('Content preflight for sent source')):
++            await self.run_task()
++        state = self.pane.task_states['r1']
++        self.assertEqual((state['skipped'], state['processed_bytes'], state['failed']), (30, 150, 0))
++
++    async def test_disabled_source_guard_keeps_content_checks(self):
++        await self.prepare_sources()
++        self.pane.app.store.data['monitor_skip_sent_sources'] = False
++        original = self.history.completed_paths
++        with patch.object(self.history, 'completed_sources', side_effect=AssertionError('Disabled guard')), \
++                patch.object(self.history, 'completed_paths', wraps=original) as checked:
++            await self.run_task()
++        self.assertTrue(checked.called)
++        self.assertEqual(self.pane.task_states['r1']['skipped'], 30)
++
++    async def test_source_cancellation_does_not_credit_partial_results(self):
++        await self.prepare_sources()
++        def cancelled(*args, **kwargs):
++            self.pane.stop_event.set()
++            return set(self.files)
++        with patch.object(self.history, 'completed_sources', cancelled):
++            await self.run_task()
++        self.assertEqual(self.pane.task_states['r1']['processed_files'], 0)
++        self.assertTrue(self.pane.task_states['r1']['checking_history'])
++
++    async def test_source_misses_still_enter_content_preflight(self):
++        await self.prepare_sources()
++        original = self.history.completed_paths
++        # A changed real target (or advisory stale catalog hint) is not authority.
++        with patch.object(self.history, 'completed_sources', return_value=set()), \
++                patch.object(self.history, 'completed_paths', wraps=original) as checked:
++            await self.run_task()
++        self.assertEqual(checked.call_args.args[0], self.files)
++
++
++class ScanSnapshotTests(unittest.TestCase):
++    def test_snapshot_captures_sizes_without_putting_them_into_task(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        task = {'id': 'one'}
++        path = Path('synthetic.mp4')
++        def scan(task, *, capture_sizes=None):
++            capture_sizes({path: 42})
++            return [path], 42
++        pane._scan_task_files = scan
++        self.assertEqual(pane._scan_task_snapshot(task), ([path], 42, {path: 42}))
++        self.assertEqual(task, {'id': 'one'})
++
++
++class CatalogUploadBoundaryTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = upload_fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = upload_fixture.PrefetchUploadTests.asyncTearDown
++    read = upload_fixture.PrefetchUploadTests.read
++    file = upload_fixture.PrefetchUploadTests.file
++    run_task = upload_fixture.PrefetchUploadTests.run_task
++
++    async def test_stale_old_group_hint_does_not_skip_real_new_group_upload(self):
++        path = self.file()
++        self.rule['monitor_folder'] = True
++        self.history.db.upload_record(target_key='old-group', fingerprint='old-fingerprint',
++            path=str(path), size=5, mtime_ns=path.stat().st_mtime_ns,
++            account_user_id=1, account_label='test', message_id=7)
++        # Catalog paths can have advisory ready hints from a stale peer cache.
++        self.pane._scan_task_snapshot = lambda task: ([path], 5, {path: 5})
++        observed = []
++        original = self.pool.observe_files
++        async def observe(paths):
++            observed.extend(paths)
++            return await original(paths)
++        with patch.object(self.pool, 'observe_files', observe):
++            await self.run_task()
++        self.assertEqual(observed, [path])
++        self.assertEqual([Path(p) for p, _ in self.sent], [path])
++
++    async def test_deleted_unsent_catalog_candidate_is_never_uploaded(self):
++        path = self.file()
++        path.unlink()
++        self.rule['monitor_folder'] = True
++        self.pane._scan_task_snapshot = lambda task: ([path], 5, {path: 5})
++        await self.run_task()
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.pane.task_states['r1']['failed'], 1)
