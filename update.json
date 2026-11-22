@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0042",
-  "display_version": "0042",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0042/TelegramAdminManager_v0042_update.zip",
-  "sha256": "d165e0993ed4f67070d02d637da3bce5aa2cc94c615a312a3bb7ee75e1825561",
-  "notes": "0042: replace the long monitoring summary line with a compact vertical file panel: total files, sent, remaining to send. Sent includes successful uploads and files found in history, excluding errors, deferred files and over-limit skips. History verification shows an explicit checking state; over-limit skips are explained separately. Existing speed, volume, ETA and 10/30/60-minute statistics remain alongside the panel. Counts use existing in-memory dashboard snapshots with no new disk or Telegram queries; uploader, cache and sessions are unchanged."
+  "version": "4.3.8.0043",
+  "display_version": "0043",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0043/TelegramAdminManager_v0043_update.zip",
+  "sha256": "7f77d360fe1cbcd6751d694662b62718f445993d0e2ffeb737ebf9bacd5f1d59",
+  "notes": "0043: accelerate large network-folder reconciliation with bounded source-history checks before per-file metadata/content work, reuse directory-entry metadata and catalog snapshots for full/delta/numbered-caption selections, and reduce idle gaps between bounded background scan slices. Cached peer/source hints are advisory only; actual resolved-group history, unsent-file readiness and final publication safeguards remain authoritative. Show catalog scan progress. Fix collapsed monitoring controls at startup, small windows and DPI scaling, add table horizontal scrolling and give summary text its own row. Existing upload history, accounts, sessions and rate statistics are preserved."
 }
