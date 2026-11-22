@@ -1,0 +1,53 @@
+--- /dev/null
++++ b/app/tests/test_catalog_settings_snapshot.py
+@@ -0,0 +1,50 @@
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from batch_uploader import BatchUploaderPane
++import test_prefetch_upload_boundary as fixture
++
++
++class NoCopyCatalog:
++    def __deepcopy__(self, memo):
++        raise AssertionError('Catalog copied into live settings')
++
++
++class CatalogSettingsTests(unittest.TestCase):
++    def test_live_and_ephemeral_settings_do_not_copy_catalog(self):
++        pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        pane.app = SimpleNamespace(store=SimpleNamespace(data={'upload_tasks': []}))
++        pane.live_tasks = {}
++        pane._live_task_lock = threading.RLock()
++        for ephemeral in (False, True):
++            task = {'id':'r', 'folder':'catalog', 'target':'group',
++                    '_ephemeral':ephemeral, '_monitor_numbering':NoCopyCatalog()}
++            with self.subTest(ephemeral=ephemeral):
++                settings = pane._latest_task_settings(task)
++                self.assertEqual(settings['id'], 'r')
++                self.assertNotIn('_monitor_numbering', settings)
++                self.assertIsInstance(task['_monitor_numbering'], NoCopyCatalog)
++
++
++class CatalogCaptionUploadTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    read = fixture.PrefetchUploadTests.read
++    file = fixture.PrefetchUploadTests.file
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    async def test_numbered_caption_reuses_catalog_ranks_across_live_settings(self):
++        a = self.file('a.mp4', b'first')
++        b = self.file('b.mp4', b'second')
++        numbering = {'paths': (a, b), 'positions': None}
++        self.rule['caption'] = '{index}/{total} {filename}'
++        def scan(task):
++            task['_monitor_numbering'] = numbering
++            # A delta containing only b must preserve its whole-catalog rank.
++            return [b], 6, {b: 6}
++        self.pane._scan_task_snapshot = scan
++        await self.run_task()
++        self.assertEqual([kwargs['caption'] for _, kwargs in self.sent], ['2/2 b.mp4'])
++        self.assertEqual(numbering['positions'], {a:1, b:2})
