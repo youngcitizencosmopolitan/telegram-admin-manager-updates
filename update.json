@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0043",
-  "display_version": "0043",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0043/TelegramAdminManager_v0043_update.zip",
-  "sha256": "7f77d360fe1cbcd6751d694662b62718f445993d0e2ffeb737ebf9bacd5f1d59",
-  "notes": "0043: accelerate large network-folder reconciliation with bounded source-history checks before per-file metadata/content work, reuse directory-entry metadata and catalog snapshots for full/delta/numbered-caption selections, and reduce idle gaps between bounded background scan slices. Cached peer/source hints are advisory only; actual resolved-group history, unsent-file readiness and final publication safeguards remain authoritative. Show catalog scan progress. Fix collapsed monitoring controls at startup, small windows and DPI scaling, add table horizontal scrolling and give summary text its own row. Existing upload history, accounts, sessions and rate statistics are preserved."
+  "version": "4.3.8.0044",
+  "display_version": "0044",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0044/TelegramAdminManager_v0044_update.zip",
+  "sha256": "2a4df3cc62ec91fc6d3d91f48e766536e8522132be7a7003790f25a86f30f996",
+  "notes": "0044: retain all 0043 catalog and monitoring-layout improvements while keeping the per-run file-numbering catalog outside deep-copied live settings. Large libraries no longer copy every catalog path at each account/permit/upload checkpoint. Numbered captions reuse the same run-local rank cache, preserving full-catalog indices for delta uploads and late caption changes. Upload history, source guard, readiness, routing and publication safeguards are unchanged."
 }
