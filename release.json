@@ -1,20 +1,12 @@
 {
-  "version": "0043",
-  "base_version": "0042",
-  "manifest_version": "4.3.8.0043",
-  "display_version": "0043",
+  "version": "0044",
+  "base_version": "0043",
+  "manifest_version": "4.3.8.0044",
+  "display_version": "0044",
   "patch_files": [
-    "release-src/0043/01-batch_uploader.py.patch",
-    "release-src/0043/02-tam_core-folder_events.py.patch",
-    "release-src/0043/03-tam_core-folder_scan.py.patch",
-    "release-src/0043/04-tam_core-monitor_delta.py.patch",
-    "release-src/0043/05-tam_core-repositories.py.patch",
-    "release-src/0043/06-telegram_admin_manager.py.patch",
-    "release-src/0043/07-tests-test_completed_sources_fast.py.patch",
-    "release-src/0043/08-tests-test_monitor_delta_upload.py.patch",
-    "release-src/0043/09-tests-test_monitor_layout.py.patch",
-    "release-src/0043/10-tests-test_network_catalog_metadata.py.patch",
-    "release-src/0043/11-tests-test_source_first_reconciliation.py.patch"
+    "release-src/0044/01-batch_uploader.py.patch",
+    "release-src/0044/02-telegram_admin_manager.py.patch",
+    "release-src/0044/03-tests-test_catalog_settings_snapshot.py.patch"
   ],
-  "notes": "0043: accelerate large network-folder reconciliation with bounded source-history checks before per-file metadata/content work, reuse directory-entry metadata and catalog snapshots for full/delta/numbered-caption selections, and reduce idle gaps between bounded background scan slices. Cached peer/source hints are advisory only; actual resolved-group history, unsent-file readiness and final publication safeguards remain authoritative. Show catalog scan progress. Fix collapsed monitoring controls at startup, small windows and DPI scaling, add table horizontal scrolling and give summary text its own row. Existing upload history, accounts, sessions and rate statistics are preserved."
+  "notes": "0044: retain all 0043 catalog and monitoring-layout improvements while keeping the per-run file-numbering catalog outside deep-copied live settings. Large libraries no longer copy every catalog path at each account/permit/upload checkpoint. Numbered captions reuse the same run-local rank cache, preserving full-catalog indices for delta uploads and late caption changes. Upload history, source guard, readiness, routing and publication safeguards are unchanged."
 }

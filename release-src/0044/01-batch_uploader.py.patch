@@ -1,0 +1,42 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -669,6 +669,10 @@
+         return asyncio.run(coro)
+ 
+     def _latest_task_settings(self, task):
++        # The catalog is per-run rendering context, not mutable user settings.
++        # Copying it at every permit/upload checkpoint blocks the asyncio loop
++        # in proportion to the whole media library rather than the current file.
++        task = {key: value for key, value in task.items() if key != '_monitor_numbering'}
+         tid = str(task.get("id", ""))
+         if task.get("_ephemeral"):
+             return immutable_settings(task)
+@@ -687,7 +691,9 @@
+                     latest = dict(getattr(self, "live_tasks", {}).get(tid, task))
+             if not latest.get("enabled", True) or not route_matches(task, latest):
+                 return None
+-        return immutable_settings(dict(task, **latest))
++        merged = dict(task, **latest)
++        merged.pop('_monitor_numbering', None)
++        return immutable_settings(merged)
+ 
+     @asynccontextmanager
+     async def _app_slot(self, name, *args):
+@@ -6209,7 +6215,7 @@
+                                             state["active"].pop(key, None)
+                                             self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, '⏸ Аккаунт отключён')
+                                             break
+-                                        caption = self._render_live_caption(dict(settings, _caption_frozen=True), path, original_index, total_files, str(settings.get("name", name)))
++                                        caption = self._render_live_caption(dict(settings, _caption_frozen=True, _monitor_numbering=task.get('_monitor_numbering')), path, original_index, total_files, str(settings.get("name", name)))
+                                         send_kwargs: dict[str, Any] = {
+                                             "caption": caption,
+                                             "progress_callback": progress_callback,
+@@ -6275,7 +6281,7 @@
+                                             delay = max(0.0, float(settings.get("delay", 0) or 0))
+                                             if policy["enabled"]:
+                                                 delay = max(delay, float(policy["min_file_delay"]))
+-                                            send_kwargs.update(caption=self._render_live_caption(dict(settings, _caption_frozen=True), path, original_index, total_files, str(settings.get("name", name))), silent=bool(settings.get("silent", False)))
++                                            send_kwargs.update(caption=self._render_live_caption(dict(settings, _caption_frozen=True, _monitor_numbering=task.get('_monitor_numbering')), path, original_index, total_files, str(settings.get("name", name))), silent=bool(settings.get("silent", False)))
+                                             if media_kind == "video":
+                                                 send_kwargs["supports_streaming"] = bool(settings.get("streaming", True)) and path.suffix.lower() in {".mp4", ".m4v"}
+                                             elif media_kind == "photo":
