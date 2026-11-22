@@ -1,0 +1,41 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -135,6 +135,38 @@
+         if signature:
+             self.db.file_fingerprint_put(norm, signature, fingerprint)
+         return fingerprint
++
++    def completed_sources(self, paths: Iterable[Path], group_target_key: str,
++                          *, stopped=None) -> set[Path]:
++        """Match sent-source policy without accessing the candidate filesystem.
++
++        Paths remain lexical: source identity ignores relocated roots, content,
++        size and timestamps. Only successful upload history counts. Each query
++        is bounded; cancellation discards all matches and misses are not cached.
++        """
++        stopped = stopped or (lambda: False)
++        if stopped():
++            return set()
++        source = iter(paths)
++        result = set()
++        while not stopped():
++            chunk = []
++            for path in islice(source, HISTORY_CHECK_BATCH_SIZE):
++                if stopped():
++                    return set()
++                chunk.append(path)
++            if stopped():
++                return set()
++            if not chunk:
++                return result
++            candidates = [(group_target_key, str(path), 0, 0, '', 0) for path in chunk]
++            if stopped():
++                return set()
++            completed = self.db.upload_completed_candidates(candidates, match_source=True)
++            if stopped():
++                return set()
++            result.update(chunk[i] for i in completed)
++        return set()
+ 
+     def completed_paths(self, paths: Iterable[Path], target_key_for_path, fingerprint_key_for_path,
+                         *, forum_target_key: str | None = None, stopped=None, match_source: bool = False) -> dict[Path, tuple[int, ...]]:

@@ -1,0 +1,283 @@
+--- /dev/null
++++ b/app/tests/test_network_catalog_metadata.py
+@@ -0,0 +1,280 @@
++"""Network catalog tests use synthetic directory entries; no network or Telegram."""
++import os
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_core.folder_events import EventBuffer, FolderSnapshotIndex
++from tam_core.folder_scan import FolderWalker
++from tam_core.monitor_delta import selected_delta_files
++
++
++class Events(EventBuffer):
++    healthy = True
++
++    def __init__(self, *args):
++        super().__init__()
++
++    def close(self):
++        pass
++
++
++class Entries:
++    def __init__(self, entries):
++        self.entries = iter(entries)
++        self.closed = False
++
++    def __iter__(self):
++        return self
++
++    def __next__(self):
++        return next(self.entries)
++
++    def close(self):
++        self.closed = True
++
++
++class Entry:
++    def __init__(self, root, name, size=9):
++        self.path, self.name = str(root / name), name
++        self.metadata = SimpleNamespace(st_size=size, st_mtime_ns=10, st_ctime_ns=20,
++                                        st_dev=1, st_ino=2)
++        self.stats = 0
++
++    def is_dir(self, **kwargs):
++        return False
++
++    def is_file(self):
++        return True
++
++    def stat(self):
++        self.stats += 1
++        return self.metadata
++
++
++class NetworkCatalogTests(unittest.TestCase):
++    def setUp(self):
++        self.root = Path(os.path.abspath('synthetic-catalog'))
++        self.task = {'id': 'rule', 'folder': str(self.root), 'target': '@group'}
++
++    def index(self, entries, **kwargs):
++        listing = Entries(entries)
++        self.addCleanup(patch.stopall)
++        patch('tam_core.folder_scan.os.scandir', return_value=listing).start()
++        patch.object(Path, 'is_dir', return_value=True).start()
++        index = FolderSnapshotIndex(self.task, lambda task: self.fail('legacy scan'),
++            lambda size: 'small', walk_factory=FolderWalker, event_factory=Events,
++            batch_size=3, budget=100, **kwargs)
++        self.addCleanup(index.close)
++        return index
++
++    def finish(self, index):
++        for _ in range(30):
++            index.snapshot()
++            if not index.reconciling:
++                return
++        self.fail('catalog did not complete')
++
++    def test_walker_exposes_only_current_metadata_and_keeps_path_iterator(self):
++        entry = Entry(self.root, 'a.mp4')
++        with patch('tam_core.folder_scan.os.scandir', return_value=Entries([entry])):
++            walker = FolderWalker(self.task)
++            self.assertEqual(next(walker), Path(entry.path))
++            self.assertIs(walker.current_stat, entry.metadata)
++            self.assertEqual(entry.stats, 1)
++            self.assertIsNone(next(walker))
++            self.assertIsNone(walker.current_stat)
++            walker.close()
++            self.assertIsNone(walker.current_stat)
++
++    def test_known_hint_keeps_membership_and_dispatch_work_without_probes(self):
++        entries = [Entry(self.root, f'{i}.mp4', i + 1) for i in range(8)]
++        batches = []
++        def known(paths):
++            batches.append(list(paths))
++            return set(paths)
++        index = self.index(entries, source_known=known)
++        with patch.object(Path, 'stat', side_effect=AssertionError('path stat')), \
++             patch('tam_core.folder_events.read_stamp', side_effect=AssertionError('read stamp')), \
++             patch('tam_core.folder_events.change_token', side_effect=AssertionError('change token')), \
++             patch.object(index.readiness, 'check', side_effect=AssertionError('readiness')):
++            self.finish(index)
++            self.assertEqual(index.freeze_sizes(), {Path(e.path): i + 1 for i, e in enumerate(entries)})
++        self.assertEqual(index.relative_files, {f'{i}.mp4' for i in range(8)})
++        self.assertEqual(set(index.numbering_snapshot()), {Path(e.path) for e in entries})
++        self.assertTrue(index.has_work)
++        self.assertTrue(all(0 < len(batch) <= 3 for batch in batches))
++        self.assertEqual(sum(map(len, batches)), 8)
++        cutoff = index.work_snapshot()['cutoff']
++        index.ack_work(cutoff)
++        self.assertFalse(index.has_work)
++        self.assertEqual(len(index.freeze_sizes()), 8)
++
++    def test_unhinted_new_path_waits_for_readiness_and_reuses_directory_stat(self):
++        entries = [Entry(self.root, 'known.mp4'), Entry(self.root, 'new.mp4')]
++        index = self.index(entries, source_known=lambda paths: {Path(entries[0].path)})
++        with patch.object(Path, 'stat', side_effect=AssertionError('duplicate stat')), \
++             patch('tam_core.folder_events.change_token', return_value=42) as token:
++            self.finish(index)
++        self.assertEqual(index.relative_files, {'known.mp4', 'new.mp4'})
++        self.assertEqual(index._ready, {Path(entries[0].path)})
++        self.assertEqual(index._pending_paths, {Path(entries[1].path)})
++        self.assertEqual(token.call_count, 1)
++
++    def test_no_hint_retains_pending_readiness(self):
++        entry = Entry(self.root, 'new.mp4')
++        index = self.index([entry])
++        with patch('tam_core.folder_events.change_token', return_value=42):
++            self.finish(index)
++        self.assertEqual(index.relative_files, {'new.mp4'})
++        self.assertFalse(index._ready)
++        self.assertTrue(index.pending)
++
++    def test_freeze_sizes_and_delta_selection_are_memory_only(self):
++        entries = [Entry(self.root, 'a.mp4', 13), Entry(self.root, 'b.mp4', 7)]
++        index = self.index(entries, source_known=set)
++        self.finish(index)
++        index.ack_work(index.work_snapshot()['cutoff'])
++        index.events.notify(Path(entries[0].path))
++        # A fresh event need not be processed to test an already queued candidate.
++        delta = {**index.work_snapshot(), 'files': ['a.mp4'], 'full': False}
++        task = {**self.task, '_monitor_delta': delta}
++        with patch.object(Path, 'stat', side_effect=AssertionError('stat')), \
++             patch.object(Path, 'is_file', side_effect=AssertionError('is file')):
++            frozen = index.freeze_sizes([Path(entries[0].path), self.root / 'absent.mp4'])
++            self.assertEqual(frozen, {Path(entries[0].path): 13})
++            frozen.clear()
++            self.assertEqual(selected_delta_files(task, {'rule': index}, lambda s: 'small'),
++                             ([Path(entries[0].path)], 13))
++        self.assertEqual(index.freeze_sizes()[Path(entries[0].path)], 13)
++
++    def test_windows_directory_identity_does_not_restart_quiet_period(self):
++        entry = Entry(self.root, 'new.mp4')
++        entry.metadata.st_dev = entry.metadata.st_ino = 0
++        now = [0.0]
++        index = self.index([entry], clock=lambda: now[0])
++        with patch('tam_core.folder_events.change_token', return_value=99):
++            self.finish(index)
++        now[0] = 3.0
++        with patch('tam_core.folder_events.read_stamp', return_value=(9, 10, 20, 7, 8, 99)), \
++             patch('tam_core.folder_events.has_active_writer', return_value=False):
++            index.snapshot()
++        self.assertEqual(index._ready, {Path(entry.path)})
++        self.assertFalse(index.pending)
++
++    def test_advisory_lookup_failure_keeps_new_file_pending(self):
++        entry = Entry(self.root, 'new.mp4')
++        def unavailable(paths):
++            raise RuntimeError('history temporarily unavailable')
++        index = self.index([entry], source_known=unavailable)
++        with patch('tam_core.folder_events.change_token', return_value=None):
++            self.finish(index)
++        self.assertEqual(index.relative_files, {'new.mp4'})
++        self.assertFalse(index._ready)
++
++    def test_revoked_hint_returns_candidate_to_normal_readiness(self):
++        entry = Entry(self.root, 'new.mp4')
++        known = [True]
++        index = self.index([entry], source_known=lambda paths: set(paths) if known[0] else set())
++        self.finish(index)
++        known[0] = False
++        index.events.notify(Path(entry.path))
++        with patch.object(Path, 'is_file', return_value=True), \
++             patch('tam_core.folder_events.read_stamp', return_value=(9, 10, 20, 1, 2, None)), \
++             patch.object(index.readiness, 'check', return_value=None):
++            index.snapshot()
++        self.assertEqual(index.relative_files, {'new.mp4'})
++        self.assertEqual(index._pending_paths, {Path(entry.path)})
++        self.assertFalse(index._ready)
++
++    def test_slow_event_hint_yields_before_refresh_and_resumes_without_requery(self):
++        entry = Entry(self.root, 'new.mp4')
++        calls, elapsed = [], [0.0]
++        def known(paths):
++            calls.append(list(paths))
++            elapsed[0] += 2
++            return set(paths)
++        index = self.index([], source_known=known)
++        self.finish(index)
++        index.budget = 1.0
++        index.events.notify(Path(entry.path))
++        metadata = SimpleNamespace(**entry.metadata.__dict__, st_mode=0o100644)
++        with patch('tam_core.folder_events.time.monotonic', side_effect=lambda: elapsed[0]), \
++             patch.object(Path, 'stat', return_value=metadata):
++            index.snapshot()
++            self.assertNotIn(Path(entry.path), index.freeze_sizes())
++            self.assertTrue(index.busy)
++            index.snapshot()
++        self.assertEqual(index.freeze_sizes(), {Path(entry.path): 9})
++        self.assertEqual(len(calls), 1)
++
++    def test_slow_discovery_hint_preserves_bounded_batch_and_close_discards_it(self):
++        entry = Entry(self.root, 'new.mp4')
++        elapsed = [0.0]
++        def known(paths):
++            elapsed[0] += 2
++            return set(paths)
++        index = self.index([entry], source_known=known)
++        index.budget = 1.0
++        with patch('tam_core.folder_events.time.monotonic', side_effect=lambda: elapsed[0]):
++            index.snapshot()
++        self.assertEqual(index.freeze_sizes(), {})
++        self.assertEqual(len(index._discovered), 1)
++        self.assertTrue(index.reconciling)
++        index.close()
++        self.assertFalse(index.reconciling)
++        self.assertEqual(len(index._discovered), 0)
++
++    def test_active_writer_still_defers_unhinted_zero_quiet_file(self):
++        entry = Entry(self.root, 'new.mp4')
++        index = self.index([entry], quiet=0)
++        with patch('tam_core.folder_events.change_token', return_value=42), \
++             patch('tam_core.folder_events.has_active_writer', return_value=True), \
++             patch.object(index.readiness, 'check', return_value=None):
++            self.finish(index)
++        self.assertEqual(index.relative_files, {'new.mp4'})
++        self.assertFalse(index._ready)
++        self.assertTrue(index.pending)
++
++    def test_full_and_numbered_caption_selection_use_whole_catalog_without_io(self):
++        entries = [Entry(self.root, 'b.mp4', 7), Entry(self.root, 'a.mp4', 13)]
++        index = self.index(entries, source_known=set)
++        self.finish(index)
++        for update in ({'full': True}, {'caption': '{index}/{total} {filename}'}):
++            with self.subTest(update=update):
++                task = {**self.task, 'caption': update.get('caption', ''), '_monitor_delta': {
++                    **index.work_snapshot(), 'full': update.get('full', False), 'files': ['b.mp4']}}
++                with patch.object(Path, 'stat', side_effect=AssertionError('stat')), \
++                     patch.object(Path, 'is_file', side_effect=AssertionError('is_file')), \
++                     patch('os.scandir', side_effect=AssertionError('scandir')):
++                    self.assertEqual(selected_delta_files(task, {'rule': index}, lambda size: 'small'),
++                                     ([self.root / 'a.mp4', self.root / 'b.mp4'], 20))
++                self.assertEqual(set(task['_monitor_numbering']['paths']), {Path(e.path) for e in entries})
++
++    def test_full_catalog_selection_preserves_identity_and_epoch_fallback(self):
++        entry = Entry(self.root, 'a.mp4')
++        index = self.index([entry], source_known=set)
++        self.finish(index)
++        for update in ({'epoch': 'old'}, {'identity': []}):
++            task = {**self.task, '_monitor_delta': {**index.work_snapshot(), **update}}
++            self.assertIsNone(selected_delta_files(task, {'rule': index}, lambda size: 'small'))
++        task = {**self.task, 'target': '@different', '_monitor_delta': index.work_snapshot()}
++        self.assertIsNone(selected_delta_files(task, {'rule': index}, lambda size: 'small'))
++
++    def test_capture_sizes_uses_single_frozen_selection_even_if_catalog_changes(self):
++        entries = [Entry(self.root, 'a.mp4', 13), Entry(self.root, 'b.mp4', 7)]
++        index = self.index(entries, source_known=set)
++        self.finish(index)
++        task = {**self.task, '_monitor_delta': {**index.work_snapshot(), 'full': False, 'files': ['a.mp4']}}
++        captured = []
++        def capture(sizes):
++            captured.append(dict(sizes))
++            index._entries[self.root / 'a.mp4'] = (99, 1, 2, 3, 4, None)
++            sizes.clear()
++        with patch.object(index, 'freeze_sizes', wraps=index.freeze_sizes) as freeze:
++            result = selected_delta_files(task, {'rule': index}, lambda size: 'small', capture_sizes=capture)
++        self.assertEqual(result, ([self.root / 'a.mp4'], 13))
++        self.assertEqual(captured, [{self.root / 'a.mp4': 13}])
++        self.assertEqual(freeze.call_count, 1)
++        self.assertEqual(index.freeze_sizes()[self.root / 'a.mp4'], 99)

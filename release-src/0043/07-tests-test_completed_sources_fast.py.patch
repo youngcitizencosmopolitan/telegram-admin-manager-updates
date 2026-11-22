@@ -1,0 +1,101 @@
+--- /dev/null
++++ b/app/tests/test_completed_sources_fast.py
+@@ -0,0 +1,98 @@
++import tempfile
++import unittest
++from contextlib import ExitStack
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++from tam_core.repositories import HISTORY_CHECK_BATCH_SIZE, UploadHistory
++from tam_core.state_db import StateDatabase
++
++
++class CompletedSourcesFastTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.history = UploadHistory.__new__(UploadHistory)
++        self.history.db = StateDatabase(Path(self.tmp.name) / 'state.db')
++
++    def record(self, *, target='Channel:1#topic:7', name='movie.mp4'):
++        self.history.db.upload_record(
++            target_key=target, fingerprint='complete-' + name,
++            path='C:/old/VIP/Studio/' + name, size=100, mtime_ns=1,
++            account_user_id=1, account_label='test', message_id=7)
++
++    def test_source_match_never_requests_metadata_or_fingerprints(self):
++        self.record()
++        restored = Path('Z:/restored/VIP/Studio/MOVIE.mp4')
++        with ExitStack() as stack:
++            for method in ('stat', 'resolve', 'is_file', 'exists', 'open'):
++                stack.enter_context(patch.object(Path, method, side_effect=AssertionError(method)))
++            stack.enter_context(patch('tam_core.repositories.change_token', side_effect=AssertionError('token')))
++            stack.enter_context(patch.object(self.history, '_file_signature', side_effect=AssertionError('signature')))
++            stack.enter_context(patch.object(self.history.db, 'file_fingerprints_get', side_effect=AssertionError('fingerprint')))
++            self.assertEqual(self.history.completed_sources([restored], 'Channel:1'), {restored})
++
++    def test_other_group_and_other_parent_are_independent(self):
++        self.record()
++        restored = Path('Z:/VIP/Studio/movie.mp4')
++        other = Path('Z:/VIP/Other/movie.mp4')
++        self.assertEqual(self.history.completed_sources([restored, other], 'Channel:1#forum:new'), {restored})
++        self.assertEqual(self.history.completed_sources([restored], 'Channel:10'), set())
++
++    def test_miss_is_rechecked_after_history_changes(self):
++        restored = Path('Z:/VIP/Studio/movie.mp4')
++        self.assertEqual(self.history.completed_sources([restored], 'Channel:1'), set())
++        self.record()
++        self.assertEqual(self.history.completed_sources([restored], 'Channel:1'), {restored})
++
++    def test_queries_are_bounded_and_ignore_content_metadata(self):
++        paths = [Path('X:/synthetic/VIP/Studio/%d.mp4' % i)
++                 for i in range(HISTORY_CHECK_BATCH_SIZE * 2 + 3)]
++        query = Mock(side_effect=lambda rows, **kwargs: set(range(len(rows))))
++        self.history.db = SimpleNamespace(upload_completed_candidates=query)
++        self.assertEqual(self.history.completed_sources(iter(paths), 'Channel:1'), set(paths))
++        self.assertEqual([len(call.args[0]) for call in query.call_args_list],
++                         [HISTORY_CHECK_BATCH_SIZE, HISTORY_CHECK_BATCH_SIZE, 3])
++        for call in query.call_args_list:
++            self.assertEqual(call.kwargs, {'match_source': True})
++            for target, path, size, mtime, fingerprint, allow_exact in call.args[0]:
++                self.assertEqual((target, size, mtime, fingerprint, allow_exact), ('Channel:1', 0, 0, '', 0))
++
++    def test_cancellation_before_query_consumes_nothing(self):
++        query = Mock()
++        self.history.db = SimpleNamespace(upload_completed_candidates=query)
++        def paths():
++            raise AssertionError('cancelled input must not be consumed')
++            yield
++        self.assertEqual(self.history.completed_sources(paths(), 'Channel:1', stopped=lambda: True), set())
++        query.assert_not_called()
++
++    def test_cancellation_during_collection_prevents_query(self):
++        cancelled = False
++        query = Mock()
++        self.history.db = SimpleNamespace(upload_completed_candidates=query)
++        def paths():
++            nonlocal cancelled
++            yield Path('X:/VIP/Studio/a.mp4')
++            cancelled = True
++            yield Path('X:/VIP/Studio/b.mp4')
++        self.assertEqual(self.history.completed_sources(paths(), 'Channel:1', stopped=lambda: cancelled), set())
++        query.assert_not_called()
++
++    def test_cancellation_after_sql_discards_prior_chunks(self):
++        cancelled = False
++        calls = 0
++        def query(rows, **kwargs):
++            nonlocal cancelled, calls
++            calls += 1
++            cancelled = calls == 2
++            return set(range(len(rows)))
++        self.history.db = SimpleNamespace(upload_completed_candidates=query)
++        paths = (Path('X:/VIP/Studio/%d.mp4' % i) for i in range(HISTORY_CHECK_BATCH_SIZE + 1))
++        self.assertEqual(self.history.completed_sources(paths, 'Channel:1', stopped=lambda: cancelled), set())
++        self.assertEqual(calls, 2)
++
++
++if __name__ == '__main__':
++    unittest.main()
