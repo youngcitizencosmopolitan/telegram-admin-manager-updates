@@ -1,0 +1,27 @@
+--- a/app/tests/test_premium_global_priority.py
++++ b/app/tests/test_premium_global_priority.py
+@@ -79,6 +79,24 @@
+         self.assertEqual(await asyncio.wait_for(job, 1), 'small')
+         self.assertEqual(big.qsize(), 1)
+ 
++    async def test_verified_premium_file_can_start_during_later_premium_checks(self):
++        for shared in (None, self.priority):
++            with self.subTest(shared=shared is not None):
++                premium_ready = asyncio.Event()
++                small, big = self.queue('small'), self.queue('verified-big')
++                args = dict(task_id='first', session='premium', small_queue=small, big_queue=big,
++                            premium_by_session=self.premium, start_after=None, priority=shared,
++                            stop_event=self.stop, disabled=lambda: False, signal_drained=lambda: None,
++                            premium_ready=premium_ready)
++                self.assertEqual(await asyncio.wait_for(bu._next_upload_job(**args), 1), 'verified-big')
++                waiting = asyncio.create_task(bu._next_upload_job(**args))
++                self.jobs.append(waiting)
++                await self.assert_waiting(waiting)
++                premium_ready.set()
++                if shared is not None:
++                    shared.mark_prepared('first')
++                    shared.mark_prepared('later')
++                self.assertEqual(await asyncio.wait_for(waiting, 1), 'small')
+     async def test_premium_returns_to_small_files_after_big_queue_drains(self):
+         small, big = self.queue('small'), self.queue('big')
+         self.priority.register('first', big, lambda session: True)

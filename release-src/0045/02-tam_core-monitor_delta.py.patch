@@ -1,0 +1,151 @@
+--- a/app/tam_core/monitor_delta.py
++++ b/app/tam_core/monitor_delta.py
+@@ -1,6 +1,9 @@
+ """Monitoring identities, incremental detection state and upload selections."""
+ import os
++import stat
+ from pathlib import Path
++
++from .media import PHOTO_EXTENSIONS, VIDEO_EXTENSIONS
+ 
+ 
+ def monitor_identity(task):
+@@ -9,55 +12,114 @@
+             bool(task.get('send_photos', False)), bool(task.get('forum_topics_from_subfolders', False)))
+ 
+ 
++def _identity_matches(delta, task):
++    identity = delta.get('identity')
++    return isinstance(identity, (list, tuple)) and tuple(identity) == monitor_identity(task)
++
++
+ def task_for_dispatch(current, queued):
+     result = dict(current)
+     result.pop('_monitor_delta', None)
+     delta = queued.get('_monitor_delta')
+-    if isinstance(delta, dict) and tuple(delta.get('identity', ())) == monitor_identity(current):
++    revision_matches = not ('route_revision' in current and 'route_revision' in queued
++                            and current['route_revision'] != queued['route_revision'])
++    if (revision_matches and isinstance(delta, dict)
++            and _identity_matches(delta, current)):
+         result['_monitor_delta'] = dict(delta)
+     return result
+ 
+ 
++def _delta_paths(root, names):
++    if not isinstance(names, list) or len(names) > 10000:
++        return None
++    selected = set()
++    for name in names:
++        if not isinstance(name, str) or not name or '\x00' in name:
++            return None
++        relative = Path(name)
++        if (not relative.parts or relative.is_absolute() or relative.drive
++                or '..' in relative.parts or any(':' in part for part in relative.parts)):
++            return None
++        path = Path(os.path.abspath(root / relative))
++        if not path.is_relative_to(root):
++            return None
++        selected.add(path)
++    return selected
++
++
++def _require_root(root):
++    # Path.is_dir/exists suppress some OS errors; explicit stat preserves retries
++    # when a share is unavailable instead of acknowledging an empty selection.
++    if not stat.S_ISDIR(root.stat().st_mode):
++        raise NotADirectoryError(str(root))
++
++
++def _restored_sizes(task, root, selected):
++    _require_root(root)
++    resolved_root = root.resolve(strict=True)
++    sizes = {}
++    allowed = set(VIDEO_EXTENSIONS if task.get('send_videos', True) else ())
++    if task.get('send_photos', False):
++        allowed.update(PHOTO_EXTENSIONS)
++    for path in selected:
++        relative = path.relative_to(root)
++        if (path.suffix.lower() not in allowed
++                or (not task.get('recursive', True) and len(relative.parts) != 1)):
++            continue
++        try:
++            # Contain symlinks/junctions as well as lexical relative paths.
++            if not path.resolve(strict=True).is_relative_to(resolved_root):
++                continue
++            metadata = path.stat()
++        except FileNotFoundError:
++            _require_root(root)
++            continue
++        if stat.S_ISREG(metadata.st_mode):
++            sizes[path] = metadata.st_size
++    _require_root(root)
++    return sizes
++
++
+ def selected_delta_files(task, indexes, lane, *, capture_sizes=None):
+-    """Select from a matching catalog; optionally capture this exact size snapshot."""
++    """Select cached or persisted partial work and capture its exact size snapshot."""
++    task.pop('_restored_monitor_delta', None)
+     delta = task.get('_monitor_delta')
+-    if not isinstance(delta, dict):
++    if (not isinstance(delta, dict)
++            or not _identity_matches(delta, task)):
+         return None
+     index = (indexes or {}).get(str(task.get('id', '')))
+-    if (index is None or index.closed or delta.get('epoch') != index.epoch
+-            or tuple(delta.get('identity', ())) != monitor_identity(task)
+-            or monitor_identity(index.task) != monitor_identity(task)):
+-        return None
++    usable_index = (index is not None and not index.closed and delta.get('epoch') == index.epoch
++                    and monitor_identity(index.task) == monitor_identity(task))
+     caption = str(task.get('caption', ''))
+     whole_catalog = delta.get('full') or '{index}' in caption or '{total}' in caption
+     if whole_catalog:
++        if (not usable_index or index.reconciling or index._last_full is None):
++            return None
+         sizes = index.freeze_sizes()
+     else:
+-        names = delta.get('files')
+-        if not isinstance(names, list) or len(names) > 10000:
++        root = Path(os.path.abspath(task['folder']))
++        selected = _delta_paths(root, delta.get('files'))
++        if selected is None:
+             return None
+-        root = Path(os.path.abspath(task['folder']))
+-        selected = set()
+-        for name in names:
+-            if not isinstance(name, str) or not name:
+-                return None
+-            relative = Path(name)
+-            if relative.is_absolute() or relative.drive or '..' in relative.parts:
+-                return None
+-            path = Path(os.path.abspath(root / relative))
+-            if not path.is_relative_to(root):
+-                return None
+-            selected.add(path)
+-        sizes = index.freeze_sizes(selected)
++        if usable_index:
++            sizes = index.freeze_sizes(selected)
++        elif delta.get('full') is False:
++            sizes = _restored_sizes(task, root, selected)
++        else:
++            return None
+     files, total = [], 0
+     for path in sorted(sizes, key=lambda p: str(p).lower()):
+         size = sizes.get(path)
+-        if size is not None and index._eligible(path) and lane(size) != 'too_large':
++        if size is not None and (not usable_index or index._eligible(path)) and lane(size) != 'too_large':
+             files.append(path)
+             total += size
+     # Freeze cached path references only, without filesystem reads. A later live
+     # caption edit may introduce {index}/{total}; derive ranks lazily in that case.
+-    task['_monitor_numbering'] = {'paths': index.numbering_snapshot(), 'positions': None}
++    if usable_index:
++        task['_monitor_numbering'] = {'paths': index.numbering_snapshot(), 'positions': None}
++    else:
++        task.pop('_monitor_numbering', None)
++        task['_restored_monitor_delta'] = True
+     if capture_sizes is not None:
+         capture_sizes({path: sizes[path] for path in files})
+     return files, total

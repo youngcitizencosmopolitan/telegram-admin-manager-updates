@@ -1,0 +1,127 @@
+--- /dev/null
++++ b/app/tests/test_monitor_delta_resume.py
+@@ -0,0 +1,124 @@
++"""Persisted partial monitor selections resume without a directory enumeration."""
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from tam_core.monitor_delta import monitor_identity, selected_delta_files, task_for_dispatch
++
++
++class DurableDeltaTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.path = self.root / 'new.mp4'
++        self.path.write_bytes(b'new')
++        (self.root / 'old.mp4').write_bytes(b'old')
++        self.task = {'id': 'r', 'folder': str(self.root), 'target': '@group', 'recursive': True}
++        self.task['_monitor_delta'] = {'identity': list(monitor_identity(self.task)),
++            'epoch': 'before-restart', 'full': False, 'files': ['new.mp4'], 'cutoff': 5}
++
++    def select(self, indexes=None, **kwargs):
++        return selected_delta_files(self.task, indexes, lambda size: 'small', **kwargs)
++
++    def test_restart_old_epoch_resumes_only_explicit_candidates_without_scandir(self):
++        captured = []
++        for indexes in (None, {'r': SimpleNamespace(closed=False, epoch='new-epoch')},
++                        {'r': SimpleNamespace(closed=True, epoch='before-restart')}):
++            with self.subTest(indexes=indexes), patch('os.scandir', side_effect=AssertionError('tree walk')):
++                self.assertEqual(self.select(indexes, capture_sizes=captured.append), ([self.path], 3))
++        self.assertEqual(captured, [{self.path: 3}] * 3)
++
++    def test_dispatch_drops_delta_for_explicit_route_revision_mismatch(self):
++        queued = {**self.task, 'route_revision': 2}
++        current = {**self.task, 'route_revision': 4}
++        self.assertNotIn('_monitor_delta', task_for_dispatch(current, queued))
++        self.assertIn('_monitor_delta', task_for_dispatch({**current, 'route_revision': 2}, queued))
++        self.assertIn('_monitor_delta', task_for_dispatch(self.task, queued))
++
++    def test_invalid_identity_and_relative_paths_keep_full_scan_fallback(self):
++        for update in ({'identity': []}, {'files': ['../outside.mp4']},
++                       {'files': [str(self.path)]}, {'files': ['new.mp4:stream.mp4']},
++                       {'files': ['bad\x00.mp4']}, {'files': 'new.mp4'}):
++            with self.subTest(update=update):
++                task = {**self.task, '_monitor_delta': {**self.task['_monitor_delta'], **update}}
++                self.assertIsNone(selected_delta_files(task, None, lambda size: 'small'))
++
++    def test_missing_root_and_non_directory_root_raise_for_retry(self):
++        self.path.unlink()
++        (self.root / 'old.mp4').unlink()
++        self.root.rmdir()
++        with self.assertRaises(FileNotFoundError):
++            self.select()
++        self.root.write_bytes(b'not a directory')
++        self.addCleanup(self.root.unlink)
++        with self.assertRaises(NotADirectoryError):
++            self.select()
++
++    def test_permission_and_transient_candidate_errors_propagate(self):
++        original = Path.stat
++        for failed_path in (self.root, self.path):
++            with self.subTest(failed_path=failed_path):
++                def unavailable(path, *args, **kwargs):
++                    if path == failed_path:
++                        raise PermissionError('network access denied')
++                    return original(path, *args, **kwargs)
++                with patch.object(Path, 'stat', unavailable), self.assertRaises(PermissionError):
++                    self.select()
++
++    def test_missing_individual_candidate_is_omitted_without_full_scan(self):
++        self.path.unlink()
++        with patch('os.scandir', side_effect=AssertionError('tree walk')):
++            self.assertEqual(self.select(), ([], 0))
++
++    def test_root_lost_during_missing_candidate_check_is_not_empty_success(self):
++        original = Path.stat
++        lost = [False]
++        def disappearing(path, *args, **kwargs):
++            if path == self.path:
++                lost[0] = True
++                raise FileNotFoundError('source vanished')
++            if path == self.root and lost[0]:
++                raise FileNotFoundError('root offline')
++            return original(path, *args, **kwargs)
++        with patch.object(Path, 'stat', disappearing), self.assertRaises(FileNotFoundError):
++            self.select()
++
++    def test_media_flags_recursion_and_size_limit_apply_to_persisted_names(self):
++        sub = self.root / 'sub'
++        sub.mkdir()
++        (sub / 'child.mp4').write_bytes(b'child')
++        (self.root / 'photo.jpg').write_bytes(b'photo')
++        (self.root / 'text.txt').write_bytes(b'text')
++        task = {**self.task, 'recursive': False, 'send_photos': False}
++        task['_monitor_delta'] = {**self.task['_monitor_delta'], 'identity': list(monitor_identity(task)),
++            'files': ['new.mp4', 'photo.jpg', 'text.txt', 'sub/child.mp4']}
++        self.assertEqual(selected_delta_files(task, None, lambda size: 'small'), ([self.path], 3))
++        self.assertEqual(selected_delta_files(task, None, lambda size: 'too_large'), ([], 0))
++
++    def test_full_numbered_and_implicit_partial_without_catalog_fall_back(self):
++        for task in ({**self.task, 'caption': '{index}/{total}'},
++                     {**self.task, '_monitor_delta': {**self.task['_monitor_delta'], 'full': True}},
++                     {**self.task, '_monitor_delta': {k: v for k, v in self.task['_monitor_delta'].items() if k != 'full'}}):
++            self.assertIsNone(selected_delta_files(task, None, lambda size: 'small'))
++
++    def test_malformed_identity_falls_back_and_restored_marker_is_per_scan(self):
++        for identity in (None, 12, 'not an identity'):
++            task = {**self.task, '_restored_monitor_delta': True,
++                '_monitor_delta': {**self.task['_monitor_delta'], 'identity': identity}}
++            self.assertIsNone(selected_delta_files(task, None, lambda size: 'small'))
++            self.assertNotIn('_restored_monitor_delta', task)
++            self.assertNotIn('_monitor_delta', task_for_dispatch(self.task, task))
++        self.select()
++        self.assertTrue(self.task['_restored_monitor_delta'])
++
++    def test_symlink_or_junction_resolving_outside_root_is_not_selected(self):
++        original = Path.resolve
++        def resolved(path, *args, **kwargs):
++            if path == self.path:
++                return self.root.parent / 'outside.mp4'
++            return original(path, *args, **kwargs)
++        with patch.object(Path, 'resolve', resolved):
++            self.assertEqual(self.select(), ([], 0))
