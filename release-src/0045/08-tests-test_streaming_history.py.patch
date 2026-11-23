@@ -1,0 +1,74 @@
+--- /dev/null
++++ b/app/tests/test_streaming_history.py
+@@ -0,0 +1,71 @@
++import asyncio
++import threading
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import test_prefetch_upload_boundary as fixture
++
++
++class StreamingHistoryTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    read = fixture.PrefetchUploadTests.read
++    file = fixture.PrefetchUploadTests.file
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    async def test_verified_file_sends_while_next_history_query_waits(self):
++        first = self.file('a.mp4', b'first')
++        second = self.file('b.mp4', b'second')
++        checking_second = threading.Event()
++        release = threading.Event()
++        first_started = asyncio.Event()
++        original = self.history.completed_paths
++
++        def check(paths, *args, **kwargs):
++            if second in paths:
++                checking_second.set()
++                if not release.wait(5):
++                    raise AssertionError('First upload did not start during the later check')
++            return original(paths, *args, **kwargs)
++
++        async def sender(path):
++            if path == first:
++                first_started.set()
++
++        self.rule['monitor_folder'] = True
++        with patch('batch_uploader.HISTORY_CHECK_BATCH_SIZE', 1), \
++                patch.object(self.history, 'completed_paths', check):
++            task = asyncio.create_task(self.run_task(sender))
++            try:
++                self.assertTrue(await asyncio.to_thread(checking_second.wait, 2))
++                await asyncio.wait_for(first_started.wait(), 3)
++                self.assertTrue(self.pane.task_states['r1']['checking_history'])
++            finally:
++                release.set()
++                await asyncio.wait_for(task, 5)
++        self.assertEqual([Path(path) for path, _ in self.sent], [first, second])
++
++    async def test_later_check_error_preserves_the_verified_send_and_fails_the_rule(self):
++        first = self.file('a.mp4', b'first')
++        second = self.file('b.mp4', b'second')
++        uploaded = threading.Event()
++        original = self.history.completed_paths
++
++        def check(paths, *args, **kwargs):
++            if second in paths:
++                if uploaded.wait(3):
++                    raise OSError('network read failed after first upload')
++                raise AssertionError('First upload did not start')
++            return original(paths, *args, **kwargs)
++
++        async def sender(path):
++            self.assertEqual(path, first)
++            uploaded.set()
++
++        self.rule['monitor_folder'] = True
++        with patch('batch_uploader.HISTORY_CHECK_BATCH_SIZE', 1), \
++                patch.object(self.history, 'completed_paths', check):
++            with self.assertRaisesRegex(OSError, 'network read failed'):
++                await asyncio.wait_for(self.run_task(sender), 5)
++        self.assertEqual([Path(path) for path, _ in self.sent], [first])

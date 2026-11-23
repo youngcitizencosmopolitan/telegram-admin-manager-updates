@@ -1,0 +1,21 @@
+--- a/app/tam_ui/monitor_presentation.py
++++ b/app/tam_ui/monitor_presentation.py
+@@ -14,9 +14,15 @@
+     deferred = int(task_state.get('deferred', 0) or 0)
+     progress = f'{min(100, done/total*100):.0f}%' if total and not blocked and not deferred else '—'
+     if running and task_state.get('checking_history'):
+-        status = 'Проверка кеша'
+-        detail = 'Сверяется история отправок. «Осталось» появится после исключения уже загруженных файлов и файлов сверх лимита.'
+-        progress = '—'
++        status = 'Загрузка · проверка' if active else 'Проверка кеша'
++        checked = int(task_state.get('history_checked', 0) or 0)
++        files = int(task_state.get('total_files', 0) or 0)
++        if files:
++            status += f': {checked}/{files}'
++        detail = ('Готовые файлы могут отправляться во время сверки. '
++                  '«Осталось» появится после завершения проверки.')
++        if not active:
++            progress = '—'
+     elif blocked:
+         status = 'Загружается · нужен повтор' if active else 'Нужен повтор'
+         detail = f'Для {blocked} отправок результат прошлого запуска не подтвержден. Повтор может создать дубль, если Telegram уже принял файл.'

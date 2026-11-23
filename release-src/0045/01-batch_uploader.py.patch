@@ -1,0 +1,765 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -250,10 +250,14 @@
+         self.queues: dict[str, tuple[asyncio.Queue[Any], Any]] = {}
+         self.regular_lane_callbacks: dict[str, Any] = {}
+ 
+-    def register(self, task_id: str, queue: asyncio.Queue[Any], eligible: Any, release_regular: Any = None) -> None:
++    def register(self, task_id: str, queue: asyncio.Queue[Any], eligible: Any, release_regular: Any = None, *, preparing: bool = False) -> None:
+         if release_regular is not None:
+             self.regular_lane_callbacks[task_id] = release_regular
+         self.queues[task_id] = (queue, eligible)
++        if not preparing:
++            self.mark_prepared(task_id)
++
++    def mark_prepared(self, task_id: str) -> None:
+         self.preparing.discard(task_id)
+ 
+     def finish(self, task_id: str) -> None:
+@@ -279,44 +283,41 @@
+ async def _next_upload_job(
+     *, task_id: str, session: str, small_queue: asyncio.Queue[Any], big_queue: asyncio.Queue[Any],
+     premium_by_session: dict[str, bool], start_after: asyncio.Event | None,
+-    priority: _PremiumWorkPriority | None, stop_event: Any, disabled: Any, signal_drained: Any,
++    priority: _PremiumWorkPriority | None, stop_event: Any, disabled: Any, signal_drained: Any, candidates_remaining=None, premium_ready=None,
+ ) -> Any:
+     """Keep ordinary rule ordering while letting Premium claim later big files."""
+     while not stop_event.is_set() and not disabled():
+         if priority is not None:
+             priority.release_regular_lanes()
+         premium = bool(premium_by_session.get(session, False))
+-        if premium and priority is not None:
+-            # Do not let a fast first rule consume Premium on small files before
+-            # slower folder/target preparation has exposed its large-file queue.
+-            if not priority.ready:
++        gate_open = start_after is None or start_after.is_set()
++        if premium and (priority is not None or gate_open):
++            try:
++                item = big_queue.get_nowait()
++            except asyncio.QueueEmpty:
++                pass
++            else:
++                signal_drained()
++                return item
++            # Only small files have to wait for the full Premium work check.
++            if ((premium_ready is not None and not premium_ready.is_set())
++                    or (priority is not None and (not priority.ready or priority.has_work(session)))):
+                 await asyncio.sleep(0.25)
+                 continue
+-            try:
+-                return big_queue.get_nowait()
+-            except asyncio.QueueEmpty:
+-                pass
+-            if priority.has_work(session):
+-                await asyncio.sleep(0.25)
+-                continue
+-
+-        if start_after is not None and not start_after.is_set():
++
++        if not gate_open:
+             await asyncio.sleep(0.25)
+             continue
+         signal_drained()
+-        if premium:
+-            try:
+-                item = big_queue.get_nowait()
+-                signal_drained()
+-                return item
+-            except asyncio.QueueEmpty:
+-                pass
+         try:
+             item = small_queue.get_nowait()
+             signal_drained()
+             return item
+         except asyncio.QueueEmpty:
+             signal_drained()
++            if candidates_remaining is not None and candidates_remaining():
++                await asyncio.sleep(0.1)
++                continue
+             return None
+     return None
+ 
+@@ -4371,8 +4372,9 @@
+                         if success and tid in sigs:
+                             getattr(self, 'monitor_blocked_signatures', {}).pop(tid, None)
+                             self._ack_monitor_work(task)
+-                            self.monitor_last_signatures[tid] = sigs[tid]
+-                            self._persist_monitor_signature(tid, sigs[tid], processed_before=batch_started_at, route_revision=task.get("route_revision", 1))
++                            if not state.get('restored_monitor_delta'):
++                                self.monitor_last_signatures[tid] = sigs[tid]
++                                self._persist_monitor_signature(tid, sigs[tid], processed_before=batch_started_at, route_revision=task.get("route_revision", 1))
+                             target = str(task.get("target", "")).strip()
+                             if target:
+                                 self.monitor_prepared_targets.add(target)
+@@ -5486,6 +5488,7 @@
+             # No history query is necessary for an empty candidate snapshot.
+             self.task_states[tid] = {
+                 '_monitor_identity': monitor_identity(task),
++                'restored_monitor_delta': bool(task.get('_restored_monitor_delta')),
+                 'name': name, 'target': str(task.get('target', '')),
+                 'total_files': 0, 'processed_files': 0,
+                 'total_bytes': 0, 'processed_bytes': 0,
+@@ -5569,6 +5572,8 @@
+             "total_bytes": total_bytes,
+             "total_files": total_files,
+             "checking_history": bool(files),
++            "history_checked": 0,
++            'restored_monitor_delta': bool(task.get('_restored_monitor_delta')),
+             "processed_bytes": 0,
+             "processed_files": 0,
+             "success": 0,
+@@ -5594,144 +5599,17 @@
+             "До 2 ГБ — любой; 2–4 ГБ — только Premium; >4 ГБ — пропуск."
+         )
+ 
+-        batch_check = getattr(self.app.upload_history, 'completed_paths', None)
+-        source_check = (getattr(self.app.upload_history, 'completed_sources', None)
+-                        if self._match_sent_source(task) else None)
+-        pending: list[tuple[int, Path]] = []
+-        last_history_update = 0.0
+-        for offset in range(0, total_files, HISTORY_CHECK_BATCH_SIZE):
+-            if self.stop_event.is_set():
+-                break
+-            chunk = files[offset:offset + HISTORY_CHECK_BATCH_SIZE]
+-            completed_paths = None
+-            completed_sources = set()
+-            if callable(source_check):
+-                async with scan_sem:
+-                    if self.stop_event.is_set():
+-                        break
+-                    completed_sources = await asyncio.to_thread(
+-                        source_check, chunk, str(target_key), stopped=self.stop_event.is_set)
+-            unresolved = [path for path in chunk if path not in completed_sources]
+-            if callable(batch_check) and unresolved:
+-                if offset == 0:
+-                    self._queue_task_row(tid, status=f'Проверка кеша: 0/{total_files}')
+-                # Bound concurrent disk/SQLite scans across rules as well as the
+-                # lifetime of each result map. No completed map for the full tree.
+-                async with scan_sem:
+-                    if self.stop_event.is_set():
+-                        break
+-                    completed_paths = await asyncio.to_thread(
+-                        batch_check, unresolved, history_key_for_path,
+-                        lambda p, fp: _dedup_fingerprint_for_upload(task, p, fp),
+-                        forum_target_key=str(target_key) if forum_mode else None,
+-                        stopped=self.stop_event.is_set,
+-                    )
+-            if self.stop_event.is_set():
+-                break
+-            for index, path in enumerate(chunk, start=offset + 1):
+-                if index % 64 == 0:
+-                    await asyncio.sleep(0)
+-                if self.stop_event.is_set():
+-                    break
+-                if path in completed_sources:
+-                    size = scan_sizes.get(path)
+-                    if size is None:
+-                        # Compatibility for custom scanners without size capture;
+-                        # the production catalog/scandir paths always capture it.
+-                        try:
+-                            size = path.stat().st_size
+-                        except OSError:
+-                            size = 0
+-                    if self._remember_unconfirmed(task, path, False):
+-                        self._queue_activity_update(f'{tid}:{path}', name, path, '—', size,
+-                                                    100.0, 0.0, 'Дубликат • отправка подтверждена')
+-                    state['processed_bytes'] += size
+-                    state['processed_files'] += 1
+-                    state['skipped'] += 1
+-                    continue
+-                try:
+-                    current_stat = path.stat()
+-                    size = current_stat.st_size
+-                except OSError:
+-                    state["processed_files"] += 1
+-                    state["failed"] += 1
+-                    continue
+-                topic_title = self._topic_title_for_path(task, path) if forum_mode else None
+-                if forum_mode and topic_title is not None and topic_id_for_path(path) is None:
+-                    state["processed_bytes"] += size
+-                    state["processed_files"] += 1
+-                    state["failed"] += 1
+-                    key = f"{tid}:{path}"
+-                    self.app.log(f"{name} → {path.name}: ❌ нет темы «{topic_title}» и создать её не удалось")
+-                    self.app.record_upload_error(task=name, target=task_target, path=str(path), account="—", attempts=1, error=f"Нет темы: {topic_title}")
+-                    self._queue_activity_update(key, name, path, '—', size, 0.0, 0.0, f'❌ Нет темы: {topic_title}')
+-                elif (completed_paths.get(path) == stat_identity(current_stat) if completed_paths is not None else (
+-                    self.app.upload_history.exact_completed(path, history_key_for_path(path))
+-                    or (
+-                        forum_mode
+-                        and hasattr(self.app.upload_history, "exact_completed_forum")
+-                        and self.app.upload_history.exact_completed_forum(path, str(target_key))
+-                    )
+-                )):
+-                    if self._remember_unconfirmed(task, path, False):
+-                        self._queue_activity_update(f'{tid}:{path}', name, path, '—', size, 100.0, 0.0, 'Дубликат • отправка подтверждена')
+-                    state["processed_bytes"] += size
+-                    state["processed_files"] += 1
+-                    state["skipped"] += 1
+-                elif _telegram_upload_lane(size) == "too_large":
+-                    state["processed_bytes"] += size
+-                    state["processed_files"] += 1
+-                    state["skipped"] += 1
+-                    state["limit_skipped"] += 1
+-                    key = f"{tid}:{path}"
+-                    self.app.log(
+-                        f"{name} → {path.name}: ⏭ превышает multipart-лимит Telegram Premium "
+-                        f"({size / 1024**3:.2f} ГБ), пропускаю"
+-                    )
+-                    self._queue_activity_update(key, name, path, '—', size, 0.0, 0.0, '⏭ лимит Telegram')
+-                else:
+-                    # Preserve original ordinals and Premium hot-add behavior.
+-                    pending.append((index, path))
+-            completed_paths = None
+-            checked = min(offset + len(chunk), total_files)
+-            now = time.monotonic()
+-            if not self.stop_event.is_set() and (checked == total_files or now - last_history_update >= 0.5):
+-                last_history_update = now
+-                self._queue_task_row(tid, status=f'Проверка кеша: {checked}/{total_files}')
+-            await asyncio.sleep(0)
+-        state['checking_history'] = self.stop_event.is_set()
+-        scan_sizes.clear()
+-        self._emit_task_metrics(tid, force=True)
+-
+-        if self.stop_event.is_set():
+-            self._queue_task_row(tid, status='Остановлено', speed='—', eta='—')
+-            return
+-
+-        if not pending:
+-            status = "✅ Нечего загружать" if state["limit_skipped"] else "✅ Уже загружено"
+-            self._queue_task_row(tid, status=status, progress='100%', speed='—', eta='0с')
+-            return
+-
+-        if preparation is not None:
+-            try:
+-                # Observe metadata for the whole pending set once. The quiet
+-                # window then elapses together, including files beyond lookahead.
+-                async with scan_sem:
+-                    await preparation.observe_files([path for _, path in pending])
+-            except PreparationStopped:
+-                return
+-
+         small_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         big_queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+         file_part_deferred: list[tuple[int, Path]] = []
+         dedup_deferred: list[tuple[int, Path]] = []
+         file_part_requeue_cycles: dict[str, int] = {}
+-        for item in pending:
+-            _idx, path = item
+-            if _telegram_upload_lane(path.stat().st_size) == "premium":
+-                big_queue.put_nowait(item)
+-            else:
+-                small_queue.put_nowait(item)
++        scan_done = asyncio.Event()
++        scan_started_work = asyncio.Event()
++        premium_ready = asyncio.Event()
++        scan_stop = threading.Event()
++        checked_count = 0
++        queued_count = 0
+ 
+         dispatch_stages = {}
+ 
+@@ -5753,13 +5631,13 @@
+         task_parallel = 100 if parallel_auto else max(1, min(100, int(task.get("parallel", 2) or 2)))
+         effective_parallel = task_parallel if parallel_auto else min(task_parallel, len(sessions))
+         task_sem = LiveSemaphore(lambda: self._task_parallel_limit(task))
+-        policy = self.app.safety_policy()
+-        self.app.log(
+-            f"{name}: параллельность задания — {'Авто' if parallel_auto else task_parallel}; "
+-            f"до {effective_parallel} аккаунтов, плюс глобальный"
+-            + (f" и Safety max {policy['max_active_accounts']}" if policy["enabled"] else "")
+-            + "."
+-        )
++        def log_parallel_policy(policy):
++            self.app.log(
++                f"{name}: параллельность задания — {'Авто' if parallel_auto else task_parallel}; "
++                f"до {effective_parallel} аккаунтов, плюс глобальный"
++                + (f" и Safety max {policy['max_active_accounts']}" if policy["enabled"] else "")
++                + "."
++            )
+ 
+         def health(session: str) -> dict[str, Any]:
+             return self.account_health.setdefault(
+@@ -5774,7 +5652,7 @@
+                 return small_queue
+ 
+         def signal_drained_if_ready() -> None:
+-            if start_after is None or start_after.is_set():
++            if scan_done.is_set() and (start_after is None or start_after.is_set()):
+                 _signal_pipeline_next_task_if_regular_lane_drained(drained_event, small_queue)
+ 
+         if premium_priority is not None:
+@@ -5789,7 +5667,7 @@
+                     and not (callable(restricted) and restricted(session))
+                     and self._runtime_task_account_allowed(task, session)
+                 )
+-            premium_priority.register(tid, big_queue, premium_eligible, signal_drained_if_ready)
++            premium_priority.register(tid, big_queue, premium_eligible, signal_drained_if_ready, preparing=True)
+ 
+         async def activate_hot_session(session: str) -> bool:
+             if session in resolved:
+@@ -5838,6 +5716,7 @@
+                 priority=premium_priority, stop_event=self.stop_event,
+                 disabled=lambda: bool(health(session).get("disabled")),
+                 signal_drained=signal_drained_if_ready,
++                candidates_remaining=lambda: not scan_done.is_set(), premium_ready=premium_ready,
+             )
+ 
+         def preparation_key(path):
+@@ -5855,10 +5734,6 @@
+ 
+         lookahead = {'premium': deque(), 'small': deque()}
+         offered, consumed = {}, set()
+-        if preparation is not None:
+-            for _, path in pending:
+-                lookahead['premium' if _telegram_upload_lane(path.stat().st_size) == 'premium' else 'small'].append(path)
+-
+         def fill_preparation():
+             if preparation is None:
+                 return
+@@ -5873,7 +5748,188 @@
+                     paths.popleft()
+                     offered[path] = lane
+ 
+-        fill_preparation()
++
++        def scan_stopped():
++            return scan_stop.is_set() or self.stop_event.is_set()
++
++        history = self.app.upload_history
++        batch_check = getattr(history, 'completed_paths', None)
++        source_check = getattr(history, 'completed_sources', None) if self._match_sent_source(task) else None
++
++        def check_candidates(entries):
++            # Network metadata and forum path resolution must stay off the upload loop.
++            titles = {}
++
++            def title_for(path):
++                if path not in titles:
++                    titles[path] = self._topic_title_for_path(task, path) if forum_mode else None
++                return titles[path]
++
++            def candidate_target(path):
++                return _forum_history_key(str(target_key), title_for(path)) if forum_mode else str(target_key)
++
++            completed = None
++            if callable(batch_check):
++                completed = batch_check(
++                    [path for _, path in entries], candidate_target,
++                    lambda path, fp: _dedup_fingerprint_for_upload(task, path, fp),
++                    forum_target_key=str(target_key) if forum_mode else None,
++                    stopped=scan_stopped,
++                )
++            results = []
++            for index, path in entries:
++                if scan_stopped():
++                    break
++                try:
++                    current = path.stat()
++                except OSError:
++                    results.append((index, path, None, None, False))
++                    continue
++                title = title_for(path)
++                duplicate = (completed.get(path) == stat_identity(current) if completed is not None else (
++                    history.exact_completed(path, candidate_target(path))
++                    or (forum_mode and hasattr(history, 'exact_completed_forum')
++                        and history.exact_completed_forum(path, str(target_key)))
++                ))
++                results.append((index, path, current.st_size, title, duplicate))
++            return results
++
++        def credit_history(path, size):
++            if self._remember_unconfirmed(task, path, False):
++                self._queue_activity_update(f'{tid}:{path}', name, path, '—', size,
++                                            100.0, 0.0, 'Дубликат • отправка подтверждена')
++            state['processed_bytes'] += size
++            state['processed_files'] += 1
++            state['skipped'] += 1
++
++        async def produce_candidates():
++            nonlocal checked_count, queued_count
++            last_update = 0.0
++
++            def report_progress(increment):
++                nonlocal last_update, checked_count
++                checked_count += increment
++                state['history_checked'] = checked_count
++                now = time.monotonic()
++                if checked_count == total_files or now - last_update >= 0.5:
++                    last_update = now
++                    phase = 'Загрузка · проверка' if state['active'] else 'Проверка кеша'
++                    self._queue_task_row(tid, status=f'{phase}: {checked_count}/{total_files}')
++
++            def release_premium():
++                premium_ready.set()
++                if premium_priority is not None:
++                    premium_priority.mark_prepared(tid)
++
++            try:
++                # Inspect potential Premium files before handing small files to
++                # Premium accounts. Keep each file's original caption ordinal.
++                large, ordinary = [], []
++                for index, path in enumerate(files, 1):
++                    size = scan_sizes.get(path)
++                    lane = _telegram_upload_lane(size) if size is not None else None
++                    (large if lane in (None, 'premium') else ordinary).append((index, path))
++
++                self._queue_task_row(tid, status=f'Проверка кеша: 0/{total_files}')
++                metadata_batch = (min(32, HISTORY_CHECK_BATCH_SIZE) if task.get('monitor_folder')
++                                  else HISTORY_CHECK_BATCH_SIZE)
++                for candidates in (large, ordinary):
++                    for offset in range(0, len(candidates), HISTORY_CHECK_BATCH_SIZE):
++                        if scan_stopped():
++                            return
++                        chunk = candidates[offset:offset + HISTORY_CHECK_BATCH_SIZE]
++                        sources = set()
++                        if callable(source_check):
++                            async with scan_sem:
++                                if scan_stopped():
++                                    return
++                                sources = await asyncio.to_thread(
++                                    source_check, [path for _, path in chunk], str(target_key), stopped=scan_stopped)
++                        if scan_stopped():
++                            return
++                        unresolved = []
++                        for index, path in chunk:
++                            if path in sources:
++                                size = scan_sizes.get(path)
++                                if size is None:
++                                    try:
++                                        size = (await asyncio.to_thread(path.stat)).st_size
++                                    except OSError:
++                                        size = 0
++                                if scan_stopped():
++                                    return
++                                credit_history(path, size)
++                            else:
++                                unresolved.append((index, path))
++                        if sources:
++                            report_progress(len(chunk) - len(unresolved))
++                        for start in range(0, len(unresolved), metadata_batch):
++                            if scan_stopped():
++                                return
++                            async with scan_sem:
++                                if scan_stopped():
++                                    return
++                                checked = await asyncio.to_thread(
++                                    check_candidates, unresolved[start:start + metadata_batch])
++                            if scan_stopped():
++                                return
++                            ready = []
++                            for index, path, size, title, duplicate in checked:
++                                if size is None:
++                                    state['processed_files'] += 1
++                                    state['failed'] += 1
++                                elif title is not None and self._forum_topic_title_key(title) not in topic_map:
++                                    state['processed_bytes'] += size
++                                    state['processed_files'] += 1
++                                    state['failed'] += 1
++                                    self.app.log(f'{name} → {path.name}: ❌ нет темы «{title}» и создать её не удалось')
++                                    self.app.record_upload_error(task=name, target=task_target, path=str(path),
++                                                                 account='—', attempts=1, error=f'Нет темы: {title}')
++                                    self._queue_activity_update(f'{tid}:{path}', name, path, '—', size, 0.0, 0.0,
++                                                                f'❌ Нет темы: {title}')
++                                elif duplicate:
++                                    credit_history(path, size)
++                                else:
++                                    lane = _telegram_upload_lane(size)
++                                    if lane == 'too_large':
++                                        state['processed_bytes'] += size
++                                        state['processed_files'] += 1
++                                        state['skipped'] += 1
++                                        state['limit_skipped'] += 1
++                                        self.app.log(f'{name} → {path.name}: ⏭ превышает multipart-лимит Telegram Premium '
++                                                     f'({size / 1024**3:.2f} ГБ), пропускаю')
++                                        self._queue_activity_update(f'{tid}:{path}', name, path, '—', size,
++                                                                    0.0, 0.0, '⏭ лимит Telegram')
++                                    else:
++                                        ready.append((index, path, lane))
++                            if ready and preparation is not None:
++                                async with scan_sem:
++                                    await preparation.observe_files([path for _, path, _ in ready])
++                            if scan_stopped():
++                                return
++                            for index, path, lane in ready:
++                                (big_queue if lane == 'premium' else small_queue).put_nowait((index, path))
++                                if preparation is not None:
++                                    lookahead[lane].append(path)
++                            if ready:
++                                queued_count += len(ready)
++                                mark_dispatch()
++                                fill_preparation()
++                                scan_started_work.set()
++                            report_progress(len(checked))
++                            await asyncio.sleep(0)
++                    if candidates is large:
++                        release_premium()
++            except PreparationStopped:
++                if not scan_stopped():
++                    raise
++            finally:
++                state['checking_history'] = checked_count < total_files
++                scan_sizes.clear()
++                scan_done.set()
++                release_premium()
++                signal_drained_if_ready()
++                scan_started_work.set()
+ 
+         def defer_empty_file(path, account_name, size):
+             # Count this pass as handled, never as an upload or a duplicate.
+@@ -5934,7 +5990,7 @@
+                 if health(session).get("disabled"):
+                     return
+                 if not self._runtime_task_account_allowed(task, session):
+-                    if small_queue.empty() and big_queue.empty():
++                    if scan_done.is_set() and small_queue.empty() and big_queue.empty():
+                         return
+                     await asyncio.sleep(0.25)
+                     continue
+@@ -5951,7 +6007,7 @@
+                         queue_for_path(path).put_nowait(item)
+                         return
+                     try:
+-                        size = path.stat().st_size
++                        size = (await asyncio.to_thread(path.stat)).st_size
+                     except OSError:
+                         state["processed_files"] += 1
+                         state["failed"] += 1
+@@ -6061,7 +6117,7 @@
+                             self._emit_task_metrics(tid, force=True)
+                             continue
+ 
+-                        history_key = history_key_for_path(path)
++                        history_key = await asyncio.to_thread(history_key_for_path, path)
+                         dedup_fingerprint = _dedup_fingerprint_for_upload(task, path, fingerprint)
+                         (claim_status, reservation_claim_token), claim_cancelled = await _settled_thread_result(
+                             self._claim_upload_fingerprint,
+@@ -6228,7 +6284,7 @@
+                                         elif media_kind == "photo":
+                                             send_kwargs["force_document"] = str(settings.get("photo_mode", "photo")) == "file"
+                                         if forum_mode:
+-                                            topic_id = topic_id_for_path(path)
++                                            topic_id = await asyncio.to_thread(topic_id_for_path, path)
+                                             if topic_id:
+                                                 send_kwargs["reply_to"] = int(topic_id)
+                                     delay = max(0.0, float(settings.get('delay', 0) or 0))
+@@ -6588,13 +6644,6 @@
+                 # The next byte upload can begin immediately. Publication of
+                 # its handle observes the shared per-account interval above.
+ 
+-        if start_after is not None and not start_after.is_set():
+-            self._queue_task_row(tid, status='Ожидает свободные аккаунты…', speed='—', eta='—')
+-
+-        # Ordinary jobs still release the next rule in order. Premium jobs can
+-        # bypass that gate only to take an eligible large file from this wave.
+-        signal_drained_if_ready()
+-
+         first_hard_failure: BaseException | None = None
+         worker_start_failed = False
+         # Rule-local: other rules still judge a shared account by their own attempts.
+@@ -6618,90 +6667,124 @@
+             except Exception:
+                 pass
+ 
+-        max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, 101 + FILE_PART_REQUEUE_LIMIT)
+-        for _wave in range(max_waves):
+-            if self.stop_event.is_set() or (small_queue.empty() and big_queue.empty()):
+-                break
+-
+-            worker_tasks: dict[str, asyncio.Task[Any]] = {}
+-            started_sessions: set[str] = set()
+-
+-            async def start_available_workers() -> None:
+-                account_map = {s: pair[0] for s, pair in clients.items()}
+-                latest = self._latest_task_settings(task)
+-                requested = set(self._effective_task_sessions(latest, account_map)) if latest else set()
+-                for session in list(clients):
+-                    if (session in started_sessions or session in failed_worker_sessions
+-                            or session not in requested or health(session).get("disabled")):
+-                        continue
+-                    if session not in resolved:
+-                        # A hot-added Premium must reserve its large-file priority
+-                        # while this rule is still resolving/promoting the account.
+-                        activation_failed.discard(session)
+-                        if not await activate_hot_session(session):
+-                            activation_failed.add(session)
++        producer = asyncio.create_task(produce_candidates())
++        try:
++            await scan_started_work.wait()
++            if not queued_count:
++                await asyncio.shield(producer)
++                self._emit_task_metrics(tid, force=True)
++                if self.stop_event.is_set():
++                    self._queue_task_row(tid, status='Остановлено', speed='—', eta='—')
++                elif state['failed']:
++                    self._queue_task_row(tid, status=f"Готово, ошибок {state['failed']}", progress='100%')
++                else:
++                    status = "✅ Нечего загружать" if state['limit_skipped'] else "✅ Уже загружено"
++                    self._queue_task_row(tid, status=status, progress='100%', speed='—', eta='0с')
++                return
++
++            policy = self.app.safety_policy()
++            log_parallel_policy(policy)
++            if start_after is not None and not start_after.is_set():
++                self._queue_task_row(tid, status='Ожидает свободные аккаунты…', speed='—', eta='—')
++            signal_drained_if_ready()
++
++            max_waves = max(2 + FILE_PART_REQUEUE_LIMIT, 101 + FILE_PART_REQUEUE_LIMIT)
++            for _wave in range(max_waves):
++                if self.stop_event.is_set() or (scan_done.is_set() and small_queue.empty() and big_queue.empty()):
++                    break
++
++                worker_tasks: dict[str, asyncio.Task[Any]] = {}
++                started_sessions: set[str] = set()
++
++                async def start_available_workers() -> None:
++                    account_map = {s: pair[0] for s, pair in clients.items()}
++                    latest = self._latest_task_settings(task)
++                    requested = set(self._effective_task_sessions(latest, account_map)) if latest else set()
++                    for session in list(clients):
++                        if (session in started_sessions or session in failed_worker_sessions
++                                or session not in requested or health(session).get("disabled")):
+                             continue
+-                    started_sessions.add(session)
+-                    worker_tasks[session] = asyncio.create_task(worker(session))
+-
+-            async def start_workers_isolated() -> None:
+-                nonlocal worker_start_failed
+-                if worker_start_failed:
+-                    return
++                        if session not in resolved:
++                            # A hot-added Premium must reserve its large-file priority
++                            # while this rule is still resolving/promoting the account.
++                            activation_failed.discard(session)
++                            if not await activate_hot_session(session):
++                                activation_failed.add(session)
++                                continue
++                        started_sessions.add(session)
++                        worker_tasks[session] = asyncio.create_task(worker(session))
++
++                async def start_workers_isolated() -> None:
++                    nonlocal worker_start_failed
++                    if worker_start_failed:
++                        return
++                    try:
++                        await start_available_workers()
++                    except Exception as exc:
++                        worker_start_failed = True
++                        note_worker_failure(None, exc)
++
+                 try:
+-                    await start_available_workers()
+-                except Exception as exc:
+-                    worker_start_failed = True
+-                    note_worker_failure(None, exc)
+-
+-            try:
+-                await start_workers_isolated()
+-                if not worker_tasks:
++                    await start_workers_isolated()
++                    if not worker_tasks:
++                        break
++                    while worker_tasks:
++                        done, _pending_workers = await asyncio.wait(
++                            list(worker_tasks.values()), timeout=0.25, return_when=asyncio.FIRST_COMPLETED
++                        )
++                        for finished in done:
++                            finished_session = None
++                            for session, task_obj in list(worker_tasks.items()):
++                                if task_obj is finished:
++                                    worker_tasks.pop(session, None)
++                                    finished_session = session
++                                    break
++                            # Connection/permit failures outside the per-file send catch
++                            # must fail this rule without cancelling its healthy workers.
++                            failure = (asyncio.CancelledError("upload worker was cancelled")
++                                       if finished.cancelled() else finished.exception())
++                            if failure is not None:
++                                note_worker_failure(finished_session, failure)
++                        if not self.stop_event.is_set():
++                            if live_pool_changed is not None and live_pool_changed.is_set():
++                                live_pool_changed.clear()
++                            await start_workers_isolated()
++                finally:
++                    # A persistent loop will not clean up children for us. On normal
++                    # Stop the loop above drains current files; cancellation/errors
++                    # settle every remaining worker before clients can be released.
++                    remaining_workers = list(worker_tasks.values())
++                    for pending in remaining_workers:
++                        if not pending.done():
++                            pending.cancel()
++                    if remaining_workers:
++                        await asyncio.gather(*remaining_workers, return_exceptions=True)
++
++                if file_part_deferred and not self.stop_event.is_set():
++                    deferred_now = list(file_part_deferred)
++                    file_part_deferred.clear()
++                    for deferred_item in deferred_now:
++                        _idx, deferred_path = deferred_item
++                        queue_for_path(deferred_path).put_nowait(deferred_item)
++                if dedup_deferred and not self.stop_event.is_set():
++                    deferred_duplicates = list(dedup_deferred)
++                    dedup_deferred.clear()
++                    for deferred_item in deferred_duplicates:
++                        _idx, deferred_path = deferred_item
++                        queue_for_path(deferred_path).put_nowait(deferred_item)
++
++            await asyncio.shield(producer)
++        finally:
++            scan_stop.set()
++            while not producer.done():
++                try:
++                    await asyncio.shield(producer)
++                except asyncio.CancelledError:
++                    continue
++                except Exception:
+                     break
+-                while worker_tasks:
+-                    done, _pending_workers = await asyncio.wait(
+-                        list(worker_tasks.values()), timeout=0.25, return_when=asyncio.FIRST_COMPLETED
+-                    )
+-                    for finished in done:
+-                        finished_session = None
+-                        for session, task_obj in list(worker_tasks.items()):
+-                            if task_obj is finished:
+-                                worker_tasks.pop(session, None)
+-                                finished_session = session
+-                                break
+-                        # Connection/permit failures outside the per-file send catch
+-                        # must fail this rule without cancelling its healthy workers.
+-                        failure = (asyncio.CancelledError("upload worker was cancelled")
+-                                   if finished.cancelled() else finished.exception())
+-                        if failure is not None:
+-                            note_worker_failure(finished_session, failure)
+-                    if not self.stop_event.is_set():
+-                        if live_pool_changed is not None and live_pool_changed.is_set():
+-                            live_pool_changed.clear()
+-                        await start_workers_isolated()
+-            finally:
+-                # A persistent loop will not clean up children for us. On normal
+-                # Stop the loop above drains current files; cancellation/errors
+-                # settle every remaining worker before clients can be released.
+-                remaining_workers = list(worker_tasks.values())
+-                for pending in remaining_workers:
+-                    if not pending.done():
+-                        pending.cancel()
+-                if remaining_workers:
+-                    await asyncio.gather(*remaining_workers, return_exceptions=True)
+-
+-            if file_part_deferred and not self.stop_event.is_set():
+-                deferred_now = list(file_part_deferred)
+-                file_part_deferred.clear()
+-                for deferred_item in deferred_now:
+-                    _idx, deferred_path = deferred_item
+-                    queue_for_path(deferred_path).put_nowait(deferred_item)
+-            if dedup_deferred and not self.stop_event.is_set():
+-                deferred_duplicates = list(dedup_deferred)
+-                dedup_deferred.clear()
+-                for deferred_item in deferred_duplicates:
+-                    _idx, deferred_path = deferred_item
+-                    queue_for_path(deferred_path).put_nowait(deferred_item)
++            if not producer.cancelled():
++                producer.exception()
+ 
+         if not self.stop_event.is_set():
+             leftovers: list[tuple[int, Path, str]] = []

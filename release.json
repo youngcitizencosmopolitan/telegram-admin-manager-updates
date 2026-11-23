@@ -1,12 +1,17 @@
 {
-  "version": "0044",
-  "base_version": "0043",
-  "manifest_version": "4.3.8.0044",
-  "display_version": "0044",
+  "version": "0045",
+  "base_version": "0044",
+  "manifest_version": "4.3.8.0045",
+  "display_version": "0045",
   "patch_files": [
-    "release-src/0044/01-batch_uploader.py.patch",
-    "release-src/0044/02-telegram_admin_manager.py.patch",
-    "release-src/0044/03-tests-test_catalog_settings_snapshot.py.patch"
+    "release-src/0045/01-batch_uploader.py.patch",
+    "release-src/0045/02-tam_core-monitor_delta.py.patch",
+    "release-src/0045/03-tam_ui-monitor_presentation.py.patch",
+    "release-src/0045/04-telegram_admin_manager.py.patch",
+    "release-src/0045/05-tests-test_monitor_delta_resume.py.patch",
+    "release-src/0045/06-tests-test_monitor_delta_upload.py.patch",
+    "release-src/0045/07-tests-test_premium_global_priority.py.patch",
+    "release-src/0045/08-tests-test_streaming_history.py.patch"
   ],
-  "notes": "0044: retain all 0043 catalog and monitoring-layout improvements while keeping the per-run file-numbering catalog outside deep-copied live settings. Large libraries no longer copy every catalog path at each account/permit/upload checkpoint. Numbered captions reuse the same run-local rank cache, preserving full-catalog indices for delta uploads and late caption changes. Upload history, source guard, readiness, routing and publication safeguards are unchanged."
+  "notes": "0045 resumes saved partial monitoring queues from their recorded relative paths after restart. File history and network metadata are checked in the background in bounded slices, so verified files can upload before the full rule is checked. Premium files retain priority and the monitoring table displays check progress. Full scans and captions that need whole-folder numbering can still require a catalog pass. Existing successful history and publication checks are preserved."
 }

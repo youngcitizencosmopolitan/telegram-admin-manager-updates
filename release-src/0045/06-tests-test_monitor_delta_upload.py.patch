@@ -1,0 +1,51 @@
+--- a/app/tests/test_monitor_delta_upload.py
++++ b/app/tests/test_monitor_delta_upload.py
+@@ -42,9 +42,10 @@
+         self.index.snapshot()
+         self.assertEqual(self.pane._scan_task_files(self.task), ([], 0))
+ 
+-    def test_restart_unknown_epoch_falls_back_to_complete_scan(self):
++    def test_restart_unknown_epoch_resumes_persisted_partial_selection(self):
+         self.pane._folder_indexes = None
+-        self.assertEqual(set(self.pane._scan_task_files(self.task)[0]), {self.old, self.new})
++        self.assertEqual(self.pane._scan_task_files(self.task), ([self.new], 3))
++        self.assertTrue(self.task['_restored_monitor_delta'])
+ 
+     def test_changed_route_and_numbered_caption_fall_back_to_complete_scan(self):
+         for update in ({'target': '@other'}, {'caption': '{index}/{total} {filename}'}):
+@@ -78,7 +79,7 @@
+         self.pane._ack_monitor_work(wrong)
+         self.assertTrue(self.index.has_work)
+ 
+-    def run_queue(self, failed=False, later=False, source='Мониторинг', blocked=False, deferred=False):
++    def run_queue(self, failed=False, later=False, source='Мониторинг', blocked=False, deferred=False, restored=False):
+         from tam_core.repositories import MonitorRuleStore
+         from tam_core.state_db import StateDatabase
+         db = StateDatabase(self.root / 'state.db')
+@@ -102,7 +103,12 @@
+ 
+         async def batch(tasks, *args, **kwargs):
+             captured.extend(tasks)
+-            pane.task_states = {'r1': {'failed': int(failed), 'blocked': int(blocked), 'deferred': int(deferred)}}
++            if restored:
++                # Restore on a new index generation and exercise the actual selector.
++                self.index.epoch = 'new-generation'
++                self.assertEqual(pane._scan_task_files(tasks[0]), ([self.new], 3))
++            pane.task_states = {'r1': {'failed': int(failed), 'blocked': int(blocked), 'deferred': int(deferred),
++                                       'restored_monitor_delta': bool(tasks[0].get('_restored_monitor_delta'))}}
+             if later:
+                 path = self.root / 'later.mp4'
+                 path.write_bytes(b'later')
+@@ -127,6 +133,12 @@
+         self.run_queue(later=True)
+         self.assertEqual(self.index.work_snapshot()['files'], ['later.mp4'])
+ 
++    def test_restored_partial_success_does_not_commit_a_full_catalog_signature(self):
++        self.run_queue(restored=True, later=True)
++        self.assertNotIn('r1', self.pane.monitor_last_signatures)
++        self.assertIsNone(self.pane.app.monitor_rules.get('r1').get('monitor_signature'))
++        self.assertEqual(set(self.index.work_snapshot()['files']), {'new.mp4', 'later.mp4'})
++
+     def test_manual_completion_releases_held_monitor_signature(self):
+         self.run_queue(source='Вручную')
+         self.assertEqual(self.pane.monitor_pending_signatures, {})
