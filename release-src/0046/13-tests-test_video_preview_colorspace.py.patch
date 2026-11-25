@@ -1,0 +1,11 @@
+--- a/app/tests/test_video_preview_colorspace.py
++++ b/app/tests/test_video_preview_colorspace.py
+@@ -101,7 +101,7 @@
+             return SimpleNamespace(returncode=1, stderr='moov atom not found')
+         with self.assertRaises(preview.PreviewError):
+             self.run_thumbnail(runner)
+-        self.assertEqual(len(self.calls), 3)
++        self.assertEqual(len(self.calls), 1)  # A missing container header cannot be repaired by another seek.
+         self.assertTrue(all('-bsf:v' not in cmd for cmd in self.calls))
+ 
+     def test_timeouts_stay_bounded_without_false_success(self):

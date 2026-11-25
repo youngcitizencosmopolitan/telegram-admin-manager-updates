@@ -1,0 +1,22 @@
+--- a/app/tam_ui/monitor_presentation.py
++++ b/app/tam_ui/monitor_presentation.py
+@@ -12,7 +12,8 @@
+     blocked = int(task_state.get('blocked', 0) or 0)
+     failed = int(task_state.get('failed', 0) or 0)
+     deferred = int(task_state.get('deferred', 0) or 0)
+-    progress = f'{min(100, done/total*100):.0f}%' if total and not blocked and not deferred else '—'
++    invalid = int(task_state.get('invalid_media', 0) or 0)
++    progress = f'{min(100, done/total*100):.0f}%' if total and not blocked and not deferred and not invalid else '—'
+     if running and task_state.get('checking_history'):
+         status = 'Загрузка · проверка' if active else 'Проверка кеша'
+         checked = int(task_state.get('history_checked', 0) or 0)
+@@ -36,6 +37,9 @@
+         status, detail = 'В очереди', 'Правило ожидает выполнения. Подробности пакета доступны в разделе «Очередь загрузок».'
+     elif not rule.get('monitor_folder', True):
+         status, detail = 'Мониторинг выключен', 'Автоматическая проверка папки выключена. Можно включить её или загрузить правило вручную.'
++    elif invalid:
++        status = f'Отложено • не читается видео: {invalid}'
++        detail = f'Не отправлено видео: {invalid}. Повторная проверка после изменения файла, настроек или ручного запуска.'
+     elif deferred:
+         status = f'Отложено пустых файлов: {deferred}'
+         detail = 'Файлы размером 0 Б не мешают остальным. Мониторинг вернётся к ним после появления данных.'

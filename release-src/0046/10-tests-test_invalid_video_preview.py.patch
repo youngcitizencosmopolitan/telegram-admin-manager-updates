@@ -1,0 +1,119 @@
+--- /dev/null
++++ b/app/tests/test_invalid_video_preview.py
+@@ -0,0 +1,116 @@
++import subprocess
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import video_preview as preview
++
++
++class InvalidPreviewTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.video = self.root / 'broken.mp4'
++        self.video.write_bytes(b'broken container')
++        self.cache = self.root / 'thumbs'
++
++    def make(self, runner, **kwargs):
++        with patch.object(preview, '_ffmpeg_executable', return_value='ffmpeg'), \
++             patch.object(preview, '_run_preview_command', side_effect=runner):
++            return preview.make_video_thumbnail(self.video, self.cache, **kwargs)
++
++    def invalid(self, *args):
++        return SimpleNamespace(returncode=1, stderr='moov atom not found\nError opening input: Invalid data found when processing input')
++
++    def test_definite_invalid_container_is_typed_and_unchanged_monitoring_is_not_reprocessed(self):
++        with self.assertRaises(preview.InvalidVideoError) as first:
++            self.make(self.invalid, failure_context=('monitor', 1))
++        self.assertFalse(first.exception.cached)
++        with self.assertRaises(preview.InvalidVideoError) as repeated:
++            self.make(lambda *a: self.fail('Repeated FFmpeg for unchanged corrupt video'), failure_context=('monitor', 1))
++        self.assertTrue(repeated.exception.cached)
++        self.assertEqual(str(repeated.exception), str(first.exception))
++
++    def test_manual_retry_setting_change_and_file_change_recheck(self):
++        calls = []
++        def invalid(*args):
++            calls.append(1)
++            return self.invalid()
++        for context in (('monitor', 1), None, ('monitor', 2)):
++            with self.assertRaises(preview.InvalidVideoError):
++                self.make(invalid, failure_context=context)
++        self.video.write_bytes(b'replaced invalid container')
++        with self.assertRaises(preview.InvalidVideoError):
++            self.make(invalid, failure_context=('monitor', 2))
++        self.assertEqual(len(calls), 4)
++
++    def test_timeout_missing_ffmpeg_and_filter_errors_are_not_negative_cached(self):
++        for error in ('Invalid color space', 'Permission denied', 'Invalid data found when processing input'):
++            calls = []
++            def failed(*args):
++                calls.append(1)
++                return SimpleNamespace(returncode=1, stderr=error)
++            for _ in range(2):
++                with self.assertRaises(preview.PreviewError) as caught:
++                    self.make(failed, failure_context=('monitor', error))
++                self.assertNotIsInstance(caught.exception, preview.InvalidVideoError)
++            self.assertEqual(len(calls), 10 if error == 'Invalid color space' else 6)
++        for _ in range(2):
++            with self.assertRaises(preview.PreviewError) as caught:
++                self.make(lambda *a: (_ for _ in ()).throw(subprocess.TimeoutExpired('ffmpeg', 1)), failure_context=('timeout', 1))
++            self.assertNotIsInstance(caught.exception, preview.InvalidVideoError)
++
++    def test_cancellation_and_file_mutation_do_not_poison_invalid_cache(self):
++        cancel = threading.Event()
++        cancel.set()
++        with self.assertRaises(preview.PreviewError) as caught:
++            self.make(self.invalid, cancel=cancel, failure_context=('monitor', 1))
++        self.assertNotIsInstance(caught.exception, preview.InvalidVideoError)
++        def mutate(*args):
++            self.video.write_bytes(b'changed while extracting thumbnail')
++            return self.invalid()
++        with self.assertRaises(preview.PreviewError) as changed:
++            self.make(mutate, failure_context=('monitor', 1))
++        self.assertNotIsInstance(changed.exception, preview.InvalidVideoError)
++        with self.assertRaises(preview.InvalidVideoError) as retried:
++            self.make(self.invalid, failure_context=('monitor', 1))
++        self.assertFalse(retried.exception.cached)
++
++    def test_missing_ffmpeg_is_transient_and_bounded_cache_evicts_old_sources(self):
++        from tam_core.preview_failures import PreviewFailureCache
++        cache = PreviewFailureCache(limit=2)
++        for source in ('a', 'b', 'c'):
++            cache.remember(source, (1, 2, 3, 4, 5, 6), 'monitor', 'invalid')
++        self.assertFalse(cache.contains_source('a'))
++        self.assertTrue(cache.contains_source('c'))
++        self.assertIsNone(cache.lookup('c', (1, 2, 3, 4, 5, None), 'monitor'))
++        with patch.object(preview, '_ffmpeg_executable', side_effect=preview.PreviewError('missing ffmpeg')):
++            for _ in range(2):
++                with self.assertRaises(preview.PreviewError) as caught:
++                    preview.make_video_thumbnail(self.video, self.cache, failure_context=('monitor', 1))
++                self.assertNotIsInstance(caught.exception, preview.InvalidVideoError)
++
++    def test_typed_cancel_removes_unique_temporary_thumbnail(self):
++        cancel = threading.Event()
++        def successful(cmd, *args):
++            Path(cmd[-1]).write_bytes(b'JPEG frame')
++            return SimpleNamespace(returncode=0, stderr='')
++        with patch.object(preview, '_compress_jpeg', side_effect=lambda path: cancel.set()):
++            with self.assertRaises(preview.PreviewCancelled):
++                self.make(successful, cancel=cancel, failure_context=('monitor', 1))
++        self.assertEqual(list(self.cache.glob('*.tmp.jpg')), [])
++
++    def test_transient_io_failure_wins_over_secondary_container_diagnostic(self):
++        calls = []
++        def io_error(*args):
++            calls.append(1)
++            return SimpleNamespace(returncode=1, stderr='moov atom not found\nInput/output error')
++        for _ in range(2):
++            with self.assertRaises(preview.PreviewError) as caught:
++                self.make(io_error, failure_context=('monitor', 1))
++            self.assertNotIsInstance(caught.exception, preview.InvalidVideoError)
++        self.assertEqual(len(calls), 6)

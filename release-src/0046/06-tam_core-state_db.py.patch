@@ -1,0 +1,16 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -48,7 +48,12 @@
+         self._migration_lock = threading.RLock()
+         try:
+             self._init_schema()
+-        except sqlite3.DatabaseError:
++        except sqlite3.DatabaseError as exc:
++            # Extended SQLite codes retain the primary code in the low byte.
++            # A busy database or an I/O error is not evidence of corruption.
++            code = getattr(exc, 'sqlite_errorcode', 0) & 0xFF
++            if code not in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
++                raise
+             self._recover_corrupt_database()
+             self._init_schema()
+ 

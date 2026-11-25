@@ -1,0 +1,111 @@
+--- /dev/null
++++ b/app/tests/test_invalid_video_upload.py
+@@ -0,0 +1,108 @@
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import test_prefetch_upload_boundary as fixture
++import video_preview
++from tam_core.monitor_delta import monitor_identity
++
++
++class InvalidVideoUploadTests(unittest.IsolatedAsyncioTestCase):
++    asyncSetUp = fixture.PrefetchUploadTests.asyncSetUp
++    asyncTearDown = fixture.PrefetchUploadTests.asyncTearDown
++    file = fixture.PrefetchUploadTests.file
++    read = fixture.PrefetchUploadTests.read
++    run_task = fixture.PrefetchUploadTests.run_task
++
++    def monitoring(self, *paths):
++        self.rule['video_preview_mode'] = 'required'
++        self.rule['_monitor_delta'] = {'identity': list(monitor_identity(self.rule)), 'full': False,
++            'epoch': 'restored', 'files': [p.name for p in paths]}
++
++    def runner(self, calls):
++        def run(cmd, *args):
++            path = Path(cmd[cmd.index('-i') + 1])
++            calls.append(path)
++            if path.name.startswith('bad'):
++                return SimpleNamespace(returncode=1, stderr='moov atom not found')
++            Path(cmd[-1]).write_bytes(b'JPEG frame')
++            return SimpleNamespace(returncode=0, stderr='')
++        return run
++
++    async def test_unchanged_corrupt_video_is_counted_once_without_upload_claim_or_repeated_error(self):
++        bad, good = self.file('bad.mp4', b'invalid'), self.file('good.mp4', b'valid')
++        self.monitoring(bad, good)
++        calls = []
++        with patch.object(video_preview, '_ffmpeg_executable', return_value='ffmpeg'), \
++             patch.object(video_preview, '_run_preview_command', side_effect=self.runner(calls)), \
++             patch.object(video_preview, '_compress_jpeg'):
++            await self.run_task()
++            await self.run_task()
++        self.assertEqual(calls.count(bad), 1)
++        self.assertEqual([Path(p) for p, _ in self.sent], [good])
++        self.assertEqual(len(self.errors), 1)
++        state = self.pane.task_states['r1']
++        self.assertEqual(state.get('invalid_media'), 1)
++        self.assertEqual(state['failed'], 0)
++        self.assertEqual(state['success'], 0)
++        with self.history.db.session() as db:
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0], 1)
++            self.assertEqual(db.execute('SELECT COUNT(*) FROM upload_reservations').fetchone()[0], 0)
++
++    async def test_definite_invalid_media_never_uses_auto_fallback_and_manual_retry_is_fresh(self):
++        bad = self.file('bad.mp4', b'invalid')
++        self.rule['video_preview_mode'] = 'auto'
++        calls = []
++        with patch.object(video_preview, '_ffmpeg_executable', return_value='ffmpeg'), \
++             patch.object(video_preview, '_run_preview_command', side_effect=self.runner(calls)):
++            await self.run_task()
++            await self.run_task()
++        self.assertEqual(calls.count(bad), 2)
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.pane.task_states['r1'].get('invalid_media'), 1)
++        self.assertEqual(self.pane.task_states['r1']['failed'], 0)
++
++    async def test_known_corrupt_video_is_revalidated_when_preview_setting_is_disabled(self):
++        bad = self.file('bad.mp4', b'invalid')
++        self.monitoring(bad)
++        calls = []
++        with patch.object(video_preview, '_ffmpeg_executable', return_value='ffmpeg'), \
++             patch.object(video_preview, '_run_preview_command', side_effect=self.runner(calls)):
++            await self.run_task()
++            self.rule['video_preview_mode'] = 'off'
++            await self.run_task()
++        self.assertEqual(self.sent, [])
++        self.assertEqual(calls.count(bad), 2)
++        self.assertEqual(self.pane.task_states['r1'].get('invalid_media'), 1)
++
++    async def test_invalid_video_remains_unfulfilled_and_visible_after_pass(self):
++        from tam_core.monitor_remaining import remaining_upload_count
++        from tam_ui.monitor_presentation import rule_presentation
++        state = {'total_files': 1, 'processed_files': 1, 'total_bytes': 5, 'processed_bytes': 5,
++                 'invalid_media': 1, 'failed': 0, 'success': 0}
++        self.assertEqual(remaining_upload_count(state), 1)
++        view = rule_presentation(self.rule, {}, state, running=False, queued=False)
++        self.assertEqual(view['progress'], '—')
++        self.assertIn('видео', view['status'].lower())
++        self.assertIn('1', view['detail'])
++
++    async def test_direct_auto_worker_does_not_publish_when_source_changes_during_preview(self):
++        import asyncio
++        from video_preview import PreviewSourceChanged
++        bad = self.file('bad.mp4', b'invalid')
++        self.rule['video_preview_mode'] = 'auto'
++        owner = self
++        class Client:
++            async def upload_file(self, path, **kwargs):
++                owner.sent.append(path)
++                return SimpleNamespace(name=Path(path).name)
++            async def send_file(self, *args, **kwargs):
++                owner.sent.append('published')
++                return SimpleNamespace(id=1)
++        with patch('batch_uploader.make_video_thumbnail', side_effect=PreviewSourceChanged('still being written')):
++            await self.pane._run_one_task(dict(self.rule), {'s1': (self.account, Client())}, {'s1': False},
++                {'s1': self.account_lock}, asyncio.Semaphore(1), asyncio.Semaphore(2), asyncio.Semaphore(2))
++        self.assertEqual(self.sent, [])
++        self.assertEqual(self.pane.task_states['r1']['failed'], 1)
++        self.assertEqual(self.pane.task_states['r1']['invalid_media'], 0)

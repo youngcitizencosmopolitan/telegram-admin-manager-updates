@@ -1,17 +1,23 @@
 {
-  "version": "0045",
-  "base_version": "0044",
-  "manifest_version": "4.3.8.0045",
-  "display_version": "0045",
+  "version": "0046",
+  "base_version": "0045",
+  "manifest_version": "4.3.8.0046",
+  "display_version": "0046",
   "patch_files": [
-    "release-src/0045/01-batch_uploader.py.patch",
-    "release-src/0045/02-tam_core-monitor_delta.py.patch",
-    "release-src/0045/03-tam_ui-monitor_presentation.py.patch",
-    "release-src/0045/04-telegram_admin_manager.py.patch",
-    "release-src/0045/05-tests-test_monitor_delta_resume.py.patch",
-    "release-src/0045/06-tests-test_monitor_delta_upload.py.patch",
-    "release-src/0045/07-tests-test_premium_global_priority.py.patch",
-    "release-src/0045/08-tests-test_streaming_history.py.patch"
+    "release-src/0046/01-batch_uploader.py.patch",
+    "release-src/0046/02-tam_core-monitor_remaining.py.patch",
+    "release-src/0046/03-tam_core-preparation.py.patch",
+    "release-src/0046/04-tam_core-preview_failures.py.patch",
+    "release-src/0046/05-tam_core-profile_instance.py.patch",
+    "release-src/0046/06-tam_core-state_db.py.patch",
+    "release-src/0046/07-tam_ui-monitor_presentation.py.patch",
+    "release-src/0046/08-telegram_admin_manager.py.patch",
+    "release-src/0046/09-tests-test_activity_history_limit.py.patch",
+    "release-src/0046/10-tests-test_invalid_video_preview.py.patch",
+    "release-src/0046/11-tests-test_invalid_video_upload.py.patch",
+    "release-src/0046/12-tests-test_profile_instance_lock.py.patch",
+    "release-src/0046/13-tests-test_video_preview_colorspace.py.patch",
+    "release-src/0046/14-video_preview.py.patch"
   ],
-  "notes": "0045 resumes saved partial monitoring queues from their recorded relative paths after restart. File history and network metadata are checked in the background in bounded slices, so verified files can upload before the full rule is checked. Premium files retain priority and the monitoring table displays check progress. Full scans and captions that need whole-folder numbering can still require a catalog pass. Existing successful history and publication checks are preserved."
+  "notes": "0046 prevents repeated monitoring retries for confirmed unreadable videos, limits recent activity history while keeping current transfers visible, reorders the table in one operation, and prevents multiple Telegram manager processes from using one profile at the same time. SQLite busy and I/O errors no longer trigger corruption recovery."
 }
