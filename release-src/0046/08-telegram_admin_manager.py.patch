@@ -73,7 +73,7 @@
 +    from contextlib import nullcontext
 +    from tam_core.profile_instance import ProfileInUse, claim_profile
 +
-+    planner = '--x-planner' in sys.argv
++    planner = "--x-planner" in sys.argv
      try:
 -        app = TelegramAdminManager()
 -        app.mainloop()

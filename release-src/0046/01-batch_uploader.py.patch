@@ -143,7 +143,7 @@
              "active": {},
              "started": time.monotonic(),
          }
-@@ -5720,14 +5724,22 @@
+@@ -5720,14 +5724,27 @@
              )
  
          def preparation_key(path):
@@ -151,10 +151,15 @@
 +            return tid, str(path), str(task.get('video_preview_mode', 'required')), task.get('revision')
 +
 +        def preview_failure_context(settings):
-+            if not isinstance(task.get('_monitor_delta'), dict) or task.get('_retry_invalid_previews'):
++            if not isinstance(task.get('_monitor_delta'), dict):
 +                return None  # Explicit/manual retries always run a fresh decoder check.
 +            return (tid, settings.get('revision'), settings.get('route_revision'),
 +                    str(settings.get('video_preview_mode', 'required')))
++
++        preview_cache_dir = getattr(self, 'preview_cache_dir', None)
++
++        def known_invalid_video(path):
++            return preview_cache_dir is not None and needs_invalid_video_check(path, preview_cache_dir)
  
          def preparation_factory(path):
              cached_reader = getattr(self.app.upload_history, 'cached_fingerprint', None)
@@ -163,18 +168,18 @@
 -            if _media_kind(path) == 'video' and task.get('video_preview_mode', 'required') != 'off':
 -                thumbnail = lambda p, cancel: make_video_thumbnail(p, self.preview_cache_dir, cancel=cancel)
 +            if _media_kind(path) == 'video' and (task.get('video_preview_mode', 'required') != 'off'
-+                                                or needs_invalid_video_check(path, self.preview_cache_dir)):
++                                                or known_invalid_video(path)):
 +                thumbnail = lambda p, cancel: make_video_thumbnail(p, self.preview_cache_dir, cancel=cancel,
 +                                                                    failure_context=preview_failure_context(task))
              check_duplicate = getattr(self.app.upload_history, 'fingerprint_completed', None)
              duplicate = (lambda fp: check_duplicate(_dedup_fingerprint_for_upload(task, path, fp), history_key_for_path(path))) if callable(check_duplicate) else None
              return lambda: preparation.prepare_file(path, reader, thumbnail, duplicate=duplicate)
-@@ -6173,22 +6185,45 @@
+@@ -6173,22 +6190,45 @@
                          thumb_path: Path | None = None
                          if media_kind == "video":
                              preview_mode = str(settings.get("video_preview_mode", "required"))
 -                            if preview_mode != "off":
-+                            must_validate = needs_invalid_video_check(path, self.preview_cache_dir)
++                            must_validate = known_invalid_video(path)
 +                            invalid_prepared = prepared is not None and isinstance(prepared.preview_error, InvalidVideoError)
 +                            if preview_mode != "off" or must_validate or invalid_prepared:
                                  self._queue_activity_update(key, name, path, account_name, size, 0.0, 0.0, 'Видео • превью')
@@ -221,7 +226,7 @@
                                          state["processed_bytes"] += size
                                          state["processed_files"] += 1
                                          state["failed"] += 1
-@@ -6199,6 +6234,8 @@
+@@ -6199,6 +6239,8 @@
                                          self._emit_task_metrics(tid, force=True)
                                          continue
                                      self.app.log(f"{name}: {path.name}: превью создать не удалось ({exc}); режим Авто — отправляю без созданного превью")
@@ -230,7 +235,7 @@
                              elif preview_mode == "off":
                                  self.app.log(f"{name}: {path.name}: создание превью выключено настройкой")
                          else:
-@@ -6816,13 +6853,17 @@
+@@ -6816,13 +6858,17 @@
                  status = f"⚠ Нужен повтор: резервов {state['blocked']}"
              elif state["failed"]:
                  status = f"Готово, ошибок {state['failed']}"
@@ -249,7 +254,7 @@
              progress = '—' if incomplete else '100%'
              self._queue_task_row(tid, status=status, progress=progress, speed='—', eta='—' if incomplete else '0с')
  
-@@ -6874,7 +6915,7 @@
+@@ -6874,7 +6920,7 @@
          pct = (done_bytes / total * 100.0) if total else 100.0
          remaining = max(0, total - done_bytes)
          eta = remaining / speed if speed > 1024 else None
@@ -258,7 +263,7 @@
          if self.unified_monitor and hasattr(self, "monitor_tree"):
              self._ui_latest(('monitor',), lambda: self.refresh_monitor_tab(force=True))
          self._emit_dashboard(force=force)
-@@ -7017,23 +7058,24 @@
+@@ -7017,23 +7063,24 @@
              tags = ("uploading",)
          if iid and self.activity.exists(iid):
              self.activity.item(iid, text=path.name, values=values, tags=tags)
