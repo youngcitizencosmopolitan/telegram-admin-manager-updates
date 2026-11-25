@@ -1,0 +1,101 @@
+--- a/app/telegram_admin_manager.py
++++ b/app/telegram_admin_manager.py
+@@ -75,7 +75,7 @@
+ 
+ 
+ APP_NAME = "Telegram Admin Manager"
+-APP_VERSION = "0045"
++APP_VERSION = "0046"
+ DEFAULT_UPDATE_MANIFEST = "https://raw.githubusercontent.com/youngcitizencosmopolitan/telegram-admin-manager-updates/main/update.json"
+ 
+ AUTO_CONTROLLER_LABEL = "Авто — владелец / админ с правом добавлять админов"
+@@ -256,28 +256,37 @@
+     legacy = BASE_DIR / "data"
+     if target.resolve() == legacy.resolve() or not legacy.exists():
+         return
++    marker = target / ".portable_migration_done"
++    if marker.exists():
++        return
++    from tam_core.profile_instance import ProfileInUse, claim_profile
++
+     try:
+-        target.mkdir(parents=True, exist_ok=True)
+-        marker = target / ".portable_migration_done"
+-        if marker.exists():
+-            return
+-        # Only fill files that are not already present in the installed profile.
+         import shutil
+-        for src in legacy.rglob("*"):
+-            rel = src.relative_to(legacy)
+-            dst = target / rel
+-            if src.is_dir():
+-                dst.mkdir(parents=True, exist_ok=True)
+-            elif not dst.exists():
+-                dst.parent.mkdir(parents=True, exist_ok=True)
+-                shutil.copy2(src, dst)
+-        marker.write_text("migrated\n", encoding="utf-8")
++
++        with claim_profile(target, lock_file='.portable-migration.lock'):
++            if marker.exists():
++                return
++            # Only fill files that are not already present in the installed profile.
++            for src in legacy.rglob("*"):
++                rel = src.relative_to(legacy)
++                if rel.parts[0] in {'.manager.lock', '.portable-migration.lock'}:
++                    continue
++                dst = target / rel
++                if src.is_dir():
++                    dst.mkdir(parents=True, exist_ok=True)
++                elif not dst.exists():
++                    dst.parent.mkdir(parents=True, exist_ok=True)
++                    shutil.copy2(src, dst)
++            marker.write_text("migrated\n", encoding="utf-8")
++    except ProfileInUse:
++        # The other entrypoint may still be copying a SQLite file.
++        raise
+     except Exception:
+         # Data migration must never prevent the application from starting.
+         pass
+ 
+ DATA_DIR = _installed_data_dir()
+-_migrate_portable_data(DATA_DIR)
+ SESSIONS_DIR = DATA_DIR / "sessions"
+ CONFIG_PATH = DATA_DIR / "config.json"
+ LOG_PATH = DATA_DIR / "app.log"
+@@ -7936,13 +7945,30 @@
+ 
+ 
+ def main() -> None:
+-    if "--x-planner" in sys.argv:
+-        from tam_x.ui import run_x_planner
+-        run_x_planner(DATA_DIR)
+-        return
++    from contextlib import nullcontext
++    from tam_core.profile_instance import ProfileInUse, claim_profile
++
++    planner = '--x-planner' in sys.argv
+     try:
+-        app = TelegramAdminManager()
+-        app.mainloop()
++        with nullcontext() if planner else claim_profile(DATA_DIR):
++            _migrate_portable_data(DATA_DIR)
++            if planner:
++                from tam_x.ui import run_x_planner
++
++                run_x_planner(DATA_DIR)
++            else:
++                app = TelegramAdminManager()
++                app.mainloop()
++    except ProfileInUse as exc:
++        root = tk.Tk()
++        root.withdraw()
++        try:
++            transferring = exc.args[0].name == '.portable-migration.lock'
++            message = ('Сейчас переносится старый профиль. Повтори запуск после завершения переноса.' if transferring
++                       else 'Telegram Admin Manager уже запущен с этим профилем.')
++            messagebox.showinfo(APP_NAME, message, parent=root)
++        finally:
++            root.destroy()
+     except Exception:
+         details = traceback.format_exc()
+         try:

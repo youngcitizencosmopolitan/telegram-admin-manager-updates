@@ -1,0 +1,85 @@
+--- /dev/null
++++ b/app/tests/test_profile_instance_lock.py
+@@ -0,0 +1,82 @@
++import subprocess
++import sqlite3
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import Mock, patch
++
++from tam_core.profile_instance import ProfileInUse, claim_profile
++from tam_core.state_db import StateDatabase
++
++
++class ProfileInstanceTests(unittest.TestCase):
++    def test_same_profile_is_exclusive_across_processes(self):
++        child_script = ('from tam_core.profile_instance import ProfileInUse, claim_profile\n'
++                        'from pathlib import Path\n'
++                        'import sys\n'
++                        'try:\n'
++                        '    with claim_profile(Path(sys.argv[1])):\n'
++                        '        pass\n'
++                        'except ProfileInUse:\n'
++                        '    sys.exit(7)\n')
++        with tempfile.TemporaryDirectory() as td:
++            profile = Path(td) / 'profile'
++            other = Path(td) / 'other'
++
++            def invoke(path):
++                result = subprocess.run([sys.executable, '-c', child_script, str(path)],
++                                        capture_output=True, text=True, timeout=10)
++                self.assertEqual(result.stderr, '')
++                return result.returncode
++
++            with claim_profile(profile):
++                self.assertEqual(invoke(profile), 7)
++                self.assertEqual(invoke(other), 0)
++            self.assertEqual(invoke(profile), 0)
++
++    def test_second_manager_stops_before_opening_the_queue(self):
++        import telegram_admin_manager as manager
++
++        with tempfile.TemporaryDirectory() as td:
++            profile = Path(td)
++            root = Mock()
++            with claim_profile(profile), patch.object(manager, 'DATA_DIR', profile), \
++                    patch.object(sys, 'argv', ['telegram_admin_manager.py']), \
++                    patch.object(manager, 'TelegramAdminManager') as start, \
++                    patch.object(manager.tk, 'Tk', return_value=root), \
++                    patch.object(manager.messagebox, 'showinfo') as message:
++                manager.main()
++            start.assert_not_called()
++            message.assert_called_once()
++            root.destroy.assert_called_once()
++
++    def test_x_launcher_preserves_first_portable_migration_and_can_open_with_manager(self):
++        import telegram_admin_manager as manager
++
++        with tempfile.TemporaryDirectory() as td:
++            base = Path(td) / 'old_program'
++            legacy = base / 'data'
++            legacy.mkdir(parents=True)
++            (legacy / 'x_planner.db').write_bytes(b'previous planner data')
++            profile = Path(td) / 'installed_profile'
++            with claim_profile(profile), patch.object(manager, 'DATA_DIR', profile), \
++                    patch.object(manager, 'BASE_DIR', base), \
++                    patch.object(sys, 'argv', ['telegram_admin_manager.py', '--x-planner']), \
++                    patch('tam_x.ui.run_x_planner') as run:
++                manager.main()
++            run.assert_called_once_with(profile)
++            self.assertEqual((profile / 'x_planner.db').read_bytes(), b'previous planner data')
++
++    def test_busy_database_does_not_trigger_corruption_recovery(self):
++        with tempfile.TemporaryDirectory() as td:
++            path = Path(td) / 'state.db'
++            StateDatabase(path)
++            error = sqlite3.OperationalError('database is locked')
++            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
++            with patch.object(StateDatabase, '_init_schema', side_effect=error), \
++                    patch.object(StateDatabase, '_recover_corrupt_database') as recover:
++                with self.assertRaisesRegex(sqlite3.OperationalError, 'database is locked'):
++                    StateDatabase(path)
++            recover.assert_not_called()
++            self.assertTrue(path.is_file())

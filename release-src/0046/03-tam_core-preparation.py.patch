@@ -1,0 +1,23 @@
+--- a/app/tam_core/preparation.py
++++ b/app/tam_core/preparation.py
+@@ -5,7 +5,7 @@
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+-from video_preview import PreviewError
++from video_preview import PreviewCancelled, PreviewError, PreviewSourceChanged
+ from .file_readiness import FileReadiness, FileStamp, PreparationStopped, read_stamp
+ from .file_metadata import has_active_writer
+ 
+@@ -106,6 +106,11 @@
+                 if thumbnail is not None and not known_duplicate:
+                     try:
+                         thumb = await asyncio.to_thread(thumbnail, path, self.cancel)
++                    except PreviewCancelled:
++                        raise PreparationStopped()
++                    except PreviewSourceChanged:
++                        self.readiness.forget(path)
++                        continue
+                     except PreviewError as exc:
+                         error = exc
+                 if (await asyncio.to_thread(read_stamp, path) == stamp

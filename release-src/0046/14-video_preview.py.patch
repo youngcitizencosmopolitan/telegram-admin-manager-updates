@@ -1,0 +1,199 @@
+--- a/app/video_preview.py
++++ b/app/video_preview.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import os
+ import shutil
+ import subprocess
+ import threading
+@@ -9,7 +10,9 @@
+ from collections import deque
+ from pathlib import Path
+ 
+-from tam_core.file_metadata import change_token, stat_identity
++from tam_core.file_metadata import has_active_writer
++from tam_core.file_readiness import read_stamp
++from tam_core.preview_failures import PreviewFailureCache
+ 
+ try:
+     import imageio_ffmpeg
+@@ -25,10 +28,55 @@
+ MAX_THUMB_SIDE = 320
+ MAX_THUMB_BYTES = 195 * 1024
+ _publish_lock = threading.Lock()
++_invalid_previews = PreviewFailureCache()
+ 
+ 
+ class PreviewError(RuntimeError):
+     pass
++
++
++class PreviewCancelled(PreviewError):
++    pass
++
++
++class PreviewSourceChanged(PreviewError):
++    pass
++
++
++class InvalidVideoError(PreviewError):
++    """FFmpeg rejected a stable input container, rather than thumbnail processing."""
++    def __init__(self, message, *, cached=False):
++        super().__init__(message)
++        self.cached = cached
++
++
++def _failure_source(video, cache):
++    return (os.path.normcase(os.path.abspath(cache)), os.path.normcase(os.path.abspath(video)))
++
++
++def needs_invalid_video_check(video, cache):
++    # Memory-only guard: switching previews off cannot send a known corrupt file.
++    return _invalid_previews.contains_source(_failure_source(video, cache))
++
++
++def _invalid_container(stderr):
++    detail = stderr.casefold()
++    if any(marker in detail for marker in ('input/output error', 'i/o error', 'permission denied',
++            'resource temporarily unavailable', 'connection timed out', 'connection reset',
++            'no such file or directory', 'cannot allocate memory', 'out of memory',
++            'too many open files', 'device or resource busy')):
++        return False
++    if any(marker in detail for marker in ('moov atom not found', 'ebml header parsing failed', 'invalid ebml header')):
++        return True
++    return ('invalid data found when processing input' in detail
++            and any(marker in detail for marker in ('error opening input', 'error reading header')))
++
++
++def _remove_temporary(path):
++    try:
++        path.unlink(missing_ok=True)
++    except OSError:
++        pass  # Cleanup must not hide cancellation or the original preview error.
+ 
+ 
+ def _ffmpeg_executable() -> str:
+@@ -47,9 +95,9 @@
+     )
+ 
+ 
+-def _cache_key(video_path: Path) -> str:
+-    stat = video_path.stat()
+-    raw = repr((str(video_path.resolve()), stat_identity(stat), change_token(video_path, stat))).encode("utf-8", "surrogatepass")
++def _cache_key(video_path: Path, stamp=None) -> str:
++    stamp = read_stamp(video_path) if stamp is None else stamp
++    raw = repr((str(video_path.resolve()), stamp[:5], stamp[5])).encode("utf-8", "surrogatepass")
+     return hashlib.sha1(raw).hexdigest()
+ 
+ 
+@@ -59,13 +107,13 @@
+     if cancel is None:
+         return subprocess.run(cmd, timeout=timeout, **kwargs)
+     if cancel.is_set():
+-        raise PreviewError('Подготовка превью отменена')
++        raise PreviewCancelled('Подготовка превью отменена')
+     child = subprocess.Popen(cmd, **kwargs)
+     deadline = time.monotonic() + timeout
+     try:
+         while True:
+             if cancel.is_set():
+-                raise PreviewError('Подготовка превью отменена')
++                raise PreviewCancelled('Подготовка превью отменена')
+             remaining = deadline - time.monotonic()
+             if remaining <= 0:
+                 raise subprocess.TimeoutExpired(cmd, timeout)
+@@ -101,7 +149,8 @@
+         raise PreviewError(f"не удалось обработать JPEG-превью: {exc}") from exc
+ 
+ 
+-def make_video_thumbnail(video_path: str | Path, cache_dir: str | Path, *, cancel=None) -> Path:
++def make_video_thumbnail(video_path: str | Path, cache_dir: str | Path, *, cancel=None,
++                         failure_context=None) -> Path:
+     """Create/reuse a Telegram-compatible JPEG thumbnail for a video.
+ 
+     The result is <=320x320 and normally <200 KiB, suitable for Telethon's `thumb=`.
+@@ -109,16 +158,26 @@
+     sending the video without a preview.
+     """
+     video = Path(video_path)
++    if cancel is not None and cancel.is_set():
++        raise PreviewCancelled('Подготовка превью отменена')
+     if not video.is_file():
+         raise PreviewError("видеофайл не найден")
+ 
+     cache = Path(cache_dir)
+     cache.mkdir(parents=True, exist_ok=True)
+-    out = cache / f"{_cache_key(video)}.jpg"
++    stamp = read_stamp(video)
++    source = _failure_source(video, cache)
++    remembered = _invalid_previews.lookup(source, stamp, failure_context)
++    if remembered is not None and not has_active_writer(video):
++        if cancel is not None and cancel.is_set():
++            raise PreviewCancelled('Подготовка превью отменена')
++        raise InvalidVideoError(remembered, cached=True)
++    out = cache / f"{_cache_key(video, stamp)}.jpg"
+ 
+     if out.exists():
+         try:
+             if 0 < out.stat().st_size <= MAX_THUMB_BYTES:
++                _invalid_previews.discard_source(source)
+                 return out
+         except OSError:
+             pass
+@@ -138,8 +197,8 @@
+     color_error = ""
+     while attempts:
+         if cancel is not None and cancel.is_set():
+-            tmp.unlink(missing_ok=True)
+-            raise PreviewError('Подготовка превью отменена')
++            _remove_temporary(tmp)
++            raise PreviewCancelled('Подготовка превью отменена')
+         seek, metadata_filter = attempts.popleft()
+         cmd = [
+             ffmpeg,
+@@ -167,20 +226,31 @@
+             if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                 _compress_jpeg(tmp)
+                 if cancel is not None and cancel.is_set():
+-                    raise PreviewError('Подготовка превью отменена')
++                    raise PreviewCancelled('Подготовка превью отменена')
+                 # Windows can reject two concurrent replacements of the same
+                 # destination. Reuse the first complete result and serialize
+                 # only this short publish step, not FFmpeg or JPEG compression.
+                 with _publish_lock:
+                     if cancel is not None and cancel.is_set():
+-                        raise PreviewError('Подготовка превью отменена')
++                        raise PreviewCancelled('Подготовка превью отменена')
+                     if out.exists() and 0 < out.stat().st_size <= MAX_THUMB_BYTES:
+                         tmp.unlink(missing_ok=True)
+                     else:
+                         tmp.replace(out)
++                _invalid_previews.discard_source(source)
+                 return out
+             lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
+             last_error = "; ".join(lines[:3])[:1200] if lines else "FFmpeg не извлёк кадр"
++            if proc.returncode != 0 and _invalid_container(proc.stderr or ''):
++                if tmp.exists():
++                    tmp.unlink()
++                if cancel is not None and cancel.is_set():
++                    raise PreviewCancelled('Подготовка превью отменена')
++                if read_stamp(video) != stamp or has_active_writer(video):
++                    raise PreviewSourceChanged('Видеофайл изменился или ещё записывается; проверка будет повторена')
++                message = f"не читается видеоконтейнер {video.name}: {last_error}"
++                repeated = _invalid_previews.remember(source, stamp, failure_context, message)
++                raise InvalidVideoError(message, cached=repeated)
+             if not color_error and "invalid color space" in (proc.stderr or "").casefold():
+                 color_error = last_error
+                 # FFmpeg 7 rejects reserved color matrices before video filters
+@@ -194,6 +264,9 @@
+                 )
+         except subprocess.TimeoutExpired:
+             last_error = "FFmpeg превысил время ожидания"
++        except (InvalidVideoError, PreviewCancelled, PreviewSourceChanged):
++            _remove_temporary(tmp)
++            raise
+         except Exception as exc:
+             last_error = str(exc)
+         try:

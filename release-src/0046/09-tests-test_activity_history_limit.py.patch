@@ -1,0 +1,73 @@
+--- /dev/null
++++ b/app/tests/test_activity_history_limit.py
+@@ -0,0 +1,70 @@
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from batch_uploader import BatchUploaderPane
++
++
++class ActivityTree:
++    def __init__(self):
++        self.rows = {}
++        self.reorders = 0
++
++    def exists(self, iid):
++        return iid in self.rows
++
++    def item(self, iid, option=None, **values):
++        if option is not None:
++            return self.rows[iid][option]
++        self.rows[iid] = values
++
++    def yview(self):
++        return (0.0, 0.4)
++
++    def insert(self, _parent, _index, *, iid, **values):
++        self.rows[iid] = values
++
++    def get_children(self, *_):
++        return tuple(self.rows)
++
++    def delete(self, iid):
++        del self.rows[iid]
++
++    def set_children(self, _parent, *iids):
++        self.reorders += 1
++        self.rows = {iid: self.rows[iid] for iid in iids}
++
++
++class ActivityHistoryTests(unittest.TestCase):
++    def setUp(self):
++        self.pane = BatchUploaderPane.__new__(BatchUploaderPane)
++        self.pane.activity = ActivityTree()
++        self.pane.activity_rows = {}
++        self.pane.activity_paths = {}
++        self.pane.activity_keys = {}
++        self.pane.activity_finished = {}
++        self.pane.activity_sort_col = None
++        self.pane._refresh_live_sort = lambda: None
++
++    def row(self, key, status):
++        self.pane._activity_update(key, 'rule', Path(key + '.mp4'), 'account', 1, 0, 0, status)
++
++    def test_recent_results_are_capped_without_discarding_current_files(self):
++        with patch('batch_uploader.ACTIVITY_HISTORY_LIMIT', 3, create=True):
++            self.row('active', 'Видео • загрузка')
++            self.row('retry', '⏳ Дубликат • уже обрабатывается')
++            for i in range(8):
++                self.row(str(i), '❌ Ошибка чтения')
++        self.assertEqual(set(self.pane.activity_rows), {'active', 'retry', '5', '6', '7'})
++        self.assertEqual(len(self.pane.activity_paths), 5)
++        self.assertEqual(len(self.pane.activity_keys), 5)
++        self.pane.clear_finished_activity()
++        self.assertEqual(set(self.pane.activity_rows), {'active', 'retry'})
++
++    def test_bulk_reorder_is_skipped_if_rows_already_sorted(self):
++        self.row('z', 'Видео • загрузка')
++        self.row('a', 'Видео • загрузка')
++        self.pane._apply_sort(self.pane.activity, '#0', False, activity=True)
++        self.pane._apply_sort(self.pane.activity, '#0', False, activity=True)
++        self.assertEqual(tuple(r['text'] for r in self.pane.activity.rows.values()), ('a.mp4', 'z.mp4'))
++        self.assertEqual(self.pane.activity.reorders, 1)

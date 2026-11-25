@@ -1,0 +1,12 @@
+--- a/app/tam_core/monitor_remaining.py
++++ b/app/tam_core/monitor_remaining.py
+@@ -24,7 +24,8 @@
+     blocked = max(0, int(state.get('blocked', 0) or 0))
+     failed = max(0, int(state.get('failed', 0) or 0))
+     deferred = max(0, int(state.get('deferred', 0) or 0))
+-    return max(0, total - processed, blocked) + failed + deferred
++    invalid = max(0, int(state.get('invalid_media', 0) or 0))
++    return max(0, total - processed, blocked) + failed + deferred + invalid
+ 
+ 
+ def remaining_upload_text(state: dict) -> str:
