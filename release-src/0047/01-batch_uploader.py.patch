@@ -1,10 +1,9 @@
 --- a/app/batch_uploader.py
 +++ b/app/batch_uploader.py
-@@ -190,6 +190,16 @@
-     if value == "completed":
+@@ -191,6 +191,16 @@
          return "skip"
      raise ValueError(f"Unknown dedup claim status: {status!r}")
-+
+ 
 +def _connected_upload_account(account, me):
 +    # Legacy profiles can lack the user ID. Keep the authenticated sender ID
 +    # in the run snapshot without editing the saved account.
@@ -14,10 +13,61 @@
 +        account.user_id = user_id
 +    return account
 +
- 
++
  def _dedup_fingerprint_for_upload(task: dict[str, Any], path: Path, content_fingerprint: str) -> str:
      """Use source identity for recursive flat uploads, content identity elsewhere.
-@@ -4364,10 +4374,17 @@
+ 
+@@ -251,6 +261,7 @@
+     def __init__(self, task_ids: list[str]):
+         self.preparing = set(task_ids)
+         self.queues: dict[str, tuple[asyncio.Queue[Any], Any]] = {}
++        self.claimed: dict[str, set[str]] = {}
+         self.regular_lane_callbacks: dict[str, Any] = {}
+ 
+     def register(self, task_id: str, queue: asyncio.Queue[Any], eligible: Any, release_regular: Any = None, *, preparing: bool = False) -> None:
+@@ -263,10 +274,19 @@
+     def mark_prepared(self, task_id: str) -> None:
+         self.preparing.discard(task_id)
+ 
++    def claim(self, task_id: str, session: str) -> None:
++        self.claimed.setdefault(task_id, set()).add(session)
++
++    def release_claim(self, task_id: str, session: str) -> None:
++        sessions = self.claimed.get(task_id)
++        if sessions is not None:
++            sessions.discard(session)
++
+     def finish(self, task_id: str) -> None:
+         # Also release the scan barrier after empty folders or preparation errors.
+         self.preparing.discard(task_id)
+         self.queues.pop(task_id, None)
++        self.claimed.pop(task_id, None)
+         self.regular_lane_callbacks.pop(task_id, None)
+ 
+     def release_regular_lanes(self) -> None:
+@@ -280,7 +300,10 @@
+         return not self.preparing
+ 
+     def has_work(self, session: str) -> bool:
+-        return any(not queue.empty() and eligible(session) for queue, eligible in self.queues.values())
++        return any(
++            (not queue.empty() or session in self.claimed.get(task_id, ())) and eligible(session)
++            for task_id, (queue, eligible) in self.queues.items()
++        )
+ 
+ 
+ async def _next_upload_job(
+@@ -301,6 +324,9 @@
+                 pass
+             else:
+                 signal_drained()
++                if priority is not None:
++                    # The worker may await disk I/O before acquiring the account lock.
++                    priority.claim(task_id, session)
+                 return item
+             # Only small files have to wait for the full Premium work check.
+             if ((premium_ready is not None and not premium_ready.is_set())
+@@ -4364,10 +4390,17 @@
                              if not hasattr(self, 'monitor_blocked_signatures'):
                                  self.monitor_blocked_signatures = {}
                              self.monitor_blocked_signatures[tid] = (sigs[tid], recovery_versions.get(tid, 0))
@@ -38,7 +88,7 @@
                          if success and tid in sigs:
                              getattr(self, 'monitor_blocked_signatures', {}).pop(tid, None)
                              self._ack_monitor_work(task)
-@@ -4604,7 +4621,7 @@
+@@ -4604,7 +4637,7 @@
                      raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
                  me = await client.get_me()
                  is_premium = bool(getattr(me, "premium", False))
@@ -47,7 +97,7 @@
                  account_locks[session] = asyncio.Lock()
                  large_ok = True
                  checker = getattr(self.app, "account_usage_allows", None)
-@@ -4641,6 +4658,11 @@
+@@ -4641,6 +4674,11 @@
          return added
  
      async def _run_batch(self, tasks: list[dict[str, Any]], global_parallel: int, notify: bool = True, pipeline: bool = False) -> set[str] | None:
@@ -59,7 +109,7 @@
          api_id, api_hash = self.app._api_credentials()
          try:
              self.app._admin_safety_disabled_sessions.clear()
-@@ -4689,7 +4711,7 @@
+@@ -4689,7 +4727,7 @@
                          raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
                      me = await client.get_me()
                      is_premium = bool(getattr(me, "premium", False))
@@ -68,7 +118,7 @@
                      large_ok = self.app.account_usage_allows(session, "large_files")
                      premium_by_session[session] = bool(is_premium and large_ok)
                      premium_text = "Premium" if is_premium else "обычный"
-@@ -6024,7 +6046,8 @@
+@@ -6024,7 +6062,8 @@
                          queue_for_path(path).put_nowait(item)
                          return
                      try:
@@ -78,7 +128,7 @@
                      except OSError:
                          state["processed_files"] += 1
                          state["failed"] += 1
-@@ -6075,6 +6098,7 @@
+@@ -6075,6 +6114,7 @@
                              offered.pop(path, None)
                              fill_preparation()
                          size = int(prepared.stamp[0])
@@ -86,7 +136,7 @@
                          upload_lane = _telegram_upload_lane(size)
                          if upload_lane == 'too_large':
                              state['processed_bytes'] += size
-@@ -6389,41 +6413,55 @@
+@@ -6389,41 +6429,55 @@
                                                  getattr(self, "monitor_runtime", {}).setdefault(tid, {})["settings_revision"] = settings.get("revision", 0)
                                                  self._ui_latest(('monitor',), self.refresh_monitor_tab)
  
@@ -158,7 +208,7 @@
                                      reservation_held = False
                                      try:
                                          self.app.state_db.transfer_stat_record(
-@@ -6440,9 +6478,15 @@
+@@ -6440,9 +6494,15 @@
                                      h = health(session)
                                      h.update({"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": ""})
                                      self._ui_latest(('health',), self.app.refresh_safety_health_table)
@@ -176,9 +226,12 @@
                                      break
                                  except BatchUploadStopped:
                                      await self._finish_diagnostic(key, False)
-@@ -6682,6 +6726,9 @@
+@@ -6681,7 +6741,12 @@
+                         return
                      raise
                  finally:
++                    if premium_priority is not None:
++                        premium_priority.release_claim(tid, session)
                      mark_dispatch(session)
 +                    forget = getattr(self.app.upload_history, 'forget_returned_message_claim', None)
 +                    if claim_taken and callable(forget):
