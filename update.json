@@ -1,7 +1,7 @@
 {
-  "version": "4.3.8.0046",
-  "display_version": "0046",
-  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0046/TelegramAdminManager_v0046_update.zip",
-  "sha256": "6468627e8212e6e6aa3641b9fbd3d51fbef3c4c327c707079bf9814c339ec020",
-  "notes": "0046 prevents repeated monitoring retries for confirmed unreadable videos, limits recent activity history while keeping current transfers visible, reorders the table in one operation, and prevents multiple Telegram manager processes from using one profile at the same time. SQLite busy and I/O errors no longer trigger corruption recovery."
+  "version": "4.3.8.0047",
+  "display_version": "0047",
+  "package_url": "https://github.com/youngcitizencosmopolitan/telegram-admin-manager-updates/releases/download/v0047/TelegramAdminManager_v0047_update.zip",
+  "sha256": "3b248fb1d6b44ee8f0339ff6bc6fa494892377c612cd3e6788f2a60907859a51",
+  "notes": "0047 records Telegram-confirmed messages from the existing reservation, without rereading the source after sending. If SQLite is temporarily unavailable, the exact response is saved locally and recorded automatically on a later queue run. Stopping before the request reaches Telegram remains safe to retry. A finished monitoring check can move on to new files while preserving genuinely unconfirmed sends for review. A Premium account keeps its large-file priority during preparation."
 }
