@@ -1,0 +1,55 @@
+--- a/app/tam_core/state_db.py
++++ b/app/tam_core/state_db.py
+@@ -13,6 +13,10 @@
+ from .source_history import source_key as sent_source_key
+ 
+ SCHEMA_VERSION = 15
++
++
++class UploadConfirmationError(RuntimeError):
++    """Returned-message evidence does not own the exact publishing claim."""
+ 
+ 
+ def _history_group_key(target_key: str) -> str:
+@@ -1032,6 +1036,41 @@
+                 removed += cur.rowcount
+         return removed
+ 
++    def upload_confirm_returned_message(
++        self, *, target_key: str, fingerprint: str, claim_token: str,
++        size: int, mtime_ns: int, account_user_id: int, account_label: str,
++        message_id: int,
++    ) -> None:
++        """Commit an exact Telegram response using only the fenced stored path."""
++        from .upload_receipts import validate_confirmation
++
++        validate_confirmation(dict(target_key=target_key, fingerprint=fingerprint, claim_token=claim_token,
++            size=size, mtime_ns=mtime_ns, account_user_id=account_user_id,
++            account_label=account_label, message_id=message_id))
++        with self.session() as conn:
++            conn.execute('BEGIN IMMEDIATE')
++            existing = conn.execute('SELECT account_user_id,message_id FROM uploads '
++                'WHERE target_key=? AND fingerprint=?', (target_key, fingerprint)).fetchone()
++            if existing is not None:
++                if existing['account_user_id'] != account_user_id or existing['message_id'] != message_id:
++                    raise UploadConfirmationError('A different returned message is already recorded')
++                # Idempotent replay may clean only its own publishing claim.
++                conn.execute('DELETE FROM upload_reservations WHERE target_key=? AND fingerprint=? '
++                    'AND claim_token=? AND prepublication=0', (target_key, fingerprint, claim_token))
++                return
++            claim = conn.execute('SELECT path FROM upload_reservations WHERE target_key=? '
++                'AND fingerprint=? AND claim_token=? AND prepublication=0',
++                (target_key, fingerprint, claim_token)).fetchone()
++            if claim is None or not claim['path']:
++                raise UploadConfirmationError('Exact publishing claim is missing or no longer owned')
++            path = claim['path']
++            conn.execute('INSERT INTO uploads(target_key,fingerprint,path,size,mtime_ns,account_user_id,'
++                'account_label,message_id,completed_at,source_key) VALUES(?,?,?,?,?,?,?,?,?,?)',
++                (target_key, fingerprint, path, size, mtime_ns, account_user_id, account_label,
++                 message_id, time.time(), sent_source_key(path)))
++            conn.execute('DELETE FROM upload_reservations WHERE target_key=? AND fingerprint=? '
++                'AND claim_token=? AND prepublication=0', (target_key, fingerprint, claim_token))
++
+     def upload_record(
+         self,
+         *,

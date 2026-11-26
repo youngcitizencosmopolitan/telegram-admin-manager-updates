@@ -1,0 +1,188 @@
+--- a/app/batch_uploader.py
++++ b/app/batch_uploader.py
+@@ -190,6 +190,16 @@
+     if value == "completed":
+         return "skip"
+     raise ValueError(f"Unknown dedup claim status: {status!r}")
++
++def _connected_upload_account(account, me):
++    # Legacy profiles can lack the user ID. Keep the authenticated sender ID
++    # in the run snapshot without editing the saved account.
++    user_id = getattr(me, 'id', None)
++    if type(user_id) is int and user_id > 0 and user_id != account.user_id:
++        account = copy.copy(account)
++        account.user_id = user_id
++    return account
++
+ 
+ def _dedup_fingerprint_for_upload(task: dict[str, Any], path: Path, content_fingerprint: str) -> str:
+     """Use source identity for recursive flat uploads, content identity elsewhere.
+@@ -4364,10 +4374,17 @@
+                             if not hasattr(self, 'monitor_blocked_signatures'):
+                                 self.monitor_blocked_signatures = {}
+                             self.monitor_blocked_signatures[tid] = (sigs[tid], recovery_versions.get(tid, 0))
+-                        success = (tid not in hard_error_ids and int(state.get("failed", 0) or 0) == 0
+-                                   and not blocked_count and not was_stopped)
+                         current_rule = self.app.monitor_rules.get(tid)
+-                        success = success and bool(current_rule and current_rule.get("monitor_folder", True) and route_matches(task, current_rule))
++                        scan_complete = (tid not in hard_error_ids and not was_stopped
++                                         and not state.get('checking_history')
++                                         and int(state.get('failed', 0) or 0) == 0
++                                         and bool(current_rule and current_rule.get('monitor_folder', True)
++                                                  and route_matches(task, current_rule)))
++                        if scan_complete and blocked_count and not state.get('restored_monitor_delta'):
++                            # The examined paths do not need another full-folder pass.
++                            # Reservations and the successful upload signature stay pending.
++                            self._ack_monitor_work(task)
++                        success = scan_complete and not blocked_count
+                         if success and tid in sigs:
+                             getattr(self, 'monitor_blocked_signatures', {}).pop(tid, None)
+                             self._ack_monitor_work(task)
+@@ -4604,7 +4621,7 @@
+                     raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+                 me = await client.get_me()
+                 is_premium = bool(getattr(me, "premium", False))
+-                clients[session] = (account, client)
++                clients[session] = (_connected_upload_account(account, me), client)
+                 account_locks[session] = asyncio.Lock()
+                 large_ok = True
+                 checker = getattr(self.app, "account_usage_allows", None)
+@@ -4641,6 +4658,11 @@
+         return added
+ 
+     async def _run_batch(self, tasks: list[dict[str, Any]], global_parallel: int, notify: bool = True, pipeline: bool = False) -> set[str] | None:
++        replay = getattr(getattr(self.app, 'upload_history', None), 'replay_confirmed_receipts', None)
++        if callable(replay):
++            restored = await asyncio.to_thread(replay, stopped=self.stop_event.is_set)
++            if restored:
++                self.app.log(f'История загрузок: автоматически восстановлено подтверждений — {restored}.')
+         api_id, api_hash = self.app._api_credentials()
+         try:
+             self.app._admin_safety_disabled_sessions.clear()
+@@ -4689,7 +4711,7 @@
+                         raise _SessionLoginRequired("сессия не авторизована; требуется повторный вход по QR")
+                     me = await client.get_me()
+                     is_premium = bool(getattr(me, "premium", False))
+-                    clients[session] = (account, client)
++                    clients[session] = (_connected_upload_account(account, me), client)
+                     large_ok = self.app.account_usage_allows(session, "large_files")
+                     premium_by_session[session] = bool(is_premium and large_ok)
+                     premium_text = "Premium" if is_premium else "обычный"
+@@ -6024,7 +6046,8 @@
+                         queue_for_path(path).put_nowait(item)
+                         return
+                     try:
+-                        size = (await asyncio.to_thread(path.stat)).st_size
++                        source_stat = await asyncio.to_thread(path.stat)
++                        size, source_mtime_ns = source_stat.st_size, source_stat.st_mtime_ns
+                     except OSError:
+                         state["processed_files"] += 1
+                         state["failed"] += 1
+@@ -6075,6 +6098,7 @@
+                             offered.pop(path, None)
+                             fill_preparation()
+                         size = int(prepared.stamp[0])
++                        source_mtime_ns = int(prepared.stamp[1])
+                         upload_lane = _telegram_upload_lane(size)
+                         if upload_lane == 'too_large':
+                             state['processed_bytes'] += size
+@@ -6389,41 +6413,55 @@
+                                                 getattr(self, "monitor_runtime", {}).setdefault(tid, {})["settings_revision"] = settings.get("revision", 0)
+                                                 self._ui_latest(('monitor',), self.refresh_monitor_tab)
+ 
+-                                    async def publish(send):
++                                    async def publish(send, validate=None):
+                                         mark_dispatch(session, 'publishing')
+                                         if media_kind == 'video':
+                                             transfer['speed'] = 0.0
+                                             self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, 'Видео • публикация')
+                                         async def marked_send():
+                                             nonlocal publication_started
++                                            if validate is not None:
++                                                await validate()
+                                             marker = getattr(self.app.upload_history, 'mark_publishing', None)
+                                             if marker is not None:
+-                                                owned = await asyncio.to_thread(marker, dedup_fingerprint,
+-                                                    history_key, reservation_claim_token)
+-                                                if not owned:
++                                                owned, marker_cancelled = await _settled_thread_result(
++                                                    marker, dedup_fingerprint, history_key, reservation_claim_token,
++                                                )
++                                                if marker_cancelled is not None:
++                                                    raise marker_cancelled
++                                                if not owned or self.stop_event.is_set():
+                                                     raise BatchUploadStopped()
+                                                 publication_started = True
+-                                            return await bounded_action(send, phase='sending' if media_kind == 'photo' and not safe_parts_retry_used else 'publishing')
++                                            return await send()
++                                        async def admitted_send():
++                                            phase = 'sending' if media_kind == 'photo' and not safe_parts_retry_used else 'publishing'
++                                            return await bounded_action(marked_send, phase=phase)
+                                         return await _publish_with_min_gap(self._publication_state, session, delay,
+-                                            marked_send, lambda: self._wait_gate(tid), self._sleep_stop)
++                                            admitted_send, lambda: self._wait_gate(tid), self._sleep_stop)
+ 
+                                     if media_kind == 'video' or safe_parts_retry_used:
+                                         message = await _send_file_with_safe_parts(client, entity, path, size, send_kwargs,
+                                             publisher=publish, uploader=bounded_action, before_upload=before_upload)
+                                     else:
+                                         async def send_direct():
+-                                            await before_upload()
+                                             return await client.send_file(entity, str(path), **send_kwargs)
+-                                        message = await publish(send_direct)
++                                        message = await publish(send_direct, validate=before_upload)
+                                     message_id = getattr(message, "id", None)
+-                                    self.app.upload_history.record_completed(
+-                                        path,
+-                                        history_key,
+-                                        dedup_fingerprint,
+-                                        account,
+-                                        int(message_id) if message_id else None,
+-                                        reservation_claim_token=reservation_claim_token,
+-                                    )
++                                    confirm = getattr(self.app.upload_history, 'confirm_returned_message', None)
++                                    confirmation_cancelled = None
++                                    confirmation_saved = False
++                                    if callable(confirm):
++                                        confirmation, confirmation_cancelled = await _settled_thread_result(
++                                            confirm, history_key, dedup_fingerprint, reservation_claim_token,
++                                            size, source_mtime_ns, account, message_id,
++                                        )
++                                        confirmation_saved = confirmation == 'saved'
++                                    else:
++                                        self.app.upload_history.record_completed(
++                                            path, history_key, dedup_fingerprint, account,
++                                            int(message_id) if message_id else None,
++                                            reservation_claim_token=reservation_claim_token,
++                                        )
+                                     reservation_held = False
+                                     try:
+                                         self.app.state_db.transfer_stat_record(
+@@ -6440,9 +6478,15 @@
+                                     h = health(session)
+                                     h.update({"state": "OK", "floods": 0, "errors": 0, "cooldown_until": 0.0, "reason": ""})
+                                     self._ui_latest(('health',), self.app.refresh_safety_health_table)
+-                                    self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, '✅ Отправлено')
+-                                    self.app.log(f"{name}: {account.display} → {path.name}: ✅")
++                                    send_status = '✅ Отправлено · запись в историю отложена' if confirmation_saved else '✅ Отправлено'
++                                    self._queue_activity_update(key, name, path, account_name, size, 100.0, 0.0, send_status)
++                                    if confirmation_saved:
++                                        self.app.log(f'{name}: {path.name}: Telegram подтвердил отправку; запись в историю будет восстановлена автоматически.')
++                                    else:
++                                        self.app.log(f"{name}: {account.display} → {path.name}: ✅")
+                                     self._emit_task_metrics(tid, force=True)
++                                    if confirmation_cancelled is not None:
++                                        raise confirmation_cancelled
+                                     break
+                                 except BatchUploadStopped:
+                                     await self._finish_diagnostic(key, False)
+@@ -6682,6 +6726,9 @@
+                     raise
+                 finally:
+                     mark_dispatch(session)
++                    forget = getattr(self.app.upload_history, 'forget_returned_message_claim', None)
++                    if claim_taken and callable(forget):
++                        forget(history_key, dedup_fingerprint, reservation_claim_token)
+ 
+                 # The next byte upload can begin immediately. Publication of
+                 # its handle observes the shared per-account interval above.

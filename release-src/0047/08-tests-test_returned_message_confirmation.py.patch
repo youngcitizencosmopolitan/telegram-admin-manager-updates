@@ -1,0 +1,226 @@
+--- /dev/null
++++ b/app/tests/test_returned_message_confirmation.py
+@@ -0,0 +1,223 @@
++import sqlite3
++import tempfile
++import unittest
++from contextlib import ExitStack
++from pathlib import Path
++from unittest.mock import patch
++
++from tam_core.models import Account
++from tam_core.repositories import UploadHistory
++
++
++class ReturnedMessageConfirmationTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.history = UploadHistory(self.root / 'uploads.db')
++        self.account = Account('test', 'test', '', 42)
++        self.source = self.root / 'video.mp4'
++        self.source.write_bytes(b'video')
++        self.original = str(self.source.resolve())
++        self.claim()
++
++    def claim(self, token='owned', fingerprint='fp', path=None):
++        self.assertEqual(self.history.claim_prepublication(
++            fingerprint, 'group', path or self.source, 'run', token), 'reserved')
++        self.assertTrue(self.history.mark_publishing(fingerprint, 'group', token))
++
++    def confirm(self, **changes):
++        values = dict(target_key='group', fingerprint='fp', claim_token='owned',
++                      size=5, mtime_ns=123, account=self.account, message_id=71)
++        values.update(changes)
++        return self.history.confirm_returned_message(**values)
++
++    def rows(self):
++        with self.history.db.session() as conn:
++            return ([dict(row) for row in conn.execute('SELECT * FROM uploads')],
++                    [dict(row) for row in conn.execute('SELECT * FROM upload_reservations')])
++
++    def busy(self):
++        exc = sqlite3.OperationalError('database is locked')
++        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
++        return exc
++
++    def test_deleted_replaced_and_unreachable_source_need_no_metadata(self):
++        self.source.unlink()
++        self.source.write_bytes(b'replaced with unrelated bytes')
++        with ExitStack() as stack:
++            for name in ('stat', 'resolve', 'is_file', 'exists', 'open'):
++                stack.enter_context(patch.object(Path, name, side_effect=AssertionError('source metadata: ' + name)))
++            self.assertEqual(self.confirm(), 'confirmed')
++        uploads, claims = self.rows()
++        self.assertEqual(claims, [])
++        self.assertEqual((uploads[0]['path'], uploads[0]['size'], uploads[0]['mtime_ns']), (self.original, 5, 123))
++        self.assertEqual((uploads[0]['message_id'], uploads[0]['account_user_id']), (71, 42))
++
++    def test_wrong_token_and_prepublication_are_rejected_without_history(self):
++        with self.assertRaises(RuntimeError):
++            self.confirm(claim_token='not-owner')
++        with self.history.db.session() as conn:
++            conn.execute('UPDATE upload_reservations SET prepublication=1')
++        with self.assertRaises(RuntimeError):
++            self.confirm()
++        uploads, claims = self.rows()
++        self.assertEqual(uploads, [])
++        self.assertEqual(len(claims), 1)
++
++    def test_missing_message_id_preserves_uncertain_claim(self):
++        for message_id in (None, 0, -1, True, '71'):
++            with self.assertRaises((ValueError, TypeError)):
++                self.confirm(message_id=message_id)
++        self.assertEqual(len(self.rows()[1]), 1)
++
++    def test_exact_returned_message_is_idempotent_but_conflicts_never_overwrite(self):
++        self.assertEqual(self.confirm(), 'confirmed')
++        self.assertEqual(self.confirm(), 'confirmed')
++        with self.assertRaises(RuntimeError):
++            self.confirm(message_id=72)
++        with self.assertRaises(RuntimeError):
++            self.confirm(account=Account('other', 'other', '', 43))
++        self.assertEqual(self.rows()[0][0]['message_id'], 71)
++
++    def test_busy_saves_receipt_then_fresh_history_replays_without_source(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++        self.source.unlink()
++        reopened = UploadHistory(self.root / 'uploads.db')
++        self.assertEqual(reopened.replay_confirmed_receipts(), 1)
++        self.assertEqual(reopened.replay_confirmed_receipts(), 0)
++        self.assertEqual(self.rows()[1], [])
++
++    def test_real_sqlite_write_lock_saves_and_replays(self):
++        original_connect = self.history.db.connect
++        writer = original_connect()
++        writer.execute('BEGIN IMMEDIATE')
++        def short_timeout_connection():
++            connection = original_connect()
++            connection.execute('PRAGMA busy_timeout=1')
++            return connection
++        try:
++            with patch.object(self.history.db, 'connect', side_effect=short_timeout_connection):
++                self.assertEqual(self.confirm(), 'saved')
++        finally:
++            writer.rollback()
++            writer.close()
++        self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++
++    def test_deleted_source_is_not_required_for_confirmation(self):
++        self.source.unlink()
++        self.assertEqual(self.confirm(), 'confirmed')
++
++    def test_missing_or_wrong_destination_claim_is_not_recorded(self):
++        for changes in ({'target_key': 'another-group'}, {'fingerprint': 'other-fingerprint'}):
++            with self.assertRaises(RuntimeError):
++                self.confirm(**changes)
++        self.assertEqual(self.rows()[0], [])
++        self.assertEqual(len(self.rows()[1]), 1)
++
++    def test_oserror_also_saves_but_receipt_fsync_failure_does_not_claim_saved(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=OSError('disk unavailable')):
++            with patch('tam_core.upload_receipts.os.fsync', side_effect=OSError('cannot sync')):
++                with self.assertRaises(OSError):
++                    self.confirm()
++            self.assertEqual(self.confirm(), 'saved')
++        self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++
++    def test_busy_without_a_proved_owned_publishing_claim_cannot_save(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            with self.assertRaises(RuntimeError):
++                self.confirm(claim_token='not-owner')
++        self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++
++    def test_replaced_claim_is_not_completed_by_older_receipt(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++        with self.history.db.session() as conn:
++            conn.execute("UPDATE upload_reservations SET claim_token='replacement'")
++        self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++        self.assertEqual(self.rows()[0], [])
++        self.assertEqual(self.rows()[1][0]['claim_token'], 'replacement')
++        with self.history.db.session() as conn:
++            conn.execute("UPDATE upload_reservations SET claim_token='owned'")
++        self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++
++    def test_replay_failure_and_cancellation_preserve_receipts(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++            self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++        self.assertEqual(self.history.replay_confirmed_receipts(stopped=lambda: True), 0)
++        self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++
++    def test_nonbusy_database_errors_are_not_hidden_as_receipts(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=sqlite3.IntegrityError('constraint')):
++            with self.assertRaises(sqlite3.IntegrityError):
++                self.confirm()
++        self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++
++    def test_worker_cleanup_and_release_discard_process_proof_only(self):
++        self.history.forget_returned_message_claim('group', 'fp', 'owned')
++        self.assertEqual(len(self.rows()[1]), 1)
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            with self.assertRaises(RuntimeError):
++                self.confirm()
++        self.assertTrue(self.history.release_fingerprint_reservation('fp', 'group', 'owned'))
++        self.assertEqual(self.rows()[1], [])
++
++    def test_proof_cache_is_bounded_and_terminal_confirmation_clears_it(self):
++        for index in range(4100):
++            self.history._remember_confirmation_claim('group', 'other-' + str(index), str(index), '/synthetic', True)
++        self.assertLessEqual(len(self.history._confirmation_claims), 4096)
++        # An evicted proof cannot prevent a healthy DB from finalizing ownership.
++        self.assertEqual(self.confirm(), 'confirmed')
++        self.assertNotIn(('group', 'fp', 'owned'), self.history._confirmation_claims)
++
++    def test_replay_is_bounded_and_leaves_legacy_journals_untouched(self):
++        import json
++        from tam_core.upload_receipts import UploadReceiptStore
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++        receipt_dir = self.root / 'upload_receipts'
++        legacy = receipt_dir / 'legacy.json'
++        legacy.write_text(json.dumps({'message_id': None}), encoding='utf-8')
++        with patch.object(UploadReceiptStore, 'REPLAY_LIMIT', 0):
++            self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++        self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++        self.assertTrue(legacy.is_file())
++
++    def test_malformed_receipts_do_not_starve_later_valid_receipts(self):
++        from tam_core.upload_receipts import UploadReceiptStore
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++        receipt_dir = self.root / 'upload_receipts'
++        for index in range(4):
++            (receipt_dir / ('returned-message-%064x.json' % index)).write_text('invalid-json', encoding='utf-8')
++        with patch.object(UploadReceiptStore, 'REPLAY_LIMIT', 2):
++            self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++            self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++            self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++        self.assertEqual(len(list(receipt_dir.glob('*.json'))), 4)
++
++    def test_saved_receipts_are_not_offered_or_released_as_stale_claims(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++        stale = self.history.db.upload_stale_reservations('group', 'new-run')
++        self.assertEqual(len(stale), 1)
++        self.assertEqual(self.history.stale_reservations(self.root, 'group', 'new-run'), [])
++        self.assertEqual(self.history.release_stale_reservations(stale, 'new-run'), 0)
++        self.assertEqual(len(self.rows()[1]), 1)
++        self.assertEqual(self.history.replay_confirmed_receipts(), 1)
++
++    def test_old_receipt_does_not_protect_a_replacement_claim_token(self):
++        with patch.object(self.history.db, 'upload_confirm_returned_message', side_effect=self.busy()):
++            self.assertEqual(self.confirm(), 'saved')
++        with self.history.db.session() as conn:
++            conn.execute("UPDATE upload_reservations SET claim_token='replacement'")
++        stale = self.history.stale_reservations(self.root, 'group', 'new-run')
++        self.assertEqual(len(stale), 1)
++        self.assertEqual(self.history.release_stale_reservations(stale, 'new-run'), 1)
++        self.assertEqual(self.history.replay_confirmed_receipts(), 0)
++
++
++if __name__ == '__main__':
++    unittest.main()

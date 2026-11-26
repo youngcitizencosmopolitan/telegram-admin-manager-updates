@@ -1,0 +1,22 @@
+--- a/app/tests/test_monitor_delta_upload.py
++++ b/app/tests/test_monitor_delta_upload.py
+@@ -143,10 +143,16 @@
+         self.run_queue(source='Вручную')
+         self.assertEqual(self.pane.monitor_pending_signatures, {})
+ 
+-    def test_blocked_work_is_not_acknowledged_as_successful(self):
+-        self.run_queue(blocked=True)
+-        self.assertTrue(self.index.has_work)
++    def test_examined_blocked_paths_leave_future_deltas_without_marking_upload_success(self):
++        self.run_queue(blocked=True, later=True)
++        self.assertEqual(self.index.work_snapshot()['files'], ['later.mp4'])
++        self.assertNotIn('r1', self.pane.monitor_last_signatures)
++        self.assertIsNone(self.pane.app.monitor_rules.get('r1').get('monitor_signature'))
+         self.assertEqual(self.pane.monitor_blocked_signatures['r1'], ('queued-sig', 0))
++
++    def test_actual_errors_keep_blocked_pass_eligible_for_retry(self):
++        self.run_queue(blocked=True, failed=True)
++        self.assertEqual(self.index.work_snapshot()['files'], ['new.mp4'])
+ 
+     def test_deferral_acknowledges_scan_without_claiming_every_file_is_uploaded(self):
+         self.run_queue(deferred=True)
