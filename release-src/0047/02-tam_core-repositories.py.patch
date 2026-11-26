@@ -1,0 +1,178 @@
+--- a/app/tam_core/repositories.py
++++ b/app/tam_core/repositories.py
+@@ -2,16 +2,19 @@
+ 
+ import copy
+ import json
++import sqlite3
+ import threading
+ import time
++from collections import OrderedDict
+ from itertools import islice
+ from pathlib import Path
+ from typing import Any, Iterable
+ 
+ from .defaults import DEFAULT_CONFIG
+ from .models import Account
+-from .state_db import StateDatabase
++from .state_db import StateDatabase, UploadConfirmationError
+ from .file_metadata import change_token, stat_identity
++from .upload_receipts import UploadReceiptStore, validate_confirmation
+ 
+ HISTORY_CHECK_BATCH_SIZE = 2000
+ 
+@@ -108,6 +111,9 @@
+         self.path = Path(legacy_path)
+         self.db = StateDatabase(self.path.parent / "state.db")
+         self.db.migrate_legacy_uploads(self.path)
++        self._confirmation_lock = threading.Lock()
++        self._confirmation_claims = OrderedDict()
++        self._receipt_replay_cursor = ''
+ 
+     @staticmethod
+     def _stat(path: Path) -> tuple[str, int, int]:
+@@ -248,32 +254,127 @@
+         claim_token: str,
+         *, match_source: bool = False,
+     ) -> str:
+-        return self.db.upload_claim_fingerprint(
++        norm = str(path.resolve())
++        result = self.db.upload_claim_fingerprint(
+             target_key=target_key,
+             fingerprint=fingerprint,
+-            path=str(path.resolve()),
++            path=norm,
+             run_token=run_token,
+             claim_token=claim_token,
+             match_source=match_source,
+         )
++        if result == 'reserved':
++            self._remember_confirmation_claim(target_key, fingerprint, claim_token, norm, True)
++        return result
+ 
+     def release_fingerprint_reservation(self, fingerprint: str, target_key: str, claim_token: str) -> bool:
+-        return self.db.upload_release_fingerprint_reservation(target_key, fingerprint, claim_token)
++        result = self.db.upload_release_fingerprint_reservation(target_key, fingerprint, claim_token)
++        self._forget_confirmation_claim(target_key, fingerprint, claim_token)
++        return result
+ 
+     def claim_prepublication(self, fingerprint, target_key, path, run_token, claim_token, *, match_source=False):
+-        return self.db.upload_claim_fingerprint(target_key=target_key, fingerprint=fingerprint,
+-            path=str(path.resolve()), run_token=run_token, claim_token=claim_token, prepublication=True, match_source=match_source)
++        norm = str(path.resolve())
++        result = self.db.upload_claim_fingerprint(target_key=target_key, fingerprint=fingerprint,
++            path=norm, run_token=run_token, claim_token=claim_token, prepublication=True, match_source=match_source)
++        if result == 'reserved':
++            self._remember_confirmation_claim(target_key, fingerprint, claim_token, norm, False)
++        return result
+ 
+     def mark_publishing(self, fingerprint, target_key, claim_token):
+-        return self.db.upload_mark_publishing(target_key, fingerprint, claim_token)
++        result = self.db.upload_mark_publishing(target_key, fingerprint, claim_token)
++        with self._confirmation_lock:
++            key = target_key, fingerprint, claim_token
++            previous = self._confirmation_claims.get(key)
++            if result and previous is not None:
++                self._confirmation_claims[key] = previous[0], True
++                self._confirmation_claims.move_to_end(key)
++            elif not result:
++                self._confirmation_claims.pop(key, None)
++        return result
++
++    def _remember_confirmation_claim(self, target_key, fingerprint, claim_token, path, publishing):
++        with self._confirmation_lock:
++            key = target_key, fingerprint, claim_token
++            self._confirmation_claims[key] = path, publishing
++            self._confirmation_claims.move_to_end(key)
++            while len(self._confirmation_claims) > 4096:
++                self._confirmation_claims.popitem(last=False)
++
++    def _forget_confirmation_claim(self, target_key, fingerprint, claim_token):
++        with self._confirmation_lock:
++            self._confirmation_claims.pop((target_key, fingerprint, claim_token), None)
++
++    def forget_returned_message_claim(self, target_key, fingerprint, claim_token):
++        """Drop process proof after a worker exits; retain the durable reservation."""
++        self._forget_confirmation_claim(target_key, fingerprint, claim_token)
++
++    def confirm_returned_message(self, target_key, fingerprint, claim_token, size, mtime_ns, account, message_id):
++        """Return confirmed, or saved only after a proved response is durable.
++
++        False ownership and conflicting responses raise without a receipt. A
++        busy DB or OS failure permits fallback only for a publishing claim this
++        facade proved before sending; replay independently rechecks ownership.
++        No candidate filesystem access is required after Telegram returns.
++        """
++        record = dict(target_key=target_key, fingerprint=fingerprint, claim_token=claim_token,
++                      size=size, mtime_ns=mtime_ns, account_user_id=account.user_id,
++                      account_label=account.display, message_id=message_id)
++        validate_confirmation(record)
++        try:
++            self.db.upload_confirm_returned_message(**record)
++        except (sqlite3.OperationalError, OSError) as exc:
++            if isinstance(exc, sqlite3.OperationalError):
++                code = getattr(exc, 'sqlite_errorcode', 0) & 0xFF
++                if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
++                    raise
++            with self._confirmation_lock:
++                proof = self._confirmation_claims.get((target_key, fingerprint, claim_token))
++            if proof is None or not proof[1]:
++                raise UploadConfirmationError('Cannot save a response without a proved publishing claim') from exc
++            UploadReceiptStore(self.path.parent / 'upload_receipts').save(record, proof[0])
++            self._forget_confirmation_claim(target_key, fingerprint, claim_token)
++            return 'saved'
++        self._forget_confirmation_claim(target_key, fingerprint, claim_token)
++        return 'confirmed'
++
++    def replay_confirmed_receipts(self, *, stopped=None) -> int:
++        """Try each bounded journal once; retain failed or ambiguous evidence."""
++        stopped = stopped or (lambda: False)
++        confirmed = 0
++        try:
++            def visited(name):
++                self._receipt_replay_cursor = name
++            for path, record in UploadReceiptStore(self.path.parent / 'upload_receipts').pending(
++                    stopped, after=self._receipt_replay_cursor, visited=visited):
++                if stopped():
++                    break
++                try:
++                    self.db.upload_confirm_returned_message(**record)
++                except (sqlite3.DatabaseError, OSError, UploadConfirmationError, ValueError):
++                    continue
++                confirmed += 1
++                try:
++                    path.unlink()
++                except OSError:
++                    pass  # Exact-message replay remains idempotent after a crash.
++        except OSError:
++            pass
++        return confirmed
+ 
+     def stale_reservations(self, folder: Path, target_key: str, current_run: str):
+         root = Path(folder).resolve()
+-        return [row for row in self.db.upload_stale_reservations(target_key, current_run)
++        rows = self._without_confirmed_receipt_claims(self.db.upload_stale_reservations(target_key, current_run))
++        return [row for row in rows
+                 if Path(row['path']).resolve().is_relative_to(root)]
+ 
+     def release_stale_reservations(self, rows, current_run: str) -> int:
+-        return self.db.upload_release_stale_reservations(rows, current_run)
++        return self.db.upload_release_stale_reservations(self._without_confirmed_receipt_claims(rows), current_run)
++
++    def _without_confirmed_receipt_claims(self, rows):
++        rows = list(rows)
++        keys = {(row['target_key'], row['fingerprint'], row['claim_token']) for row in rows}
++        protected = UploadReceiptStore(self.path.parent / 'upload_receipts').protected_claims(keys)
++        return [row for row in rows if (row['target_key'], row['fingerprint'], row['claim_token']) not in protected]
+ 
+     def record_completed(
+         self,
+@@ -296,6 +397,8 @@
+             message_id=message_id,
+             reservation_claim_token=reservation_claim_token,
+         )
++        if reservation_claim_token:
++            self._forget_confirmation_claim(target_key, fingerprint, reservation_claim_token)
+ 
+ 
+ class GroupStateCache:

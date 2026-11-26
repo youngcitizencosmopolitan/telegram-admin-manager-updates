@@ -1,0 +1,37 @@
+--- a/app/tests/test_premium_global_priority.py
++++ b/app/tests/test_premium_global_priority.py
+@@ -65,6 +65,10 @@
+         later = self.start('later', 'premium', later_small, later_big, gate)
+         self.assertEqual(await asyncio.wait_for(later, 1), 'big')
+         self.assertFalse(gate.is_set())
++        self.assertTrue(self.priority.has_work('premium'))
++        self.assertFalse(self.priority.has_work('other-premium'))
++        await self.assert_waiting(first)
++        self.priority.release_claim('later', 'premium')
+         self.assertEqual(await asyncio.wait_for(first, 1), 'small')
+ 
+     async def test_regular_account_keeps_order_and_never_claims_big(self):
+@@ -84,11 +88,15 @@
+             with self.subTest(shared=shared is not None):
+                 premium_ready = asyncio.Event()
+                 small, big = self.queue('small'), self.queue('verified-big')
++                if shared is not None:
++                    shared.register('first', big, lambda session: True, preparing=True)
+                 args = dict(task_id='first', session='premium', small_queue=small, big_queue=big,
+                             premium_by_session=self.premium, start_after=None, priority=shared,
+                             stop_event=self.stop, disabled=lambda: False, signal_drained=lambda: None,
+                             premium_ready=premium_ready)
+                 self.assertEqual(await asyncio.wait_for(bu._next_upload_job(**args), 1), 'verified-big')
++                if shared is not None:
++                    shared.release_claim('first', 'premium')
+                 waiting = asyncio.create_task(bu._next_upload_job(**args))
+                 self.jobs.append(waiting)
+                 await self.assert_waiting(waiting)
+@@ -102,6 +110,7 @@
+         self.priority.register('first', big, lambda session: True)
+         self.priority.finish('later')
+         self.assertEqual(await self.start('first', 'premium', small, big), 'big')
++        self.priority.release_claim('first', 'premium')
+         self.assertEqual(await self.start('first', 'premium', small, big), 'small')
+ 
+     async def test_inaccessible_or_paused_big_rule_does_not_block_small(self):

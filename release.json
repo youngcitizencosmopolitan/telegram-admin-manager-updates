@@ -1,23 +1,18 @@
 {
-  "version": "0046",
-  "base_version": "0045",
-  "manifest_version": "4.3.8.0046",
-  "display_version": "0046",
+  "version": "0047",
+  "base_version": "0046",
+  "manifest_version": "4.3.8.0047",
+  "display_version": "0047",
   "patch_files": [
-    "release-src/0046/01-batch_uploader.py.patch",
-    "release-src/0046/02-tam_core-monitor_remaining.py.patch",
-    "release-src/0046/03-tam_core-preparation.py.patch",
-    "release-src/0046/04-tam_core-preview_failures.py.patch",
-    "release-src/0046/05-tam_core-profile_instance.py.patch",
-    "release-src/0046/06-tam_core-state_db.py.patch",
-    "release-src/0046/07-tam_ui-monitor_presentation.py.patch",
-    "release-src/0046/08-telegram_admin_manager.py.patch",
-    "release-src/0046/09-tests-test_activity_history_limit.py.patch",
-    "release-src/0046/10-tests-test_invalid_video_preview.py.patch",
-    "release-src/0046/11-tests-test_invalid_video_upload.py.patch",
-    "release-src/0046/12-tests-test_profile_instance_lock.py.patch",
-    "release-src/0046/13-tests-test_video_preview_colorspace.py.patch",
-    "release-src/0046/14-video_preview.py.patch"
+    "release-src/0047/01-batch_uploader.py.patch",
+    "release-src/0047/02-tam_core-repositories.py.patch",
+    "release-src/0047/03-tam_core-state_db.py.patch",
+    "release-src/0047/04-tam_core-upload_receipts.py.patch",
+    "release-src/0047/05-telegram_admin_manager.py.patch",
+    "release-src/0047/06-tests-test_automatic_reservation_recovery.py.patch",
+    "release-src/0047/07-tests-test_monitor_delta_upload.py.patch",
+    "release-src/0047/08-tests-test_premium_global_priority.py.patch",
+    "release-src/0047/09-tests-test_returned_message_confirmation.py.patch"
   ],
-  "notes": "0046 prevents repeated monitoring retries for confirmed unreadable videos, limits recent activity history while keeping current transfers visible, reorders the table in one operation, and prevents multiple Telegram manager processes from using one profile at the same time. SQLite busy and I/O errors no longer trigger corruption recovery."
+  "notes": "0047 records Telegram-confirmed messages from the existing reservation, without rereading the source after sending. If SQLite is temporarily unavailable, the exact response is saved locally and recorded automatically on a later queue run. Stopping before the request reaches Telegram remains safe to retry. A finished monitoring check can move on to new files while preserving genuinely unconfirmed sends for review. A Premium account keeps its large-file priority during preparation."
 }

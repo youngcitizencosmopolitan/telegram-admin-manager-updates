@@ -1,0 +1,141 @@
+--- /dev/null
++++ b/app/tam_core/upload_receipts.py
+@@ -0,0 +1,138 @@
++"""Small durable journals for exact Telegram responses awaiting SQLite commit."""
++import hashlib
++import heapq
++import json
++import os
++from pathlib import Path
++import uuid
++
++
++def validate_confirmation(record):
++    for field in ('target_key', 'fingerprint', 'claim_token'):
++        if not isinstance(record.get(field), str) or not record[field]:
++            raise ValueError('Missing confirmation ' + field)
++    for field in ('message_id', 'account_user_id', 'size', 'mtime_ns'):
++        if type(record.get(field)) is not int:
++            raise ValueError('Invalid confirmation ' + field)
++    if record['message_id'] <= 0 or record['account_user_id'] <= 0 or record['size'] < 0:
++        raise ValueError('Invalid returned message, account or size')
++    if not isinstance(record.get('account_label'), str):
++        raise ValueError('Invalid confirmation account label')
++
++
++class UploadReceiptStore:
++    MAX_BYTES = 64 * 1024
++    REPLAY_LIMIT = 100
++
++    def __init__(self, directory):
++        self.directory = Path(directory)
++
++    @staticmethod
++    def _own_name(name):
++        digest = name[len('returned-message-'):-len('.json')]
++        return (name.startswith('returned-message-') and name.endswith('.json')
++                and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest))
++
++    def _read(self, path):
++        with path.open('rb') as handle:
++            data = handle.read(self.MAX_BYTES + 1)
++        if len(data) > self.MAX_BYTES:
++            raise ValueError('Oversized receipt')
++        payload = json.loads(data)
++        if (not isinstance(payload, dict) or payload.get('version') != 1
++                or payload.get('kind') != 'telegram-returned-message'
++                or not isinstance(payload.get('path'), str) or not payload['path']):
++            raise ValueError('Unrecognized receipt')
++        validate_confirmation(payload)
++        return {key: payload[key] for key in ('target_key', 'fingerprint', 'claim_token',
++                'account_user_id', 'account_label', 'message_id', 'size', 'mtime_ns')}
++
++    def protected_claims(self, candidates):
++        """Protect exact durable responses from manual stale-claim recovery.
++
++        Results are bounded by the candidate set. Journal I/O failures propagate
++        so recovery cannot discard evidence it was unable to inspect.
++        """
++        wanted = set(candidates)
++        protected = set()
++        if not wanted:
++            return protected
++        try:
++            entries = os.scandir(self.directory)
++        except FileNotFoundError:
++            return protected
++        with entries:
++            for entry in entries:
++                if not self._own_name(entry.name) or not entry.is_file(follow_symlinks=False):
++                    continue
++                try:
++                    record = self._read(Path(entry.path))
++                except (FileNotFoundError, ValueError, TypeError, KeyError):
++                    continue
++                key = tuple(record[field] for field in ('target_key', 'fingerprint', 'claim_token'))
++                if key in wanted:
++                    protected.add(key)
++                    if protected == wanted:
++                        break
++        return protected
++
++    def save(self, record, canonical_path):
++        validate_confirmation(record)
++        if not isinstance(canonical_path, str) or not canonical_path:
++            raise ValueError('Missing owned reservation path')
++        payload = dict(record, version=1, kind='telegram-returned-message', path=canonical_path)
++        data = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
++        if len(data) > self.MAX_BYTES:
++            raise ValueError('Confirmation receipt exceeds size limit')
++        identity = [record[name] for name in ('target_key', 'fingerprint', 'claim_token', 'account_user_id', 'message_id')]
++        digest = hashlib.sha256(json.dumps(identity).encode('utf-8')).hexdigest()
++        self.directory.mkdir(parents=True, exist_ok=True)
++        destination = self.directory / ('returned-message-' + digest + '.json')
++        temporary = destination.with_name(destination.name + '.' + uuid.uuid4().hex + '.tmp')
++        try:
++            with temporary.open('xb') as handle:
++                handle.write(data)
++                handle.flush()
++                os.fsync(handle.fileno())
++            os.replace(temporary, destination)
++            if os.name != 'nt':
++                descriptor = os.open(self.directory, os.O_RDONLY)
++                try:
++                    os.fsync(descriptor)
++                finally:
++                    os.close(descriptor)
++        finally:
++            temporary.unlink(missing_ok=True)
++
++    def pending(self, stopped, *, after='', visited=None):
++        # Keep at most one bounded page of names. The caller retains the last
++        # examined name, including malformed or conflicting journals, so those
++        # cannot permanently starve later valid receipts on subsequent passes.
++        names = []
++        for cutoff in ((after, '') if after else ('',)):
++            try:
++                entries = os.scandir(self.directory)
++            except FileNotFoundError:
++                return
++            def eligible_names():
++                for entry in entries:
++                    if stopped():
++                        return
++                    name = entry.name
++                    if (self._own_name(name) and name > cutoff and entry.is_file(follow_symlinks=False)):
++                        yield name
++            with entries:
++                names = heapq.nsmallest(self.REPLAY_LIMIT, eligible_names())
++            if names or stopped():
++                break
++        for name in names:
++            if stopped():
++                return
++            if visited is not None:
++                visited(name)
++            path = self.directory / name
++            try:
++                record = self._read(path)
++            except (OSError, ValueError, TypeError, KeyError):
++                continue  # Preserve unreadable/foreign/ambiguous evidence.
++            yield path, record
